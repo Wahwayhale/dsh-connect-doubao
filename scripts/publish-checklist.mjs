@@ -65,12 +65,68 @@ check('screenshots.json 列出的文件都真实存在', () => {
   return `${list.length} 条引用全部存在`
 })
 
-check('.gitignore 没有挡住截图', () => {
-  const out = execFileSync('git', ['status', '--porcelain', '--', 'docs/assets'], { cwd: ROOT, encoding: 'utf8' })
-  assert(out.trim().length > 0, 'docs/assets 下没有任何待提交文件 —— 截图可能被 .gitignore 挡住了')
-  const pngs = out.split('\n').filter(l => l.trim().endsWith('.png'))
-  assert(pngs.length >= 2, `只有 ${pngs.length} 张图会被提交`)
-  return `${pngs.length} 张 PNG 在待提交列表中`
+// These two answer DIFFERENT questions and must stay separate, because they fail
+// for different reasons with different fixes.
+//
+//  (a) "are the screenshots IN the repository?"  — the thing the marketplace page
+//      actually needs. Judge it from HEAD (or the index before the first commit),
+//      NOT from "is there anything staged": once the commit exists the working
+//      tree is clean, and an earlier version of this check read that emptiness as
+//      "blocked by .gitignore" and produced a false FAIL on a healthy repo.
+//
+//  (b) "would a FUTURE image be blocked?" — judge it with `check-ignore`'s exit
+//      code. Note the semantics: exit 0 means "matched SOME rule", which includes
+//      matching a NEGATION rule (`!docs/assets/*.png`). So a 0 here does NOT mean
+//      "ignored"; only `--no-index -v` output that ends in an ignore rule does.
+function gitHasHead() {
+  try {
+    execFileSync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: ROOT, stdio: ['ignore', 'ignore', 'ignore'] })
+    return true
+  } catch {
+    return false
+  }
+}
+
+const SCREENSHOT_FILES = [
+  'docs/assets/dsh-connect-doubao-quota-card.png',
+  'docs/assets/dsh-connect-doubao-settings-section.png',
+]
+
+check('截图已进版本库（市场页要有图）', () => {
+  const listing = gitHasHead()
+    ? execFileSync('git', ['ls-tree', '-r', 'HEAD', '--name-only'], { cwd: ROOT, encoding: 'utf8' })
+    : execFileSync('git', ['ls-files', '--cached', '--'], { cwd: ROOT, encoding: 'utf8' })
+  const tracked = new Set(listing.split('\n').map(l => l.trim()))
+  const missing = SCREENSHOT_FILES.filter(f => !tracked.has(f))
+  assert(missing.length === 0,
+    `未进库：${missing.join(', ')}（${gitHasHead() ? 'HEAD 里找不到' : '暂存区里找不到'}）`)
+  return `${SCREENSHOT_FILES.length} 张均在${gitHasHead() ? ' HEAD' : '暂存区'}中`
+})
+
+check('截图未被 .gitignore 挡住（防未来的宽规则）', () => {
+  // `--no-index` consults the ignore rules alone, without the tracked-file
+  // exemption, which is exactly the "would a new file here be ignored?" question.
+  for (const file of SCREENSHOT_FILES) {
+    let matched = ''
+    try {
+      execFileSync('git', ['check-ignore', '--no-index', '-q', '--', file], { cwd: ROOT, stdio: 'ignore' })
+      matched = 'matched'
+    } catch {
+      matched = 'not-matched'
+    }
+    if (matched === 'matched') {
+      // Distinguish a real ignore from a matched NEGATION rule, so the message
+      // tells the user which of the two happened.
+      let rule = ''
+      try {
+        rule = execFileSync('git', ['check-ignore', '--no-index', '-v', '--', file], { cwd: ROOT, encoding: 'utf8' }).trim()
+      } catch { /* no rule matched */ }
+      if (!/^\S+:\d+:\s*!/.test(rule)) {
+        throw new Error(`${file} 被 ${rule || '某条 .gitignore 规则'} 挡住了`)
+      }
+    }
+  }
+  return '两张图均不会被 ignore 规则吞掉'
 })
 
 // --- 3. build artifacts ------------------------------------------------------

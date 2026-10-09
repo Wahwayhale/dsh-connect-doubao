@@ -9,8 +9,9 @@ coverage/
 
 # Screenshots are release assets: `screenshots.json` lists them, both READMEs
 # embed them, and the plugin-market entry cannot render a card without them.
-# `lib/` above is deliberately ignored (build output), so these need no
-# un-ignore rule today — they are here to defend against a future broad rule
-# being added to this file that would silently swallow the marketplace images.
+# These two rules are DEFENSIVE, not load-bearing today: nothing above matches
+# `docs/`, so as the repository stands they change no outcome. They exist so a
+# future broad rule (`*.png`, `assets/`, a catch-all) cannot silently swallow the
+# marketplace images without anyone noticing.
 !docs/assets/
 !docs/assets/*.png
