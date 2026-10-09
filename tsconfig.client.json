@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["es2024", "dom", "dom.iterable"],
+    "types": ["node", "react"],
+    "moduleResolution": "bundler",
+    "noEmit": true
+  },
+  "include": ["src/client"],
+  "exclude": ["node_modules", "lib", "dist"]
+}

@@ -1,0 +1,16 @@
+node_modules/
+.pnpm-store/
+lib/
+dist/
+coverage/
+*.log
+.env
+.DS_Store
+
+# Screenshots are release assets: `screenshots.json` lists them, both READMEs
+# embed them, and the plugin-market entry cannot render a card without them.
+# `lib/` above is deliberately ignored (build output), so these need no
+# un-ignore rule today — they are here to defend against a future broad rule
+# being added to this file that would silently swallow the marketplace images.
+!docs/assets/
+!docs/assets/*.png
