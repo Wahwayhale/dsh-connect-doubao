@@ -19,13 +19,23 @@
  * line, so a generic `data:`-only SSE parser silently drops everything.
  */
 import { randomUUID } from 'node:crypto'
-import { loadDoubaoCredentials, REQUIRED_COOKIE_NAMES, type DoubaoCredentials } from './doubao-auth.ts'
+import { hostname, homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  findDoubaoUserDataDir,
+  loadDoubaoCredentials,
+  REQUIRED_COOKIE_NAMES,
+  type DoubaoCredentials,
+} from './doubao-auth.ts'
 import {
   CHAT_AGENT_MODE,
+  TASK_AGENT_MODE,
   DOUBAO_CONTEXT_WINDOW,
   findDoubaoModel,
   findReasoningLevel,
   needDeepThinkOf,
+  TASK_RUNTIME_LOCAL_PC,
+  TASK_SANDBOX_AUTH_ALLOW_ALL,
 } from './doubao-catalog.ts'
 
 export const CHAT_ENDPOINT = 'https://www.doubao.com/chat/completion'
@@ -133,6 +143,15 @@ export interface DoubaoChatResult {
   reasoningText?: string
   /** True when the server routed to a thinking-capable model. */
   thinking: boolean
+  /**
+   * The agent the server says served this turn (`intention_agent_name`).
+   *
+   * Not a model identifier — it names the server-side AGENT, which is how a
+   * 「工作任务」 turn becomes visible at all: chat turns and task turns use the
+   * same endpoint and the same stream, and this field is the only read-back
+   * evidence of which one was actually used.
+   */
+  intentionAgent?: string
 }
 
 export class DoubaoUpstreamError extends Error {
@@ -168,11 +187,137 @@ export interface ChatRequestOptions {
    */
   reasoningLevel?: 'low' | 'mid' | 'high'
   /**
-   * 1 = ordinary chat, 2 = work mode. Only chat is implemented; kept explicit
-   * so the two are never confused with the numeric model keys, several of which
-   * are also small integers.
+   * `option.agent_mode` / `ext.agent_mode`.
+   *
+   * VERIFIED: the desktop app sends 1 for BOTH ordinary chat and a 「工作任务」
+   * (a real 2026-09-15 task request carries 1). Kept explicit so these small
+   * integers are never confused with the numeric model keys, which are also
+   * small integers.
    */
   agentMode?: number
+  /**
+   * Send the request as a 「工作任务 · 本地电脑」 instead of a plain chat.
+   *
+   * DEFAULTS TO TRUE. The whole point of this route is that the executing
+   * machine is this one, which is where the Harness already runs its tools; the
+   * cloud VM runtime (`runtime_type: 1`) puts execution somewhere we cannot
+   * reach.
+   *
+   * What travels: `ext.general_task_param` as a JSON *string* — the client's own
+   * shape, transcribed from a captured request. Its presence is what makes the
+   * server treat the turn as a task (the client's `is_general_task` check is
+   * `!!ext.general_task_param`); `agent_mode` stays 1.
+   *
+   * Set `DSH_DOUBAO_TASK=0` in the host environment to fall back to plain chat
+   * without a rebuild — the escape hatch for a server-side rejection.
+   */
+  taskMode?: boolean
+  /**
+   * Directory the task declares as its workspace.
+   *
+   * The cloud plans against these paths, so they must be real on THIS machine.
+   * Defaults to `DSH_DOUBAO_WORKSPACE`, then `process.cwd()`.
+   */
+  workspace?: string
+}
+
+/* ------------------------------------------------------------------ *
+ * 「工作任务 · 本地电脑」
+ * ------------------------------------------------------------------ */
+
+/**
+ * Stable-per-process id that rides along as `client_env_id`.
+ *
+ * The client generates one per app environment; ours is per host process so a
+ * restart looks like a new environment, which is exactly what it is.
+ */
+const CLIENT_ENV_ID = randomUUID()
+
+/** Whether a request asks for local-PC task mode. Default: OFF — see below. */
+export function taskModeEnabled(options: ChatRequestOptions): boolean {
+  if (options.taskMode !== undefined) return options.taskMode
+  // Opt-in, not default.
+  //
+  // 2026-10-22 measurement: sending `ext.general_task_param` (runtime_type 2) DOES
+  // switch the turn — the server answers `intention_agent_name:
+  // Agent-GeneralTask` — but the agent then fails with `710010702` because its
+  // executing runtime is the desktop app's CUA process, which an external client
+  // cannot register. Worse, the routing is bound to the DEVICE: with
+  // `general_task_param` omitted entirely the same device still gets
+  // Agent-GeneralTask, so once the Doubao app's 对话/工作 switch sits on 工作 every
+  // turn from this client fails, not just task turns.
+  //
+  // Defaulting this on would therefore break ordinary chat for as long as the
+  // runtime question is unresolved. `DSH_DOUBAO_TASK=1` turns it back on for
+  // anyone who wants to keep probing it.
+  const flag = process.env.DSH_DOUBAO_TASK
+  return flag === undefined ? false : /^(1|true|on|yes)$/i.test(flag.trim())
+}
+
+/** The directory this machine declares to the task runtime. */
+export function taskWorkspaceOf(options: ChatRequestOptions): string {
+  return options.workspace ?? process.env.DSH_DOUBAO_WORKSPACE ?? process.cwd()
+}
+
+/**
+ * Build `ext.general_task_param` — the field that makes a turn a 工作任务.
+ *
+ * Transcribed field-for-field from a real 「工作任务 · 本地电脑」 request the
+ * desktop client sent on 2026-09-15 (recovered from the app's own IndexedDB
+ * message store), then reduced to what is portable:
+ *
+ *   thread_local_message_id  the local message id being submitted
+ *   client_option            the workspace and the sandbox/authorisation policy
+ *   runtime_type             2 — Local_PC; the cloud VM would be 1
+ *   agent_task_param         the same facts again, device-side
+ *   agent_task_param_change  all false: nothing is being switched mid-thread
+ *
+ * Paths are computed from THIS machine rather than copied, because the cloud
+ * plans against them: a workspace that does not exist here would make the task
+ * fail inside the runtime instead of at submit time. `local_device_id` and
+ * `local_app_id` reuse the frozen client identity already in {@link CLIENT_PARAMS}
+ * — the captured request carries the same two values, so they are the same
+ * install identity and not per-request state.
+ */
+export function buildGeneralTaskParam(
+  localMessageId: string,
+  workspace: string,
+): Record<string, unknown> {
+  const userData = findDoubaoUserDataDir()
+  const agentWorkspace = userData === undefined
+    ? join(tmpdir(), 'dsh-doubao-agent-workspace')
+    : join(userData, 'Default', '.doubao', 'agent_mode', 'workspace')
+  return {
+    thread_local_message_id: [localMessageId],
+    client_option: {
+      shared_folder_path: [workspace, agentWorkspace],
+      enable_sandbox: true,
+      os: process.platform === 'win32' ? 'Windows' : process.platform,
+      client_env_id: CLIENT_ENV_ID,
+      sandbox_id: `route-${randomUUID()}`,
+      workspace,
+      agent_workspace: {
+        agent_workspace: agentWorkspace,
+        local_skill_paths: [join(homedir(), 'Doubao', 'skills'), join(homedir(), '.agents', 'skills')],
+      },
+      sandbox_auth_type: TASK_SANDBOX_AUTH_ALLOW_ALL,
+    },
+    runtime_type: TASK_RUNTIME_LOCAL_PC,
+    need_modify_conversation: false,
+    agent_task_param: {
+      runtime_type: TASK_RUNTIME_LOCAL_PC,
+      device_name: hostname(),
+      workspace,
+      local_device_id: CLIENT_PARAMS.device_id,
+      local_app_id: CLIENT_PARAMS.aid,
+      sandbox_auth_type: TASK_SANDBOX_AUTH_ALLOW_ALL,
+    },
+    agent_task_param_change: {
+      runtime_changed: false,
+      device_changed: false,
+      sandbox_auth_type_changed: false,
+    },
+  }
 }
 
 /**
@@ -190,13 +335,38 @@ export interface ChatRequestOptions {
 export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) {
   const model = findDoubaoModel(options.modelKey)
   const level = findReasoningLevel(options.reasoningLevel)
-  const agentMode = options.agentMode ?? CHAT_AGENT_MODE
-  const needDeepThink = needDeepThinkOf(level)
+  const task = taskModeEnabled(options)
+  /**
+   * 2 = 普通对话, 1 = 「工作任务」.
+   *
+   * CDP-captured from the running client on 2026-10-22. This constant was the
+   * bug: the plugin sent 1 for chat, so the server answered every turn as a work
+   * task — `Agent-GeneralTask`, then `710010702` because the task runtime is the
+   * desktop app's own CUA process.
+   */
+  const agentMode = options.agentMode ?? (task ? TASK_AGENT_MODE : CHAT_AGENT_MODE)
+  const localMessageId = randomUUID()
+  /**
+   * Mode id the model picker groups by. The captured chat request carries "1" in
+   * BOTH `conversation_init_ext` and `aggregate_params`; leaving it out lets the
+   * server choose a mode for us.
+   */
+  const modeId = (process.env.DSH_DOUBAO_MODE_ID ?? '').trim() || '1'
+  /**
+   * The client's own default for `general_task_param` on an ordinary turn.
+   *
+   * NOTE the shape: an OBJECT inside `option` and the same thing STRINGIFIED
+   * inside `ext`. That asymmetry is the client's, not a mistake here.
+   */
+  const plainTaskParam = { server_do_compare: true }
+  const taskParam = task
+    ? buildGeneralTaskParam(localMessageId, taskWorkspaceOf(options))
+    : plainTaskParam
 
   return {
     messages: [
       {
-        local_message_id: randomUUID(),
+        local_message_id: localMessageId,
         message_status: 0,
         content_block: [
           {
@@ -221,7 +391,11 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
       answer_with_suggest: false,
       agent_mode: agentMode,
       tts_switch: false,
-      need_deep_think: needDeepThink,
+      // 0, always. The captured chat request carries 0 even with reasoning
+      // effort 高 — the level travels in `reasoning_effort`, and this field is
+      // the (off) deep-think toggle. The plugin used to send 10000+level here,
+      // a value the client never emits on this path.
+      need_deep_think: 0,
       click_clear_context: false,
       from_suggest: false,
       is_regen: false,
@@ -231,17 +405,55 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
       disable_sse_cache: false,
       select_text_action: '',
       is_select_text: false,
+      resend_for_regen: false,
+      scene_type: 0,
+      unique_key: randomUUID(),
+      start_seq: 0,
+      // This client keeps no thread: it re-flattens the transcript every turn,
+      // so every request is a NEW conversation.
+      need_create_conversation: true,
+      conversation_init_option: { need_ack_conversation: true },
+      // The model and the mode are declared here as well as in `model_config`.
+      // The captured request does both; the server reads this pair first.
+      conversation_init_ext: {
+        model_item_key: model.id,
+        reasoning_effort: String(level.level),
+        mode_id: modeId,
+      },
+      regen_query_id: [],
+      edit_query_id: [],
+      regen_instruction: '',
+      no_replace_for_regen: false,
+      message_from: 0,
+      shared_app_name: '',
+      shared_app_id: '',
       // Ask for incremental blocks so STREAM_CHUNK deltas actually arrive.
       sse_recv_event_options: { support_chunk_delta: true },
+      support_lazy_fetch_stream: true,
+      is_ai_playground: false,
+      is_old_user: true,
+      general_task_param: taskParam,
+      recovery_option: {
+        is_recovery: false,
+        req_create_time_sec: Math.floor(Date.now() / 1000),
+        append_sse_event_scene: 0,
+      },
+      message_storage_type: 0,
+      related_deleted_message_ids: {},
+      connector_info_list: [],
       model_config: {
         model_item_key: model.id,
-        model_extra_params: {
-          memory_profile: '256k',
-          total_window_size: String(DOUBAO_CONTEXT_WINDOW),
-        },
+        // Empty in the captured request. The 256k window is negotiated by the
+        // server for this account; asserting it here was our own invention.
+        model_extra_params: {},
         reasoning_effort: level.level,
       },
       aggregate_params: {
+        mention_skill_list: '[]',
+        mention_plugin_list: '[]',
+        mention_ext: '[{}]',
+        conversation_mode: '',
+        mode_id: modeId,
         model_item_key: model.id,
         agent_mode: String(agentMode),
         reasoning_effort: String(level.level),
@@ -254,12 +466,23 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
       bot_id: DEFAULT_BOT_ID,
       last_section_id: '',
       last_message_index: null,
+      // The client reports the permissions it holds; the server echoes them into
+      // its own telemetry. Shape copied verbatim from the capture.
+      local_permissions: [
+        { permission_name: 'ACCESS_COARSE_LOCATION', status: 1 },
+        { permission_name: 'ACCESS_FINE_LOCATION', status: 1 },
+        { permission_name: 'ACCESS_BACKGROUND_LOCATION', status: 1 },
+      ],
     },
     user_context: [],
     ext: {
-      use_deep_think: String(needDeepThink),
       agent_mode: String(agentMode),
+      use_deep_think: '0',
+      sub_conv_firstmet_type: '1',
+      general_task_param: JSON.stringify(taskParam),
+      collection_id: '',
       is_finish: '1',
+      conversation_init_option: JSON.stringify({ need_ack_conversation: true }),
       commerce_credit_config_enable: '0',
     },
   }
@@ -384,13 +607,10 @@ export interface StreamCallbacks {
 }
 
 /**
- * Stream one chat completion and return the assembled reply.
- *
- * Rejects with `DoubaoUpstreamError` when the server answers with a business
- * error frame — notably `710022004 rate limited`, which is risk control asking
- * for a slider CAPTCHA rather than an authentication failure.
+ * One attempt, no fallback. Split out so {@link streamChat} can retry a
+ * task-mode call as plain chat when the task runtime is not attached.
  */
-export async function streamChat(
+async function streamOnce(
   prompt: string,
   options: ChatRequestOptions & {
     signal?: AbortSignal
@@ -431,8 +651,54 @@ export async function streamChat(
   // next call stays authenticated.
   absorbSetCookies(response.headers)
 
-  const result = await consumeStream(response, options.callbacks)
+  const result = await consumeStream(response, options.callbacks, {
+    harvestNotifyText: taskModeEnabled(options),
+  })
   return result
+}
+
+/**
+ * Stream one completion and return the assembled reply.
+ *
+ * Rejects with `DoubaoUpstreamError` when the server answers with a business
+ * error frame — notably `710022004 rate limited`, which is risk control asking
+ * for a slider CAPTCHA rather than an authentication failure.
+ *
+ * TASK MODE FALLBACK. 「工作任务 · 本地电脑」 is the default, but the task agent
+ * is executed by a runtime that only the desktop app attaches; when it is
+ * absent the server answers the turn with `710010702 system error` instead of a
+ * reply (verified: the stream still names `Agent-GeneralTask`, so the mode
+ * itself was accepted). Rather than hand that placeholder to the user, the call
+ * is retried ONCE as plain chat — and only when the failed attempt emitted no
+ * text, so a fallback can never duplicate a partially streamed answer.
+ */
+export async function streamChat(
+  prompt: string,
+  options: ChatRequestOptions & {
+    signal?: AbortSignal
+    callbacks?: StreamCallbacks
+    credentials?: DoubaoCredentials
+  } = {},
+): Promise<DoubaoChatResult> {
+  let emittedText = false
+  const wrapped: StreamCallbacks = {
+    onText: (delta) => {
+      if (delta) emittedText = true
+      options.callbacks?.onText?.(delta)
+    },
+    onEvent: (event) => options.callbacks?.onEvent?.(event),
+  }
+  const wanted = taskModeEnabled(options)
+  const call = (taskMode: boolean): Promise<DoubaoChatResult> =>
+    streamOnce(prompt, { ...options, callbacks: wrapped, taskMode })
+  try {
+    return await call(wanted)
+  } catch (error) {
+    const taskRuntimeMissing = error instanceof DoubaoUpstreamError &&
+      (error.code === CODE_TASK_RUNTIME_UNAVAILABLE || /agent_err_real_answer/.test(error.message))
+    if (!wanted || !taskRuntimeMissing || emittedText) throw error
+    return call(false)
+  }
 }
 
 const renewals = new Map<string, string>()
@@ -484,12 +750,15 @@ export function applyRenewals(header: string): string {
 async function consumeStream(
   response: Response,
   callbacks?: StreamCallbacks,
+  options: { harvestNotifyText?: boolean } = {},
 ): Promise<DoubaoChatResult> {
   const reader = response.body?.getReader()
   if (!reader) throw new DoubaoUpstreamError('Doubao returned an empty response body.')
   const decoder = new TextDecoder()
   let buffer = ''
   const texts: string[] = []
+  /** Text carried by STREAM_MSG_NOTIFY instead of by chunk deltas. */
+  const notifyTexts: string[] = []
   let conversationId: string | undefined
   let messageId: string | undefined
   let model: string | undefined
@@ -497,9 +766,33 @@ async function consumeStream(
   let reasoningText: string | undefined
   let lastEventId: string | undefined
   let ended = false
+  /**
+   * Every event name seen, in arrival order (deduped).
+   *
+   * Task mode answers with a richer event vocabulary than chat, so an empty
+   * completion is usually "the text lives in an event we do not harvest yet"
+   * rather than "the server said nothing". Naming the events turns an opaque
+   * failure into a next step.
+   */
+  const events = new Set<string>()
+  /** The agent that served this turn, when the server names one. */
+  let intentionAgent: string | undefined
+  /**
+   * `expose_reason` of a task turn whose runtime was unreachable.
+   *
+   * Recorded instead of surfacing its placeholder text (「出了点问题，请稍后重试。」),
+   * which reads like a transient glitch and hides the actual cause.
+   */
+  let taskAgentError: string | undefined
 
   const handle = (frame: StreamFrame): void => {
     const name = frame.event ?? ''
+    if (name) events.add(name)
+    // Task mode answers with frames chat mode never emits. Dump them on demand
+    // rather than guessing which envelope carries the text.
+    if (process.env.DSH_DOUBAO_DEBUG_FRAMES === '1' && frame.data) {
+      process.stderr.write(`[frame ${name || '(none)'}] ${frame.data.slice(0, 1500)}\n`)
+    }
     if (name && callbacks?.onEvent) callbacks.onEvent(name)
     if (frame.id) lastEventId = frame.id
     if (!frame.data) return
@@ -533,10 +826,46 @@ async function consumeStream(
     }
 
     if (name === 'FULL_MSG_NOTIFY' || name === 'STREAM_MSG_NOTIFY') {
-      const record = payload as { message?: { message_id?: string; ext?: unknown }; ext?: unknown }
+      const record = payload as {
+        message?: { message_id?: string; ext?: unknown; content?: unknown }
+        content?: { ext?: unknown; content_block?: unknown }
+        ext?: unknown
+      }
       messageId = record.message?.message_id ?? messageId
       model = model ?? extractModel(payload)
       thinking = thinking || extractThinking(payload)
+
+      const ext = (record.content?.ext ?? record.message?.ext ?? record.ext) as
+        | Record<string, unknown>
+        | undefined
+      if (ext !== undefined && ext !== null && typeof ext === 'object') {
+        const agent = ext.intention_agent_name
+        if (typeof agent === 'string' && agent !== '') intentionAgent = agent
+        const reason = ext.expose_reason
+        if (typeof reason === 'string' && /agent_err_real_answer/.test(reason)) {
+          taskAgentError = reason
+        }
+      }
+
+      // Chat mode streams the answer as STREAM_CHUNK deltas; a TASK turn instead
+      // delivers the whole reply in THIS frame's content_block. Harvest both and
+      // decide afterwards which one was real (chunks win), so neither shape is
+      // lost — and so an empty `texts` can no longer hide a reply that arrived
+      // here instead.
+      //
+      // FULL_MSG_NOTIFY stays excluded: it carries the USER's own message, so
+      // harvesting it would replay the prompt into the answer.
+      if (name === 'STREAM_MSG_NOTIFY') {
+        const acc = { out: [] as string[] }
+        harvestText(record.content?.content_block, acc)
+        for (const piece of acc.out) {
+          if (!piece) continue
+          notifyTexts.push(piece)
+          // Emitted live: this frame carries the OPENING of the reply, and the
+          // chunk patches that follow are deltas appended after it.
+          if (callbacks?.onText) callbacks.onText(piece)
+        }
+      }
       return
     }
 
@@ -573,11 +902,36 @@ async function consumeStream(
     reader.releaseLock()
   }
 
-  const raw = texts.join('')
+  const chunkText = texts.join('')
+  const notifyText = notifyTexts.join('')
+  /**
+   * The reply is `notify` + chunk deltas.
+   *
+   * The opening lands in STREAM_MSG_NOTIFY and the rest arrives as patch deltas
+   * in STREAM_CHUNK, so taking only the chunks silently swallowed the first
+   * character of EVERY answer (「1+1」 came back as 「+1」, 「我是豆包」 as
+   * 「是豆包」). A cumulative chunk stream would already start with the notify
+   * text, so that case is detected instead of concatenated twice.
+   */
+  const raw = chunkText.startsWith(notifyText) ? chunkText : notifyText + chunkText
   const text = stripPromptEcho(raw)
-  if (!text) {
+  if (taskAgentError !== undefined) {
+    // Checked BEFORE the empty-completion branch: the placeholder text is
+    // non-empty, so ordering it after would report a generic failure and lose
+    // the one fact that matters — the task runtime was never reached.
     throw new DoubaoUpstreamError(
-      `Doubao returned an empty completion${lastEventId ? ` (last event id ${lastEventId})` : ''}.`,
+      `Doubao accepted the task but its executing runtime was unreachable ` +
+      `(${taskAgentError}). The 「工作任务」 runtime is attached by the desktop ` +
+      `client; without it the agent has nowhere to run.`,
+      CODE_TASK_RUNTIME_UNAVAILABLE,
+    )
+  }
+  if (!text) {
+    const seen = [...events]
+    throw new DoubaoUpstreamError(
+      `Doubao returned an empty completion` +
+      `${lastEventId ? ` (last event id ${lastEventId})` : ''}` +
+      `${seen.length > 0 ? `; events seen: ${seen.join(', ')}` : '; no events at all'}.`,
     )
   }
   return {
@@ -586,6 +940,7 @@ async function consumeStream(
     ...(conversationId !== undefined ? { conversationId } : {}),
     ...(messageId !== undefined ? { messageId } : {}),
     ...(reasoningText !== undefined ? { reasoningText } : {}),
+    ...(intentionAgent !== undefined ? { intentionAgent } : {}),
     thinking,
   }
 }
@@ -633,16 +988,40 @@ export async function chat(
  *   network          transport failure or timeout.
  *   upstream         anything else Doubao returns.
  */
-export type DoubaoErrorKind = 'rate_limited' | 'quota_exhausted' | 'session_dead' | 'network' | 'upstream'
+export type DoubaoErrorKind =
+  | 'rate_limited'
+  | 'quota_exhausted'
+  | 'session_dead'
+  | 'network'
+  | 'upstream'
+  /**
+   * The account is routing to the 「工作任务」 agent, whose executing runtime is
+   * the desktop app's own process.
+   *
+   * Kept as its own class because the fix is a single toggle, and calling it
+   * `network` (which is where the old classifier dropped it) sends the user to
+   * check their Wi-Fi for a problem that is one switch away from solved.
+   */
+  | 'task_runtime_unavailable'
 
 /** The server's business code for "this session is not valid". */
 const CODE_SESSION_DEAD = 710012001
 /** The server's business code for a risk-control slider challenge. */
 const CODE_RATE_LIMITED = 710022004
+/**
+ * The server's business code when a 「工作任务」 was accepted but its executing
+ * runtime could not be reached (`expose_reason: agent_err_real_answer`).
+ *
+ * This is the signature of "the mode is right, the local runtime is not
+ * attached" — the desktop client's CUA runtime registers itself; an external
+ * client has nothing to register, so the agent has nowhere to run.
+ */
+const CODE_TASK_RUNTIME_UNAVAILABLE = 710010702
 
 /** Map one upstream error onto its class. */
 export function classifyDoubaoFailure(error: DoubaoUpstreamError): DoubaoErrorKind {
   if (error.rateLimited || error.code === CODE_RATE_LIMITED) return 'rate_limited'
+  if (error.code === CODE_TASK_RUNTIME_UNAVAILABLE) return 'task_runtime_unavailable'
   if (error.code === CODE_SESSION_DEAD) return 'session_dead'
   return 'network'
 }
@@ -663,6 +1042,8 @@ export const DOUBAO_ERROR_HINTS: Readonly<Record<DoubaoErrorKind, string>> = {
     '豆包登录态失效。请在豆包客户端重新登录，然后重试。',
   network:
     '连接豆包失败（网络或超时）。请检查网络后重试。',
+  task_runtime_unavailable:
+    '豆包把这个账号路由到了「工作任务」代理，而该任务的执行运行时只存在于豆包客户端进程里，外部客户端接不上。请打开豆包客户端，把输入框上方的开关切回「对话」，然后重试；需要多步执行的话，交给 DSH 自己的工具来做。',
   upstream:
     '豆包上游返回了未知错误。',
 }

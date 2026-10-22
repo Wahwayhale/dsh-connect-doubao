@@ -39,12 +39,47 @@ export const DOUBAO_CONTEXT_WINDOW = 256_000
 export const DOUBAO_MAX_TOKENS = 32_000
 
 /**
- * Agent mode for ordinary chat.
+ * `option.agent_mode` / `ext.agent_mode`.
  *
- * The desktop app has a 对话/工作 switch that also lands in `agent_mode`:
- * ordinary chat sends 1, work mode sends 2. Only chat is implemented here.
+ * VERIFIED AGAINST A CDP-CAPTURED REQUEST (2026-10-22, 对话 mode):
+ *
+ *   agent_mode 2  →  普通对话
+ *   agent_mode 1  →  「工作任务」 (where every turn is handed to
+ *                    `Agent-GeneralTask` and then fails 710010702 when the
+ *                    desktop client's CUA runtime is not the requester)
+ *
+ * The previous revision of this constant said 1 for chat and carried a comment
+ * claiming work mode sends 2 — BOTH were backwards, and sending 1 is exactly
+ * what made every request from this plugin look like a work task.
  */
-export const CHAT_AGENT_MODE = 1
+export const CHAT_AGENT_MODE = 2
+
+/** 「工作任务」 mode. Its executing runtime is the desktop app's own process. */
+export const TASK_AGENT_MODE = 1
+
+/**
+ * Which machine runs a 「工作任务」.
+ *
+ * Read off the desktop client's own enum (`ai-views` bundle, module 941658):
+ *
+ *   RuntimeType_Cloud_VM  = 1   → 「工作任务 · 云电脑」: ByteDance's VM executes
+ *   RuntimeType_Local_PC  = 2   → 「工作任务 · 本地电脑」: THIS machine executes
+ *
+ * The plugin uses 2 on purpose: the cloud VM's artefacts are unreachable from an
+ * external client, whereas the local runtime is this very machine — the same one
+ * the Harness already executes tools on.
+ */
+export const TASK_RUNTIME_CLOUD_VM = 1
+export const TASK_RUNTIME_LOCAL_PC = 2
+
+/**
+ * Sandbox authorisation level.
+ *
+ * `2` is what the client sends with its 「全部允许」 authorisation setting (read
+ * off the same captured task request). The cloud uses it to decide how freely it
+ * may plan file and command actions inside the declared workspace.
+ */
+export const TASK_SANDBOX_AUTH_ALLOW_ALL = 2
 
 /**
  * A reasoning-effort level.
@@ -113,25 +148,45 @@ export interface DoubaoModelInfo {
 }
 
 /**
- * The six entries the desktop app publishes, with the keys it sends.
+ * The two entries DSH may offer.
  *
- * Read out of the client's own `menuConfV2` cache (M10) — the configuration
- * the server hands the app, not something reconstructed from the UI. Each entry
- * there carries its own `reasoning_effort_config` listing 低=3 / 中=4 / 高=5,
- * which is the SECOND of two independent confirmations of those values (the
- * first was the UI diff in M8 续二).
+ * WHY ONLY TWO. Doubao groups models by MODE, and the model list is per-mode:
  *
- * 「豆包 快速」 leads because it is what `default_select_mode_map.chat` points
- * at, so an unconfigured install reproduces the app's own default rather than
- * something that merely happens to work.
+ *   对话       → 豆包 快速 (0), 豆包 2.1 Turbo·专家 (3)
+ *   工作任务   → 自动 (9), 2.1 Lite (seed-lite-7b), 2.1 Pro (5), Turbo (3)
+ *
+ * The 「工作任务」 group is not offered here because its requests are executed by
+ * the desktop client's own CUA runtime (`tasks-mode-resource` + `sbox`), which an
+ * external client cannot register; every such turn fails `710010702`. See the
+ * README's known limitations.
+ *
+ * MEASURED, 2026-10-22: `model_item_key` is forwarded verbatim (the server stores
+ * it on the message), but in 对话 mode it does NOT change what answers —
+ * 0 / 3 / 5 / seed-lite-7b AND a deliberately bogus key all returned answers of
+ * indistinguishable length and latency (12.3–14.0 s). So this list is honest
+ * about what the PICKER can offer; it does not claim per-key routing.
+ *
+ * 「豆包 快速」 leads because it is the app's own chat-mode default, so an
+ * unconfigured install reproduces the app rather than something that merely
+ * happens to work.
  */
 export const DOUBAO_MODELS: readonly DoubaoModelInfo[] = [
-  { id: '0',            name: '豆包 快速',    reasoning: true },
-  { id: 'seed-lite-7b', name: '豆包 2.1 Lite', badge: '0921 新版', reasoning: true },
-  { id: '3',            name: '豆包 2.1 Turbo', badge: '专家',    reasoning: true },
-  { id: '5',            name: '豆包 2.1 Pro',  reasoning: true },
-  { id: '4',            name: '豆包 2.1 Turbo', badge: '即将下线', reasoning: true },
-  { id: '9',            name: '自动',          reasoning: true },
+  { id: '0', name: '豆包 快速', reasoning: true },
+  { id: '3', name: '豆包 2.1 Turbo', badge: '专家', reasoning: true },
+]
+
+/**
+ * Entries that exist in the desktop app but are deliberately NOT offered here.
+ *
+ * Kept as data rather than a comment so the README and any future UI can state
+ * the reason from one place — and so re-adding one is a deliberate act that has
+ * to confront this note.
+ */
+export const DOUBAO_UNAVAILABLE_MODELS: readonly { id: string; name: string; reason: string }[] = [
+  { id: '5', name: '豆包 2.1 Pro', reason: '「工作任务」专属：执行侧是客户端内的 CUA 运行时，外部客户端注册不进去' },
+  { id: 'seed-lite-7b', name: '豆包 2.1 Lite', reason: '同上（工作任务专属）' },
+  { id: '9', name: '自动', reason: '同上（工作任务专属）' },
+  { id: '4', name: '豆包 2.1 Turbo（即将下线）', reason: '客户端已用「即将下线」标注，不引导用户选择' },
 ]
 
 /**

@@ -30,8 +30,8 @@
  * values as opaque secrets.
  */
 import { createHash, createDecipheriv } from 'node:crypto'
-import { readFileSync, mkdtempSync, rmSync, copyFileSync, writeFileSync, existsSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync, mkdtempSync, rmSync, copyFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { tmpdir, homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
@@ -94,7 +94,7 @@ const DPAPI_MAGIC = Buffer.from('DPAPI', 'ascii')
  * addon, so we shell out to the Windows Data Protection API. The master key
  * travels back over stdout and never touches disk.
  */
-function dpapiUnprotect(cipher: Buffer): Buffer {
+function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
   // The script is written to a temp .ps1 and run with `-File`, not passed via
   // -Command/-EncodedCommand: the C# P/Invoke source needs real newlines, and
   // any inline form flattens the here-string header into a parse error.
@@ -112,7 +112,7 @@ function dpapiUnprotect(cipher: Buffer): Buffer {
     //    Marshal.Copy reads freed memory and faults the process.
     //    The struct below is the only correct shape.
     // PowerShell single-quoted string, C# double quotes — one level only.
-    '$cs = \'using System; using System.Runtime.InteropServices; [StructLayout(LayoutKind.Sequential)] public struct DshDataBlob { public int cbData; public IntPtr pbData; } public static class DshCrypt { [DllImport("crypt32.dll", SetLastError = true)] public static extern bool CryptUnprotectData(ref DshDataBlob pDataIn, IntPtr szDataDescr, IntPtr pOptionalEntropy, IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DshDataBlob pDataOut); }\'',
+    '$cs = \'using System; using System.Runtime.InteropServices; [StructLayout(LayoutKind.Sequential)] public struct DshDataBlob { public int cbData; public IntPtr pbData; } public static class DshCrypt { [DllImport("crypt32.dll", SetLastError = true)] public static extern bool CryptUnprotectData(ref DshDataBlob pDataIn, IntPtr szDataDescr, IntPtr pOptionalEntropy, IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DshDataBlob pDataOut); [DllImport("crypt32.dll", SetLastError = true)] public static extern bool CryptProtectData(ref DshDataBlob pDataIn, IntPtr szDataDescr, IntPtr pOptionalEntropy, IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DshDataBlob pDataOut); }\'',
     'Add-Type -TypeDefinition $cs',
     '$bytes = [System.Convert]::FromBase64String($env:DSH_DOUBAO_DPAPI_BLOB)',
     '$len = [int]$bytes.Length',
@@ -122,8 +122,13 @@ function dpapiUnprotect(cipher: Buffer): Buffer {
     '$inBlob.cbData = $len',
     '$inBlob.pbData = $mem',
     '$outBlob = New-Object DshDataBlob',
-    // CRYPTPROTECT_UI_FORBIDDEN = 0x1
-    '$ok = [DshCrypt]::CryptUnprotectData([ref]$inBlob, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, 1, [ref]$outBlob)',
+    // CRYPTPROTECT_UI_FORBIDDEN = 0x1. Protect and unprotect share every
+    // argument shape except the entry point, so the mode is one branch.
+    "if ($env:DSH_DPAPI_MODE -eq 'protect') {",
+    '  $ok = [DshCrypt]::CryptProtectData([ref]$inBlob, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, 1, [ref]$outBlob)',
+    '} else {',
+    '  $ok = [DshCrypt]::CryptUnprotectData([ref]$inBlob, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, 1, [ref]$outBlob)',
+    '}',
     "if (-not $ok) { [Console]::Out.Write('DPAPI_CALL_FAILED'); exit 3 }",
     '$res = New-Object byte[] $outBlob.cbData',
     '[Runtime.InteropServices.Marshal]::Copy($outBlob.pbData, $res, 0, $outBlob.cbData)',
@@ -146,7 +151,11 @@ function dpapiUnprotect(cipher: Buffer): Buffer {
         encoding: 'utf8',
         maxBuffer: 1 << 24,
         windowsHide: true,
-        env: { ...process.env, DSH_DOUBAO_DPAPI_BLOB: cipher.toString('base64') },
+        env: {
+          ...process.env,
+          DSH_DOUBAO_DPAPI_BLOB: blob.toString('base64'),
+          DSH_DPAPI_MODE: mode,
+        },
       },
     )
     const stdout = result.stdout ?? ''
@@ -170,6 +179,79 @@ function dpapiUnprotect(cipher: Buffer): Buffer {
     throw new Error('DPAPI helper returned no usable output')
   } finally {
     rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
+/** Convenience wrapper for the decrypt direction. */
+function dpapiUnprotect(cipher: Buffer): Buffer {
+  return dpapiCall('unprotect', cipher)
+}
+
+/* ------------------------------------------------------------------ *
+ * Sealed credential cache
+ * ------------------------------------------------------------------ */
+
+/**
+ * Why a cache exists at all.
+ *
+ * The Doubao client takes an EXCLUSIVE lock on `Default\Network\Cookies` while
+ * it is active, so an external process cannot read the session at all while the
+ * app runs — `EBUSY` on open, on copy, everywhere. That is the NORMAL state for
+ * this plugin: its whole point is to use the account whose app is signed in.
+ *
+ * So a successful read is sealed with Windows DPAPI (current user scope) and
+ * kept under the DSH home. The plaintext never touches disk — only the sealed
+ * blob does — and that blob cannot be opened by another Windows account or
+ * moved to another machine. It expires, because the server rotates session
+ * cookies.
+ */
+const CREDENTIAL_CACHE_FILENAME = 'doubao-credentials.dpapi'
+/** Long enough to survive a reboot with the app open, short enough to expire. */
+const CREDENTIAL_CACHE_TTL_MS = 12 * 60 * 60 * 1000
+
+function credentialCachePath(): string {
+  return join(homedir(), '.dsh', CREDENTIAL_CACHE_FILENAME)
+}
+
+/** Seal the current session to disk. Best-effort: never fails a request. */
+function saveCredentialCache(credentials: DoubaoCredentials): void {
+  if (!credentials.ok) return
+  try {
+    const payload = JSON.stringify({
+      savedAt: Date.now(),
+      header: credentials.header,
+      pairs: [...credentials.pairs.entries()],
+    })
+    const sealed = dpapiCall('protect', Buffer.from(payload, 'utf8'))
+    mkdirSync(dirname(credentialCachePath()), { recursive: true })
+    writeFileSync(credentialCachePath(), sealed)
+  } catch {
+    // A cache that cannot be written is a slower plugin, not a broken one.
+  }
+}
+
+/** Read the sealed cache, or `undefined` when absent/expired/unreadable. */
+function loadCredentialCache(): DoubaoCredentials | undefined {
+  try {
+    const sealed = readFileSync(credentialCachePath())
+    const json = dpapiCall('unprotect', sealed).toString('utf8')
+    const parsed = JSON.parse(json) as { savedAt?: unknown; header?: unknown; pairs?: unknown }
+    if (typeof parsed.savedAt !== 'number') return undefined
+    if (Date.now() - parsed.savedAt > CREDENTIAL_CACHE_TTL_MS) return undefined
+    if (typeof parsed.header !== 'string' || !Array.isArray(parsed.pairs)) return undefined
+    const pairs = new Map<string, string>()
+    for (const entry of parsed.pairs) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue
+      const [name, value] = entry as [unknown, unknown]
+      if (typeof name === 'string' && typeof value === 'string' && name !== '') {
+        pairs.set(name, value)
+      }
+    }
+    const missing = REQUIRED_COOKIE_NAMES.filter((name) => !pairs.get(name))
+    if (missing.length > 0) return undefined
+    return { ok: true, header: parsed.header, pairs }
+  } catch {
+    return undefined
   }
 }
 
@@ -265,34 +347,88 @@ export function findDoubaoUserDataDir(): string | undefined {
  * SQLite access (read-only, via a throwaway copy)
  * ------------------------------------------------------------------ */
 
+/** Block the current thread for `ms` (no async plumbing in this read path). */
+function sleepSync(ms: number): void {
+  const view = new Int32Array(new SharedArrayBuffer(4))
+  Atomics.wait(view, 0, 0, ms)
+}
+
+/** Select the decryptable cookie rows from an opened database. */
+function selectCookieRows(
+  db: { prepare(sql: string): { all(): unknown[] } },
+): Array<{ host: string; name: string; encrypted: Buffer }> {
+  const stmt = db.prepare(
+    'SELECT host_key, name, encrypted_value FROM cookies WHERE encrypted_value IS NOT NULL',
+  )
+  const rows = stmt.all() as Array<{ host_key: string; name: string; encrypted_value: Uint8Array }>
+  return rows.map((r) => ({
+    host: String(r.host_key),
+    name: String(r.name),
+    encrypted: Buffer.from(r.encrypted_value),
+  }))
+}
+
 /**
  * Read rows from the cookie jar.
  *
- * Chromium holds an exclusive lock on the live database, so the file is copied
- * to a temp directory first and that copy is destroyed before returning. The
- * original profile is only ever read.
+ * Two paths, because the live file is held by a running Chromium:
+ *
+ *   1. a read-only SQLite open on the ORIGINAL file — SQLite only needs a shared
+ *      lock, so this normally works even while the app is signed in and running;
+ *   2. a throwaway COPY, retried a few times. Windows share-deny locks and
+ *      on-access scanners make `copyFileSync` return `EBUSY` for a moment, and
+ *      that transient error used to surface as "credentials unreadable" — which
+ *      reads like a signed-out account and is the most misleading possible
+ *      message for a file that is simply busy.
+ *
+ * The original profile is only ever read.
  */
 function readCookieRows(userDataDir: string): Array<{ host: string; name: string; encrypted: Buffer }> {
   const source = join(userDataDir, 'Default', 'Network', 'Cookies')
+  const { DatabaseSync } = require_('node:sqlite') as typeof import('node:sqlite')
+
+  // 1. direct read-only open (retried: the lock is often held only briefly,
+  //    while the client is writing the cookie it just received)
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const db = new DatabaseSync(source, { readOnly: true })
+      try {
+        return selectCookieRows(db)
+      } finally {
+        db.close()
+      }
+    } catch {
+      if (attempt < 3) sleepSync(150)
+    }
+  }
+
+  // 2. copy, with bounded retries
   const scratch = mkdtempSync(join(tmpdir(), 'dsh-doubao-cookie-'))
   const copy = join(scratch, 'Cookies.db')
   try {
-    copyFileSync(source, copy)
-    // node:sqlite ships with Node 22.5+ under this flag on some builds; fall
-    // back to a plain read so the caller degrades instead of crashing.
-    const { DatabaseSync } = require_('node:sqlite') as
-      typeof import('node:sqlite')
+    let copied = false
+    let lastError: unknown
+    for (let attempt = 0; attempt < 6 && !copied; attempt += 1) {
+      try {
+        copyFileSync(source, copy)
+        copied = true
+      } catch (error) {
+        lastError = error
+        sleepSync(120)
+      }
+    }
+    if (!copied) {
+      throw new Error(
+        'the Doubao desktop client holds its Cookies database with an EXCLUSIVE lock ' +
+        '(EBUSY), so no other process can read the session while it is in that state. ' +
+        'Fully quit the Doubao client and retry: credentials are then cached in this ' +
+        'process for 10 minutes, so the app can be reopened straight away.',
+        { cause: lastError },
+      )
+    }
     const db = new DatabaseSync(copy, { readOnly: true })
     try {
-      const stmt = db.prepare(
-        'SELECT host_key, name, encrypted_value FROM cookies WHERE encrypted_value IS NOT NULL',
-      )
-      const rows = stmt.all() as Array<{ host_key: string; name: string; encrypted_value: Uint8Array }>
-      return rows.map((r) => ({
-        host: String(r.host_key),
-        name: String(r.name),
-        encrypted: Buffer.from(r.encrypted_value),
-      }))
+      return selectCookieRows(db)
     } finally {
       db.close()
     }
@@ -342,6 +478,32 @@ export function loadDoubaoCredentials(options: { force?: boolean } = {}): Doubao
       pairs: new Map(),
     }
   }
+
+  // STALE-WHILE-ERROR.
+  //
+  // A refresh can fail for a reason that does not invalidate what we already
+  // hold — the Doubao client takes an EXCLUSIVE lock on its Cookies database
+  // while it is active, and `EBUSY` on the read is by far the commonest case in
+  // practice. Dropping a working session because a re-read was blocked would
+  // break chat every ten minutes for anyone with the app open, so the previous
+  // good credential stays in force and the freshness clock restarts (which also
+  // stops the reader from spinning on a lock it cannot win).
+  if (!credentials.ok && cached?.credentials.ok === true) {
+    cached = { at: now, credentials: cached.credentials }
+    return cached.credentials
+  }
+
+  // Disk fallback: the app holds the jar exclusively whenever it is running, so
+  // a cold start with the app open can ONLY be served from the sealed cache.
+  if (!credentials.ok) {
+    const sealed = loadCredentialCache()
+    if (sealed !== undefined) {
+      cached = { at: now, credentials: sealed }
+      return sealed
+    }
+  }
+
+  if (credentials.ok) saveCredentialCache(credentials)
 
   cached = { at: now, credentials }
   return credentials

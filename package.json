@@ -2,7 +2,7 @@
   "name": "dsh-connect-doubao",
   "displayName": "DSH Connect Doubao",
   "description": "把本机已登录的豆包（Doubao）会员额度接入 DeepSeek Harness，作为 Seed 模型 provider，并提供只读的双窗口额度概览。",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "keywords": [
     "dsh-plugin",

@@ -95,6 +95,9 @@ const KIND_STATUS: Readonly<Record<DoubaoErrorKind, number>> = {
   session_dead: 401,
   network: 502,
   upstream: 502,
+  // 409, not 502: nothing is broken on the wire, and 502 would invite the host's
+  // retry classifier to burn the budget on a state only a toggle can change.
+  task_runtime_unavailable: 409,
 }
 
 function writeJson(res: ServerResponse, status: number, payload: unknown): void {
