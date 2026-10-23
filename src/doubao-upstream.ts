@@ -213,6 +213,19 @@ export interface ChatRequestOptions {
    */
   taskMode?: boolean
   /**
+   * Ask for the 深度思考 pass (probe knob; see `buildChatBody`).
+   */
+  deepThink?: boolean
+  /**
+   * Continue the conversation named by {@link ChatRequestOptions.conversationId}
+   * instead of opening a new one.
+   *
+   * The client sends `need_create_conversation: false` plus the id it got back;
+   * omitting both starts a fresh thread. Set by the shim from its own
+   * conversation store (see `doubao-session.ts`).
+   */
+  continueConversation?: boolean
+  /**
    * Directory the task declares as its workspace.
    *
    * The cloud plans against these paths, so they must be real on THIS machine.
@@ -337,6 +350,17 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
   const level = findReasoningLevel(options.reasoningLevel)
   const task = taskModeEnabled(options)
   /**
+   * Deep-thinking toggle, for probing only.
+   *
+   * The captured ordinary turn sends `need_deep_think: 0`; the client's 深度思考
+   * switch is what turns this on, and the value it sends there has NOT been
+   * captured yet. `DSH_DOUBAO_DEEP_THINK=1` reproduces the old 10000+level shape
+   * so the resulting stream can be inspected.
+   */
+  const deepThink = options.deepThink === true ||
+    (options.deepThink === undefined && process.env.DSH_DOUBAO_DEEP_THINK === '1')
+  const needDeepThink = deepThink ? needDeepThinkOf(level) : 0
+  /**
    * 2 = 普通对话, 1 = 「工作任务」.
    *
    * CDP-captured from the running client on 2026-10-22. This constant was the
@@ -391,11 +415,9 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
       answer_with_suggest: false,
       agent_mode: agentMode,
       tts_switch: false,
-      // 0, always. The captured chat request carries 0 even with reasoning
-      // effort 高 — the level travels in `reasoning_effort`, and this field is
-      // the (off) deep-think toggle. The plugin used to send 10000+level here,
-      // a value the client never emits on this path.
-      need_deep_think: 0,
+      // 0 on an ordinary turn. The level itself travels in `reasoning_effort`;
+      // this is the (off) 深度思考 toggle, worth 10000+level when on.
+      need_deep_think: needDeepThink,
       click_clear_context: false,
       from_suggest: false,
       is_regen: false,
@@ -409,9 +431,9 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
       scene_type: 0,
       unique_key: randomUUID(),
       start_seq: 0,
-      // This client keeps no thread: it re-flattens the transcript every turn,
-      // so every request is a NEW conversation.
-      need_create_conversation: true,
+      // A continuation reuses the server-side thread: `false` + the id it issued.
+      // Anything else starts a new conversation.
+      need_create_conversation: options.continueConversation !== true,
       conversation_init_option: { need_ack_conversation: true },
       // The model and the mode are declared here as well as in `model_config`.
       // The captured request does both; the server reads this pair first.
@@ -477,7 +499,7 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
     user_context: [],
     ext: {
       agent_mode: String(agentMode),
-      use_deep_think: '0',
+      use_deep_think: String(needDeepThink),
       sub_conv_firstmet_type: '1',
       general_task_param: JSON.stringify(taskParam),
       collection_id: '',

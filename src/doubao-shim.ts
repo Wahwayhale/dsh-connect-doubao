@@ -32,8 +32,14 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
+import {
+  ConversationStore,
+  continuationDelta,
+  isContinuation,
+  sessionKeyOf,
+} from './doubao-session.ts'
 import { loadDoubaoCredentials, type DoubaoCredentials } from './doubao-auth.ts'
-import { chat, DoubaoUpstreamError, classifyDoubaoFailure, type DoubaoErrorKind } from './doubao-upstream.ts'
+import { chat, DoubaoUpstreamError, classifyDoubaoFailure, type ChatRequestOptions, type DoubaoErrorKind } from './doubao-upstream.ts'
 import { fetchQuota, findWindow, millisUntilReset } from './doubao-quota.ts'
 import { DOUBAO_MODELS, findDoubaoModel } from './doubao-catalog.ts'
 
@@ -261,6 +267,15 @@ export interface DoubaoShimOptions {
 export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
   const resolveCredentials = options.resolveCredentials ?? loadDoubaoCredentials
 
+  /**
+   * Doubao conversation ids by transcript opening.
+   *
+   * The Harness resends the whole transcript every turn, so continuity has to be
+   * inferred; see `doubao-session.ts` for the rule and why it is conservative.
+   * Kept per shim (i.e. per host process) — a restart simply starts new threads.
+   */
+  const sessions = new ConversationStore()
+
   // Per-process shared secret. In memory only; pi-ai sends it as
   // `Authorization: Bearer`, the shim validates it, and it is never
   // forwarded upstream — Doubao authenticates on its own cookie jar.
@@ -347,6 +362,9 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     res: ServerResponse,
     prompt: string,
     parsed: InboundChatRequest,
+    upstreamOptions: ChatRequestOptions,
+    remember: (conversationId: string | undefined) => void,
+    forget: () => void,
   ): Promise<void> {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -363,7 +381,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     let roleSent = false
     try {
       const result = await chat(prompt, {
-        ...requestOptions(parsed),
+        ...upstreamOptions,
         callbacks: {
           onText: (delta) => {
             if (!roleSent) {
@@ -374,6 +392,9 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
           },
         },
       })
+      // Only a completed turn teaches us the thread id; a failed one leaves the
+      // previous mapping alone so the next attempt can still continue it.
+      remember(result.conversationId)
       if (!roleSent) send({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
       send({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
       if (!res.writableEnded) {
@@ -382,6 +403,12 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       }
       void result
     } catch (error) {
+      // A thread the server no longer knows must not be retried forever: drop it
+      // so the NEXT turn opens a fresh conversation instead of failing the same
+      // way for the next 30 minutes.
+      if (error instanceof DoubaoUpstreamError && classifyDoubaoFailure(error) === 'session_dead') {
+        forget()
+      }
       // The response has already begun, so the failure can only be reported
       // inside the stream. An error chunk is what pi-ai surfaces to the user.
       send({ error: { message: (error as Error)?.message ?? 'Doubao upstream failed', type: 'SERVER' } })
@@ -483,14 +510,58 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         return
       }
 
-      const prompt = buildPrompt(parsed.messages)
+      // ---- conversation continuity ------------------------------------
+      //
+      // The Harness sends the WHOLE transcript each turn, so the delta is what
+      // this turn adds. A continuation sends only that delta plus the id the
+      // server issued last time; anything uncertain starts a new conversation,
+      // which is the previous behaviour and never worse.
+      const sessionKey = sessionKeyOf(parsed.messages)
+      const known = sessions.get(sessionKey)
+      const continuing = isContinuation(parsed.messages, known)
+      /**
+       * What to send.
+       *
+       * `+1` accounts for the ASSISTANT reply this turn will add to the thread:
+       * the server stores both sides, while the inbound transcript we remember
+       * ends at the user message. Without it the next turn would resend last
+       * turn's answer as if it were new input.
+       */
+      const delta = continuing ? continuationDelta(parsed.messages ?? [], known) : []
+      // A transcript that grew by only an assistant message leaves nothing to
+      // send; fall back to the full prompt rather than 400-ing the request.
+      const useDelta = delta.length > 0
+      const isContinuationTurn = continuing && useDelta
+      const outgoing = useDelta ? delta : (parsed.messages ?? [])
+      const prompt = buildPrompt(outgoing)
       if (!prompt) {
         writeOpenAIError(res, 400, 'invalid_request', 'no usable message content')
         return
       }
+      const upstreamOptions = {
+        ...requestOptions(parsed),
+        ...isContinuationTurn ? { conversationId: known.conversationId, continueConversation: true } : {},
+      }
+      /** Record the thread id the server handed back, for the next turn. */
+      const remember = (conversationId: string | undefined): void => {
+        if (conversationId !== undefined) {
+          sessions.remember(sessionKey, conversationId, (parsed.messages?.length ?? 0) + 1)
+        }
+      }
+      // Diagnosis without a debugger: which path this turn took, how much text
+      // went upstream, and whether a thread id was reused. Never logs content.
+      if (process.env.DSH_DOUBAO_DEBUG_PLAN === '1') {
+        process.stderr.write(
+          `[plan] continuation=${isContinuationTurn} ` +
+          `messages=${parsed.messages?.length ?? 0} ` +
+          `sending=${outgoing.length} chars=${prompt.length} ` +
+          `conversation=${isContinuationTurn ? known.conversationId : '(new)'}\n`,
+        )
+      }
 
       if (parsed.stream === false) {
-        const result = await chat(prompt, requestOptions(parsed))
+        const result = await chat(prompt, upstreamOptions)
+        remember(result.conversationId)
         // What we actually sent upstream: the inbound id run through the
         // catalog, so an unknown id degrades to the default instead of being
         // echoed back as if it had been honoured.
@@ -510,7 +581,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         return
       }
 
-      await streamCompletion(res, prompt, parsed)
+      await streamCompletion(res, prompt, parsed, upstreamOptions, remember, () => sessions.forget(sessionKey))
     } catch (error) {
       writeFailure(res, error)
     }
