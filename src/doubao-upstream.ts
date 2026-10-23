@@ -904,16 +904,7 @@ async function consumeStream(
 
   const chunkText = texts.join('')
   const notifyText = notifyTexts.join('')
-  /**
-   * The reply is `notify` + chunk deltas.
-   *
-   * The opening lands in STREAM_MSG_NOTIFY and the rest arrives as patch deltas
-   * in STREAM_CHUNK, so taking only the chunks silently swallowed the first
-   * character of EVERY answer (「1+1」 came back as 「+1」, 「我是豆包」 as
-   * 「是豆包」). A cumulative chunk stream would already start with the notify
-   * text, so that case is detected instead of concatenated twice.
-   */
-  const raw = chunkText.startsWith(notifyText) ? chunkText : notifyText + chunkText
+  const raw = assembleReplyText(notifyText, chunkText)
   const text = stripPromptEcho(raw)
   if (taskAgentError !== undefined) {
     // Checked BEFORE the empty-completion branch: the placeholder text is
@@ -943,6 +934,24 @@ async function consumeStream(
     ...(intentionAgent !== undefined ? { intentionAgent } : {}),
     thinking,
   }
+}
+
+/**
+ * Join the two halves of a reply.
+ *
+ * The opening of every answer arrives in STREAM_MSG_NOTIFY and the remainder as
+ * patch deltas in STREAM_CHUNK. Reading only the chunks swallowed the first
+ * character of EVERY reply — 「1+1等于2。」 came back as 「+1等于2。」, 「我是豆包」
+ * as 「是豆包」 — and nothing failed loudly, which is exactly why it survived.
+ *
+ * A cumulative chunk stream (one that re-sends what was already delivered)
+ * already starts with the notification text; that case is detected rather than
+ * concatenated twice. Exported so the rule can be tested without a live stream.
+ */
+export function assembleReplyText(notifyText: string, chunkText: string): string {
+  if (notifyText === '') return chunkText
+  if (chunkText === '') return notifyText
+  return chunkText.startsWith(notifyText) ? chunkText : notifyText + chunkText
 }
 
 /**

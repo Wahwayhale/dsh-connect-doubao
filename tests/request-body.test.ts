@@ -18,7 +18,7 @@
  * expected value from the same constant it is checking cannot fail.
  */
 import { afterEach, describe, expect, it } from 'vitest'
-import { buildChatBody } from '../src/doubao-upstream.ts'
+import { assembleReplyText, buildChatBody } from '../src/doubao-upstream.ts'
 import { DOUBAO_MODELS } from '../src/doubao-catalog.ts'
 
 /** A body for the default chat turn. */
@@ -107,6 +107,29 @@ describe('task mode stays opt-in and keeps its own shape', () => {
   it('can be enabled by environment for a probe run', () => {
     process.env.DSH_DOUBAO_TASK = '1'
     expect(body().option.agent_mode).toBe(1)
+  })
+})
+
+describe('a reply is notify opening + chunk deltas, never only one of them', () => {
+  it('keeps the first character, which lives in the notification', () => {
+    // 「1+1等于2。」 used to come back as 「+1等于2。」 because only chunks were read.
+    expect(assembleReplyText('1', '+1等于2。')).toBe('1+1等于2。')
+  })
+
+  it('handles a reply that is entirely in the notification', () => {
+    expect(assembleReplyText('你好', '')).toBe('你好')
+  })
+
+  it('handles a reply with no notification text at all', () => {
+    expect(assembleReplyText('', '好的')).toBe('好的')
+  })
+
+  it('does not duplicate a cumulative chunk stream', () => {
+    expect(assembleReplyText('你好', '你好世界')).toBe('你好世界')
+  })
+
+  it('is empty when nothing arrived', () => {
+    expect(assembleReplyText('', '')).toBe('')
   })
 })
 
