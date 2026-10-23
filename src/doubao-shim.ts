@@ -383,6 +383,17 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       const result = await chat(prompt, {
         ...upstreamOptions,
         callbacks: {
+          // Private reasoning is forwarded as `reasoning_content`, the field
+          // OpenAI-compatible clients read for it. It is NOT mixed into
+          // `content`: a client that does not understand it simply ignores it,
+          // which is the right degradation.
+          onThinking: (delta) => {
+            if (!roleSent) {
+              send({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
+              roleSent = true
+            }
+            send({ choices: [{ index: 0, delta: { reasoning_content: delta }, finish_reason: null }] })
+          },
           onText: (delta) => {
             if (!roleSent) {
               send({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })

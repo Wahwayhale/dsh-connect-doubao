@@ -33,7 +33,7 @@ import {
   DOUBAO_CONTEXT_WINDOW,
   findDoubaoModel,
   findReasoningLevel,
-  needDeepThinkOf,
+  needDeepThinkValue,
   TASK_RUNTIME_LOCAL_PC,
   TASK_SANDBOX_AUTH_ALLOW_ALL,
 } from './doubao-catalog.ts'
@@ -359,7 +359,7 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
    */
   const deepThink = options.deepThink === true ||
     (options.deepThink === undefined && process.env.DSH_DOUBAO_DEEP_THINK === '1')
-  const needDeepThink = deepThink ? needDeepThinkOf(level) : 0
+  const needDeepThink = needDeepThinkValue(deepThink)
   /**
    * 2 = 普通对话, 1 = 「工作任务」.
    *
@@ -474,7 +474,11 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
         mention_skill_list: '[]',
         mention_plugin_list: '[]',
         mention_ext: '[{}]',
-        conversation_mode: '',
+        // The captured deep-think request carries "1" here while an ordinary turn
+        // carries "". Without it the 10040 thinking block still appears in the
+        // stream but stays empty (`deep_think_intention: "0"`), i.e. the server
+        // opens the shell and skips the thinking.
+        conversation_mode: deepThink ? '1' : '',
         mode_id: modeId,
         model_item_key: model.id,
         agent_mode: String(agentMode),
@@ -578,6 +582,48 @@ function harvestText(node: unknown, into: { out: string[] }): void {
   }
 }
 
+/**
+ * Collect answer text and thinking text, separated by block ownership.
+ *
+ * A deep-think reply carries a `block_type: 10040` container (the visible
+ * 「正在思考 / 已完成思考」 shell) and then streams the reasoning as ordinary
+ * `block_type: 10000` blocks whose `parent_id` is that container's id. The shell
+ * and its children both point at `Deep_Think.png`, but `parent_id` is the
+ * reliable discriminator, so it is what this uses.
+ *
+ * Treating every `text` as answer text — what the previous revision did — mixes
+ * the model's private reasoning into the reply the user sees.
+ */
+export function collectBlocks(
+  node: unknown,
+  into: { answer: string[]; thinking: string[] },
+  thinkingIds: Set<string>,
+): void {
+  if (Array.isArray(node)) {
+    for (const item of node) collectBlocks(item, into, thinkingIds)
+    return
+  }
+  if (node === null || typeof node !== 'object') return
+  const record = node as Record<string, unknown>
+
+  const blockType = record.block_type
+  if (typeof blockType === 'number') {
+    const blockId = typeof record.block_id === 'string' ? record.block_id : undefined
+    if (blockType === THINKING_BLOCK_TYPE && blockId !== undefined) thinkingIds.add(blockId)
+    const content = record.content as { text_block?: { text?: unknown } } | undefined
+    const text = content?.text_block?.text
+    if (typeof text === 'string' && text !== '') {
+      const parentId = typeof record.parent_id === 'string' ? record.parent_id : ''
+      const isThinking = blockType === THINKING_BLOCK_TYPE ||
+        (parentId !== '' && thinkingIds.has(parentId))
+      if (isThinking) into.thinking.push(text)
+      else into.answer.push(text)
+    }
+  }
+
+  for (const value of Object.values(record)) collectBlocks(value, into, thinkingIds)
+}
+
 /** Read the model identifier the server actually used for a reply. */
 export function extractModel(payload: unknown): string | undefined {
   const seen = new Set<string>()
@@ -625,6 +671,8 @@ function extractThinking(payload: unknown): boolean {
 
 export interface StreamCallbacks {
   onText?: (delta: string) => void
+  /** Private reasoning deltas (deep-think turns); never part of the answer. */
+  onThinking?: (delta: string) => void
   onEvent?: (event: string) => void
 }
 
@@ -781,6 +829,10 @@ async function consumeStream(
   const texts: string[] = []
   /** Text carried by STREAM_MSG_NOTIFY instead of by chunk deltas. */
   const notifyTexts: string[] = []
+  /** Private reasoning (deep-think turns), kept out of the answer. */
+  const reasoningParts: string[] = []
+  /** block_ids of the `block_type: 10040` thinking containers seen so far. */
+  const thinkingBlockIds = new Set<string>()
   let conversationId: string | undefined
   let messageId: string | undefined
   let model: string | undefined
@@ -878,9 +930,14 @@ async function consumeStream(
       // FULL_MSG_NOTIFY stays excluded: it carries the USER's own message, so
       // harvesting it would replay the prompt into the answer.
       if (name === 'STREAM_MSG_NOTIFY') {
-        const acc = { out: [] as string[] }
-        harvestText(record.content?.content_block, acc)
-        for (const piece of acc.out) {
+        const acc = { answer: [] as string[], thinking: [] as string[] }
+        collectBlocks(record.content?.content_block, acc, thinkingBlockIds)
+        for (const piece of acc.thinking) {
+          if (!piece) continue
+          reasoningParts.push(piece)
+          if (callbacks?.onThinking) callbacks.onThinking(piece)
+        }
+        for (const piece of acc.answer) {
           if (!piece) continue
           notifyTexts.push(piece)
           // Emitted live: this frame carries the OPENING of the reply, and the
@@ -894,10 +951,14 @@ async function consumeStream(
     if (name === 'STREAM_CHUNK' || name === 'CHUNK_DELTA') {
       model = model ?? extractModel(payload)
       thinking = thinking || extractThinking(payload)
-      const acc = { out: [] as string[] }
-      harvestText(payload, acc)
-      // The first harvested chunk can be an echo of the user's own prompt.
-      for (const text of acc.out) {
+      const acc = { answer: [] as string[], thinking: [] as string[] }
+      collectBlocks(payload, acc, thinkingBlockIds)
+      for (const piece of acc.thinking) {
+        if (!piece) continue
+        reasoningParts.push(piece)
+        if (callbacks?.onThinking) callbacks.onThinking(piece)
+      }
+      for (const text of acc.answer) {
         if (!text) continue
         if (callbacks?.onText) callbacks.onText(text)
         texts.push(text)
@@ -952,7 +1013,7 @@ async function consumeStream(
     ...(model !== undefined ? { model } : {}),
     ...(conversationId !== undefined ? { conversationId } : {}),
     ...(messageId !== undefined ? { messageId } : {}),
-    ...(reasoningText !== undefined ? { reasoningText } : {}),
+    ...(reasoningParts.length > 0 ? { reasoningText: reasoningParts.join('') } : {}),
     ...(intentionAgent !== undefined ? { intentionAgent } : {}),
     thinking,
   }
@@ -1039,6 +1100,14 @@ export type DoubaoErrorKind =
 const CODE_SESSION_DEAD = 710012001
 /** The server's business code for a risk-control slider challenge. */
 const CODE_RATE_LIMITED = 710022004
+/**
+ * `block_type` of the deep-think container.
+ *
+ * A 深度思考 turn opens one `10040` block (the 「正在思考 / 已完成思考」 shell) and
+ * then streams the reasoning as `10000` blocks whose `parent_id` is its id.
+ * Captured 2026-10-23.
+ */
+const THINKING_BLOCK_TYPE = 10040
 /**
  * The server's business code when a 「工作任务」 was accepted but its executing
  * runtime could not be reached (`expose_reason: agent_err_real_answer`).

@@ -121,9 +121,28 @@ export function findReasoningLevel(id: string | undefined): DoubaoReasoningLevel
     ?? DOUBAO_REASONING_LEVELS.find((level) => level.id === DEFAULT_REASONING_LEVEL_ID)!
 }
 
-/** `need_deep_think` for a reasoning level: 10000 + level, per a captured request. */
-export function needDeepThinkOf(level: DoubaoReasoningLevel): number {
-  return 10_000 + level.level
+/**
+ * `need_deep_think` / `ext.use_deep_think` — the 深度思考 switch.
+ *
+ * CDP-captured 2026-10-23, the same conversation sent with the switch OFF and ON:
+ *
+ *   off →  option.need_deep_think: 0   ext.use_deep_think: "0"
+ *   on  →  option.need_deep_think: 3   ext.use_deep_think: "3"
+ *
+ * `3` is what the switch sends — NOT `10000 + reasoning_effort`. That shape
+ * (10005 at 高) was this plugin's own invention, and sending it produced no
+ * thinking at all: every frame still carried `block_type: 10000` and the reply
+ * agent was `pc_general_nocot_agent` (no-CoT).
+ *
+ * The two axes are independent: effort still travels as `reasoning_effort`
+ * 3/4/5, while this flag only says whether the model may think before answering.
+ */
+export const DEEP_THINK_OFF = 0
+export const DEEP_THINK_ON = 3
+
+/** `need_deep_think` value for the switch state. */
+export function needDeepThinkValue(deepThink: boolean): number {
+  return deepThink ? DEEP_THINK_ON : DEEP_THINK_OFF
 }
 
 export interface DoubaoModelInfo {
