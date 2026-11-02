@@ -98,7 +98,7 @@ describe('writeStoredSetting', () => {
 describe('withStoredSettings', () => {
   it('falls back to the Loader config when no file exists', () => {
     const merged = withStoredSettings({ enabledModelIds: ['0'], toolEmulation: true }, file)
-    expect(merged).toEqual({ enabledModelIds: ['0'], toolEmulation: true })
+    expect(merged).toEqual({ enabledModelIds: ['0'], toolEmulation: true, profileDir: '' })
   })
 
   it('lets the file win over the Loader config', () => {
@@ -110,8 +110,40 @@ describe('withStoredSettings', () => {
     expect(merged.enabledModelIds).toEqual(['0'])
   })
 
+  it('stores and returns the manual profile directory', () => {
+    writeStoredSetting('profileDir', 'D:/Doubao/User Data', file)
+    expect(readStoredSettings(file)).toEqual({ profileDir: 'D:/Doubao/User Data' })
+  })
+
+  it('lets a stored profile directory win over the Loader config', () => {
+    // A recorded pick is the one value we know reached disk, so a disagreeing
+    // Loader entry is stale by definition.
+    writeStoredSetting('profileDir', 'D:/Doubao/User Data', file)
+    const merged = withStoredSettings({ profileDir: 'C:/stale' }, file)
+    expect(merged.profileDir).toBe('D:/Doubao/User Data')
+  })
+
+  it('falls back to the Loader profile directory before the empty default', () => {
+    const merged = withStoredSettings({ profileDir: 'E:/Doubao/User Data' }, file)
+    expect(merged.profileDir).toBe('E:/Doubao/User Data')
+  })
+
+  it('treats a blank profile directory as unset so auto-detection resumes', () => {
+    writeStoredSetting('profileDir', '', file)
+    const merged = withStoredSettings({ profileDir: 'E:/Doubao/User Data' }, file)
+    expect(merged.profileDir).toBe('')
+  })
+
+  it('rejects a non-string profile directory', () => {
+    expect(() => { writeStoredSetting('profileDir', 42, file) }).toThrow('invalid value')
+  })
+
   it('defaults to an empty model list and tools off', () => {
-    expect(withStoredSettings(undefined, file)).toEqual({ enabledModelIds: [], toolEmulation: false })
+    expect(withStoredSettings(undefined, file)).toEqual({
+      enabledModelIds: [],
+      toolEmulation: false,
+      profileDir: '',
+    })
   })
 })
 

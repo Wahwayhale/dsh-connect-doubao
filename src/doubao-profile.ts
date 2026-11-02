@@ -7,9 +7,11 @@
  * move it after the fact to keep C: small. A hardcoded `AppData` path then
  * fails with "profile not found" on an otherwise perfectly working install.
  *
- * Four strategies, cheapest and most explicit first:
+ * Strategies, most explicit first:
  *
- *   1. `DSH_DOUBAO_PROFILE`  — escape hatch, the only one a user controls.
+ *   0. the directory the user picked in the settings card — stored in this
+ *      plugin's own settings file and applied through {@link setProfileOverride}
+ *   1. `DSH_DOUBAO_PROFILE`  — escape hatch, for scripted setups.
  *   2. AppData candidates    — the default layout, and free (four `existsSync`)
  *   3. process command line  — `Doubao.exe --user-data-dir=…`, authoritative
  *                              but costs a `powershell.exe` (≈0.8 s), so it is
@@ -32,7 +34,7 @@ import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 /** Where a candidate path came from. Reported by `doctor` so failures are diagnosable. */
-export type ProfileSource = 'env' | 'process' | 'appdata' | 'scan'
+export type ProfileSource = 'manual' | 'env' | 'process' | 'appdata' | 'scan'
 
 export interface DoubaoProfileLocation {
   /** Absolute path of the `User Data` directory (the one containing `Default`). */
@@ -55,13 +57,46 @@ export interface ProfileProbeDeps {
   scanBudgetMs?: number
   /** Injectable clock, for tests. */
   now?: () => number
+  /** Overrides {@link setProfileOverride}, for tests. */
+  manual?: string
 }
 
 /** Env var a user can set to point at their profile (the folder holding `Default`). */
 export const PROFILE_ENV = 'DSH_DOUBAO_PROFILE'
 
+/**
+ * The directory the user picked in the settings card, if any.
+ *
+ * Module-level because the card's choice has to reach every caller of
+ * `loadDoubaoCredentials` (quota, shim, upstream) without threading a parameter
+ * through four layers. `apply` seeds it once at startup from the settings file
+ * and re-seeds it whenever the card saves a new path.
+ */
+let manualOverride: string | undefined
+
+/**
+ * Point the resolver at a user-chosen directory.
+ *
+ * Call with `undefined` to go back to automatic detection. Invalid paths are
+ * ignored here rather than stored, so a folder that was later deleted or
+ * renamed falls back to detection instead of breaking sign-in outright.
+ */
+export function setProfileOverride(raw: string | undefined): void {
+  if (raw === undefined) {
+    manualOverride = undefined
+    return
+  }
+  const resolved = resolveUserProvided(raw)
+  manualOverride = resolved
+}
+
+/** The active override after validation, or `undefined`. */
+export function currentProfileOverride(): string | undefined {
+  return manualOverride
+}
+
 /** A directory is a profile only if the cookie jar is really there. */
-function looksLikeProfile(dir: string): boolean {
+export function looksLikeProfile(dir: string): boolean {
   return existsSync(join(dir, 'Default', 'Network', 'Cookies'))
 }
 
@@ -71,7 +106,7 @@ function looksLikeProfile(dir: string): boolean {
  * Accepts either the `User Data` directory itself or its parent (`E:\Doubao`),
  * because both are reasonable readings of "where my data is".
  */
-function resolveUserProvided(raw: string): string | undefined {
+export function resolveUserProvided(raw: string): string | undefined {
   const trimmed = raw.trim().replace(/^"|"$/g, '')
   if (trimmed === '') return undefined
   if (looksLikeProfile(trimmed)) return trimmed
@@ -248,7 +283,15 @@ export function listDoubaoProfiles(deps: ProfileProbeDeps = {}): DoubaoProfileLo
     out.push({ dir, source })
   }
 
-  // 1. explicit user choice
+  // 0. what the user picked in the settings card. The stored value is already
+  //    validated, but the injected one may come straight from a test or a
+  //    stale pick, so both paths re-resolve: a pick that no longer holds any
+  //    Doubao data falls through to automatic detection instead of wedging
+  //    credential loading on a folder the user has since moved.
+  const manual = deps.manual ?? manualOverride
+  if (manual !== undefined) push(resolveUserProvided(manual), 'manual')
+
+  // 1. explicit environment variable
   const override = env[PROFILE_ENV]
   if (typeof override === 'string') push(resolveUserProvided(override), 'env')
 

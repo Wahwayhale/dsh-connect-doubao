@@ -19,6 +19,7 @@ import {
   findDoubaoUserDataDir,
   listDoubaoProfiles,
   PROFILE_ENV,
+  setProfileOverride,
 } from '../src/doubao-profile.ts'
 
 let root: string
@@ -266,5 +267,75 @@ describe('findDoubaoUserDataDir / describeProfileLocation', () => {
         platform: 'win32',
       }),
     ).toBe('<not found>')
+  })
+})
+
+describe('manual override', () => {
+  it('wins over every automatic strategy', () => {
+    // Someone who picks a folder in the card has already answered the question
+    // the probes are asking, so no probe is consulted at all.
+    const manual = makeProfile(root, 'Chosen')
+    const appdata = makeProfile(join(root, 'appdata'), 'User Data')
+    // `processCommandLines` is stubbed because this machine runs a real client:
+    // without it the probe returns the developer's own profile and the test
+    // would pass or fail depending on whose laptop it runs on.
+    const profiles = listDoubaoProfiles({
+      manual,
+      appDataBases: [join(root, 'appdata', 'User Data')],
+      processCommandLines: () => [],
+    })
+    expect(profiles[0]).toEqual({ dir: manual, source: 'manual' })
+    expect(profiles.some(entry => entry.dir === appdata)).toBe(true)
+  })
+
+  it('is ignored when the folder holds no Doubao data', () => {
+    // A stale pick must not brick credential loading: the automatic probes run
+    // instead, so the user sees their quota with a wrong-but-working path
+    // rather than "not found" forever.
+    const empty = join(root, 'empty')
+    mkdirSync(empty, { recursive: true })
+    const appdata = makeProfile(join(root, 'appdata'), 'User Data')
+    const profiles = listDoubaoProfiles({
+      manual: empty,
+      appDataBases: [join(root, 'appdata', 'User Data')],
+      processCommandLines: () => [],
+    })
+    expect(profiles).toEqual([{ dir: appdata, source: 'appdata' }])
+  })
+
+  it('accepts the parent folder and looks one level down', () => {
+    // The picker hands back whatever the user clicked, and people click the
+    // install folder (`D:\Doubao`) rather than the `User Data` inside it.
+    const manual = makeProfile(root, 'User Data')
+    const profiles = listDoubaoProfiles({ manual: root, appDataBases: [], processCommandLines: () => [] })
+    expect(profiles[0]).toEqual({ dir: manual, source: 'manual' })
+  })
+
+  it('survives a module-level override being set and cleared', () => {
+    const manual = makeProfile(root, 'Chosen')
+    setProfileOverride(manual)
+    try {
+      expect(listDoubaoProfiles({ appDataBases: [], processCommandLines: () => [] })[0]?.source).toBe('manual')
+      setProfileOverride(undefined)
+      // Nothing left to find: no appdata candidate, no client process, and the
+      // drive scan is kept out of the way with a zero budget.
+      expect(listDoubaoProfiles({
+        appDataBases: [],
+        processCommandLines: () => [],
+        scanRoots: [],
+      })).toEqual([])
+    } finally {
+      setProfileOverride(undefined)
+    }
+  })
+
+  it('ignores a module-level override pointing at nothing', () => {
+    setProfileOverride(join(root, 'missing'))
+    try {
+      const profiles = listDoubaoProfiles({ appDataBases: [], processCommandLines: () => [] })
+      expect(profiles.some(entry => entry.source === 'manual')).toBe(false)
+    } finally {
+      setProfileOverride(undefined)
+    }
   })
 })

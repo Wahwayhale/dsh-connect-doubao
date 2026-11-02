@@ -34,6 +34,9 @@ export const DOUBAO_CARD_CSS = `
 .dbq-row-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .dbq-label { font-weight: 500; }
 .dbq-meta { color: #9aa0a6; font-size: 12px; white-space: nowrap; }
+/* Candidate list: one path per line, and a long path must wrap instead of
+   pushing the card wider than the settings panel. */
+.dbq-candidates { color: #9aa0a6; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 
 .dbq-bar { height: 8px; border-radius: 999px; background: #2b2f36; overflow: hidden; }
 .dbq-fill { height: 100%; border-radius: 999px; background: #4a9eff; transition: width .25s ease; }

@@ -18,7 +18,10 @@
  */
 import { createDoubaoAdapter } from './doubao-adapter.ts'
 import { createDoubaoShim } from './doubao-shim.ts'
-import { registerDoubaoQuotaRoute, registerDoubaoCatalogRoute, registerDoubaoSaveRoute } from './doubao-status.ts'
+import { registerDoubaoQuotaRoute, registerDoubaoCatalogRoute, registerDoubaoSaveRoute, registerDoubaoProfileRoute } from './doubao-status.ts'
+import { setProfileOverride, listDoubaoProfiles } from './doubao-profile.ts'
+import { invalidateCredentialCache } from './doubao-auth.ts'
+import { invalidateQuotaCache } from './doubao-quota.ts'
 import type { WebServerLike } from './doubao-status.ts'
 import {
   DOUBAO_CONTEXT_WINDOW,
@@ -29,7 +32,7 @@ import {
   discoverDoubaoModels,
   enabledModelsOf,
 } from './doubao-catalog.ts'
-import { ENABLED_MODEL_IDS_FIELD, effectiveIds, toolEmulationOf } from './doubao-config.ts'
+import { ENABLED_MODEL_IDS_FIELD, effectiveIds, profileDirOf, toolEmulationOf } from './doubao-config.ts'
 import { writeStoredSetting, readStoredSettings, withStoredSettings } from './doubao-store.ts'
 import { liveModels, invalidateDiscovery, discoverAllCachedModels } from './doubao-discovery.ts'
 import type { DoubaoSettings } from './doubao-config.ts'
@@ -195,7 +198,7 @@ export function settingsNamespaceOf(ctx: unknown): string {
  * releases the shim's port, the adapter, the directory entry, the discovery
  * callback and the HTTP routes — nothing outlives the plugin.
  */
-export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabledModelIds: [], toolEmulation: false }): void {
+export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabledModelIds: [], toolEmulation: false, profileDir: '' }): void {
   let shim: ReturnType<typeof createDoubaoShim> | undefined
   let adapterRelease: (() => void) | undefined
   let directoryRelease: (() => void) | undefined
@@ -215,6 +218,12 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
    * saved a switch.
    */
   let current: DoubaoSettings = withStoredSettings(config)
+
+  // Point credential discovery at the user's choice before ANY caller runs.
+  // `apply` is the only place that sees the stored settings this early, and the
+  // shim/quota/adapter all reach for credentials through the module-level
+  // resolver — so the override has to be installed here, not lazily.
+  setProfileOverride(profileDirOf(current))
 
   try {
     shim = createDoubaoShim({
@@ -393,6 +402,9 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
       try {
         const disposeQuota = registerDoubaoQuotaRoute(webCtx)
         const disposeCatalog = registerDoubaoCatalogRoute(webCtx, { modelsProvider: liveModels })
+        const disposeProfile = registerDoubaoProfileRoute(webCtx, {
+          candidates: () => listDoubaoProfiles().map(entry => ({ dir: entry.dir, source: entry.source })),
+        })
         const disposeSave = registerDoubaoSaveRoute(
           {
             webServer: (webCtx as unknown as { webServer: WebServerLike }).webServer,
@@ -414,6 +426,14 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
                 next.enabledModelIds = value.filter((id): id is string => typeof id === 'string')
               } else if (field === 'toolEmulation' && typeof value === 'boolean') {
                 next.toolEmulation = value
+              } else if (field === 'profileDir' && typeof value === 'string') {
+                next.profileDir = value
+                // A different profile means different cookies: drop both the
+                // resolved credentials and the cached quota, or the card would
+                // keep showing the old account's numbers after the switch.
+                setProfileOverride(value)
+                invalidateCredentialCache()
+                invalidateQuotaCache()
               }
               onSettingsChanged(next)
             },
@@ -422,6 +442,7 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
         ctx.effect(() => () => {
           disposeQuota()
           disposeCatalog()
+          disposeProfile()
           disposeSave()
         })
       } catch (error: unknown) {

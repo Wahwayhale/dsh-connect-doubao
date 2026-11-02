@@ -32,10 +32,19 @@ import {
   clampPercent,
   enabledModelIdsOf,
   DOUBAO_TOOL_EMULATION_FIELD,
+  DOUBAO_PROFILE_DIR_FIELD,
+  DOUBAO_PROFILE_PATH,
+  profileDirOf,
   toolEmulationOf,
   formatCountdown,
 } from './contract.ts'
-import type { DoubaoAccountState, DoubaoCatalogView, DoubaoModelEntry, DoubaoQuotaView } from './contract.ts'
+import type {
+  DoubaoAccountState,
+  DoubaoCatalogView,
+  DoubaoModelEntry,
+  DoubaoProfileView,
+  DoubaoQuotaView,
+} from './contract.ts'
 import type { DoubaoCardKey, Translate } from './locales.ts'
 import { DOUBAO_CARD_CSS } from './styles.ts'
 
@@ -443,6 +452,74 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
    * while the value never lands (see `onSave`), and silently failing to turn OFF
    * a capability that lets a model touch files is the worse error.
    */
+  // ---- profile directory ------------------------------------------------
+  const [profile, setProfile] = useState<DoubaoProfileView | undefined>(undefined)
+  const [profileBusy, setProfileBusy] = useState(false)
+  const [profileError, setProfileError] = useState<string | null>(null)
+
+  const loadProfile = useCallback(async (): Promise<void> => {
+    try {
+      const response = await fetch(DOUBAO_PROFILE_PATH, { method: 'GET' })
+      if (!response.ok) throw new Error(`HTTP ${String(response.status)}`)
+      setProfile(await response.json() as DoubaoProfileView)
+    } catch (error: unknown) {
+      setProfileError((error as Error)?.message ?? 'unknown error')
+    }
+  }, [])
+
+  useEffect(() => { void loadProfile() }, [loadProfile])
+
+  const chosenProfile = profileDirOf(configured)
+  /** What is actually in use right now: the manual pick, else auto-detection. */
+  const activeProfile = chosenProfile !== '' ? chosenProfile : (profile?.detected ?? '')
+
+  /**
+   * Open the host's native folder picker.
+   *
+   * The desktop shell exposes `__DSH_DIRECTORY_PICKER__.pick()` — an Electron
+   * dialog that runs on the main thread and can therefore create a folder. A
+   * browser-only host has no equivalent, and the card says so rather than
+   * silently doing nothing; `DSH_DOUBAO_PROFILE` remains the escape hatch.
+   */
+  const pickProfile = useCallback(async (): Promise<void> => {
+    setProfileError(null)
+    setProfileBusy(true)
+    try {
+      const desktop = (globalThis as {
+        __DSH_DIRECTORY_PICKER__?: { pick?: () => Promise<string | null> }
+      }).__DSH_DIRECTORY_PICKER__
+      if (typeof desktop?.pick !== 'function') throw new Error('no native picker on this host')
+      const picked = await desktop.pick()
+      // Cancelled — the picker resolves null and the card must stay as it was.
+      if (picked === null || picked === '') return
+      const committed = profileDirOf(await persistField(DOUBAO_PROFILE_DIR_FIELD, picked))
+      // The host validates the path before storing it; a save that came back
+      // empty means the folder held no Cookies and nothing was written.
+      setProfileError(committed === '' ? t('profile.invalid') : null)
+      if (committed !== '') {
+        void loadProfile()
+        // A new profile means a new account: re-read the quota immediately
+        // rather than showing the previous profile's numbers for up to 5 min.
+        void onRefresh()
+      }
+    } catch (error: unknown) {
+      setProfileError(t('profile.pickFailed', { reason: (error as Error)?.message ?? 'unknown' }))
+    } finally {
+      setProfileBusy(false)
+    }
+  }, [persistField, loadProfile, onRefresh, t])
+
+  const clearProfile = useCallback(async (): Promise<void> => {
+    setProfileError(null)
+    try {
+      await persistField(DOUBAO_PROFILE_DIR_FIELD, '')
+      void loadProfile()
+      void onRefresh()
+    } catch (error: unknown) {
+      setProfileError((error as Error)?.message ?? 'unknown error')
+    }
+  }, [persistField, loadProfile, onRefresh])
+
   const toolsOn = toolEmulationOf(configured)
   const [toolsError, setToolsError] = useState<string | null>(null)
   const onToggleTools = useCallback(async (next: boolean): Promise<void> => {
@@ -509,6 +586,41 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
         {quota?.profile !== undefined && (
           <div className="dbq-profile">{t('account.profile')}: {quota.profile}</div>
         )}
+      </div>
+
+      {/* ---- data directory ------------------------------------------- */}
+      <div className="dbq-section">
+        <div className="dbq-section-title">
+          <span>{t('profile.title')}</span>
+          <span className="dbq-count">
+            {chosenProfile !== '' ? t('profile.manual') : (profile?.detected != null ? t('profile.detected') : t('profile.none'))}
+          </span>
+        </div>
+        {activeProfile !== '' && (
+          <div className="dbq-profile">{t('profile.current')}: {activeProfile}</div>
+        )}
+        <div className="dbq-note">{t('profile.hint')}</div>
+        <div className="dbq-actions">
+          <button
+            type="button"
+            className="dbq-btn"
+            onClick={() => void pickProfile()}
+            disabled={profileBusy || !canWrite}
+          >
+            {profileBusy ? t('profile.picking') : t('profile.pick')}
+          </button>
+          {chosenProfile !== '' && (
+            <button type="button" className="dbq-btn" onClick={() => void clearProfile()} disabled={profileBusy}>
+              {t('profile.clear')}
+            </button>
+          )}
+        </div>
+        {profile !== undefined && profile.candidates.length > 0 && (
+          <div className="dbq-candidates">
+            {profile.candidates.map(entry => `${entry.dir} (${entry.source})`).join('\n')}
+          </div>
+        )}
+        {profileError !== null && <span className="dbq-error">{profileError}</span>}
       </div>
 
       {/* ---- model checklist ---- */}

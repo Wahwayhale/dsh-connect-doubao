@@ -248,10 +248,14 @@ dsh plugin --profile desktop add "E:\path\to\dsh-connect-doubao"
 | macOS | ❌ 不支持（DPAPI 是 Windows 专有） |
 | Linux | ❌ 不支持（同上） |
 
-凭据查找逻辑（`listDoubaoProfiles`，`src/doubao-profile.ts`）按**代价从低到高**尝试四层：
+凭据查找逻辑（`listDoubaoProfiles`，`src/doubao-profile.ts`）按**代价从低到高**尝试五层：
 
+0. **设置卡片里手动选的目录** —— 点「豆包数据目录」那段的「选择目录…」，桌面端会弹原生文件夹
+   对话框。选中的目录必须含 `Default\Network\Cookies`，否则拒绝保存并当场提示；目录后来被
+   删掉则自动退回下面几层，不会把凭据加载卡死。指到 `User Data` 或它的父目录（如 `D:\Doubao`）
+   都行。
 1. **环境变量 `DSH_DOUBAO_PROFILE`** —— 手动指定，指到 `User Data` 目录或它的父目录都行。
-   这是唯一由用户掌控的一层，也是其余三层全失效时的逃生门。
+   给脚本化部署留的口子，也是第 0 层之外的第二逃生门。
 2. **AppData 候选**（4 次 `existsSync`，几乎免费）：
    `%LOCALAPPDATA%\Doubao\User Data`、`%APPDATA%\Doubao\User Data`、
    `C:\Users\<各用户>\AppData\Local\Doubao\User Data`。
@@ -260,9 +264,16 @@ dsh plugin --profile desktop add "E:\path\to\dsh-connect-doubao"
    代价是要起一个 `powershell.exe`（本机实测约 0.7–0.8 s），所以只在第 1、2 层都没命中时才跑。
 4. **限时扫盘兜底** —— 从每个存在的盘符根开始做深度 4 的广度优先搜索，找
    `…\Default\Network\Cookies`。默认预算 1500 ms，跳过 `Windows`、`$RECYCLE.BIN`、
-   `node_modules` 等目录。只在前面三层全部落空时启用。
+   `node_modules` 等目录。只在前面四层全部落空时启用。
 
 命中条件一律是存在 `Default\Network\Cookies`，空目录不算。
+
+返回的是**列表**而不是单个路径，因为「复制而不是移动」会留下空壳：把 `User Data` 拷到 D 盘的
+人，C 盘还留着一个能命中 `Cookies` 但已经登出的旧目录。`loadDoubaoCredentials` 按顺序逐个试，
+第一个真的解出可用会话的才算数，失败原因保留最早的那个（那才是用户想修的那个）。
+
+`node lib/cli-doctor.js` 的 `credentials` 会告诉你实际用了哪个：`profile` 是命中的那个
+（带来源，如 `(via process)`），`candidates` 是按顺序找到的全部。
 
 **为什么顺序是"便宜优先"而不是"最准优先"**：常见情况下第 2 层就命中，不能为了 0.8 s 的
 进程探测让每次冷启动都变慢。而真正把数据搬到 D 盘的人，第 3 层一定能救回来。
@@ -331,9 +342,11 @@ npm run check       # 以上全部
    本插件能确定的是：它把 `model_item_key` 随请求发出（这已抓包确认）。
    至于服务端如何解释这个键，只能由服务端回答。
 4. **仅 Windows。** 凭据解密依赖 DPAPI。
-   **User Data 不在 `%LOCALAPPDATA%` 也能用**：插件会依次尝试环境变量 `DSH_DOUBAO_PROFILE`、
-   AppData 候选、运行中客户端的 `--user-data-dir`、限时扫盘（见上文「凭据查找逻辑」）。
-   四层全部失效时才报 `Doubao user profile not found`。
+   **User Data 不在 `%LOCALAPPDATA%` 也能用**：设置卡片里可以点「选择目录…」直接指定，
+   也可以留空让插件自动探测（环境变量 `DSH_DOUBAO_PROFILE`、AppData 候选、运行中客户端的
+   `--user-data-dir`、限时扫盘，见上文「凭据查找逻辑」）。全部失效时才报
+   `Doubao user profile not found`。浏览器形态的宿主没有原生目录对话框，那一层的按钮会
+   明确报错，此时请改用 `DSH_DOUBAO_PROFILE`。
 5. **风控滑块无法自动处理。** 触发后需去豆包客户端手动发一条消息完成验证。
 6. **图片输入未提供。** 本 provider 只发送文本块，不转发图片。
 7. **单账号。** 没有账号池、没有区域切换、没有签到。

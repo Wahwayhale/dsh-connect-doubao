@@ -172,7 +172,42 @@ export function enabledModelIdsOf(configured: unknown): string[] | undefined {
   return value.filter((entry): entry is string => typeof entry === 'string')
 }
 
-/** Settings field holding the tool-emulation switch. */
+/** Settings field holding the manually chosen profile directory. */
+export const DOUBAO_PROFILE_DIR_FIELD = 'profileDir'
+
+/** Route that reports which profiles the host detected. */
+export const DOUBAO_PROFILE_PATH = '/plugins/dsh-connect-doubao/profile'
+
+/** One detected profile, as the picker shows it. */
+export interface DoubaoProfileCandidate {
+  dir: string
+  source: string
+}
+
+/** The discovery payload `GET {DOUBAO_PROFILE_PATH}` returns. */
+export interface DoubaoProfileView {
+  ok: boolean
+  /** The profile automatic discovery would use, or null when it found none. */
+  detected: string | null
+  candidates: DoubaoProfileCandidate[]
+  /** Name of the environment variable that overrides everything. */
+  env: string
+  error?: string
+}
+
+/** Read the chosen profile directory out of a settings snapshot. */
+export function profileDirOf(configured: unknown): string {
+  const value = (configured as { profileDir?: unknown } | undefined)?.profileDir
+  return typeof value === 'string' ? value : ''
+}
+
+/**
+ * Settings field holding the tool-emulation switch.
+ *
+ * Declared after `profileDir` on purpose: the card reads the three fields in
+ * the order they appear in the settings file, and the file is written in
+ * declaration order, so this keeps the JSON readable.
+ */
 export const DOUBAO_TOOL_EMULATION_FIELD = 'toolEmulation'
 
 /**

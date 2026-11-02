@@ -35,8 +35,10 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
   ENABLED_MODEL_IDS_FIELD,
+  PROFILE_DIR_FIELD,
   TOOL_EMULATION_FIELD,
   enabledIdsOf,
+  profileDirOf,
   type DoubaoSettings,
 } from './doubao-config.ts'
 
@@ -52,6 +54,8 @@ function normalise(raw: unknown): Partial<DoubaoSettings> {
   if (ids !== undefined) out.enabledModelIds = ids
   const tools = (raw as { toolEmulation?: unknown } | undefined)?.toolEmulation
   if (typeof tools === 'boolean') out.toolEmulation = tools
+  const profile = (raw as { profileDir?: unknown } | undefined)?.profileDir
+  if (typeof profile === 'string') out.profileDir = profile
   return out
 }
 
@@ -86,11 +90,13 @@ export function withStoredSettings(config: unknown, path: string = settingsFileP
   const base: DoubaoSettings = {
     enabledModelIds: enabledIdsOf(config) ?? [],
     toolEmulation: (config as { toolEmulation?: unknown } | undefined)?.toolEmulation === true,
+    profileDir: profileDirOf(config) ?? '',
   }
   const stored = readStoredSettings(path)
   return {
     enabledModelIds: stored.enabledModelIds ?? base.enabledModelIds,
     toolEmulation: stored.toolEmulation ?? base.toolEmulation,
+    profileDir: stored.profileDir ?? base.profileDir,
   }
 }
 
@@ -107,7 +113,11 @@ export function writeStoredSetting(
   value: unknown,
   path: string = settingsFilePath(),
 ): void {
-  if (field !== ENABLED_MODEL_IDS_FIELD && field !== TOOL_EMULATION_FIELD) {
+  if (
+    field !== ENABLED_MODEL_IDS_FIELD
+    && field !== TOOL_EMULATION_FIELD
+    && field !== PROFILE_DIR_FIELD
+  ) {
     throw new Error(`field ${field} is not persistable`)
   }
   const next = { ...readStoredSettings(path) }
@@ -116,9 +126,12 @@ export function writeStoredSetting(
       throw new Error(`invalid value for ${field}`)
     }
     next.enabledModelIds = value.filter((entry): entry is string => typeof entry === 'string')
-  } else {
+  } else if (field === TOOL_EMULATION_FIELD) {
     if (typeof value !== 'boolean') throw new Error(`invalid value for ${field}`)
     next.toolEmulation = value
+  } else {
+    if (typeof value !== 'string') throw new Error(`invalid value for ${field}`)
+    next.profileDir = value
   }
   mkdirSync(dirname(path), { recursive: true })
   const temp = `${path}.${process.pid.toString()}.tmp`

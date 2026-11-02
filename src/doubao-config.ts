@@ -47,10 +47,29 @@ export interface DoubaoSettings {
    * to be useful and not enough to be trusted silently — hence opt-in.
    */
   toolEmulation: boolean
+  /**
+   * Absolute path to the Doubao profile, or `''` for "detect it yourself".
+   *
+   * Only needed when the app keeps `User Data` somewhere the four automatic
+   * strategies cannot reach — an external drive that is not mounted at scan
+   * time, a redirected folder, or a copy the user moved by hand. The card
+   * offers a picker for it; the value is validated host-side (it must contain
+   * `Default\Network\Cookies`) before it is stored.
+   */
+  profileDir: string
 }
 
 /** The settings field holding the tool-emulation switch. */
 export const TOOL_EMULATION_FIELD = 'toolEmulation'
+
+/** The settings field holding a manually chosen profile directory. */
+export const PROFILE_DIR_FIELD = 'profileDir'
+
+/** Read the chosen profile directory, or `undefined` when it is not set. */
+export function profileDirOf(config: unknown): string | undefined {
+  const value = (config as { profileDir?: unknown } | undefined)?.profileDir
+  return typeof value === 'string' && value.trim() !== '' ? value : undefined
+}
 
 /** Read the switch out of an arbitrary config snapshot; default false. */
 export function toolEmulationOf(config: unknown): boolean {
@@ -106,6 +125,8 @@ export const Config: z<DoubaoSettings> = z.object({
     .description('Catalog ids enabled in the DSH model picker. Doubao routes upstream by content, so this selects which entries are offered, never which model answers. Empty means "not yet configured" and serves the whole catalog.'),
   toolEmulation: asVolatile(z.boolean().default(false))
     .description('实验性：豆包没有函数调用通道（tools 字段会被静默忽略），此项改用提示词模拟工具调用，让豆包能驱动 Harness 的本地工具。约 11.5 秒/轮，且可能随上游模型变化而退化，故默认关闭。'),
+  profileDir: asVolatile(z.string().default(''))
+    .description('豆包客户端 User Data 目录。留空表示自动探测（%LOCALAPPDATA%、%APPDATA%、运行中客户端的 --user-data-dir、全盘扫描）。只有当豆包把数据放在自动探测找不到的位置时才需要填。'),
 })
 
 /**

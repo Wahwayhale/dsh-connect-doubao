@@ -14,7 +14,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { fetchQuota, findWindow, millisUntilReset, invalidateQuotaCache } from './doubao-quota.ts'
-import { describeProfileLocation } from './doubao-auth.ts'
+import { describeProfileLocation, resolveUserProvided, PROFILE_ENV, type DoubaoProfileLocation } from './doubao-auth.ts'
 import { doubaoCatalogEntries, type DoubaoModelInfo } from './doubao-catalog.ts'
 import { invalidateDiscovery } from './doubao-discovery.ts'
 import type { DoubaoCatalogEntry } from './doubao-catalog.ts'
@@ -126,6 +126,9 @@ export interface WebServerLike {
 /** Route the card writes settings through. */
 export const DOUBAO_SAVE_PATH = '/plugins/dsh-connect-doubao/__save'
 
+/** Route the card asks for the detected profile candidates. */
+export const DOUBAO_PROFILE_PATH = '/plugins/dsh-connect-doubao/profile'
+
 /**
  * Minimal shape of the `settings` service the presentation claim needs.
  *
@@ -149,7 +152,7 @@ export interface SettingsLike {
  * schema addition quietly widen what the browser can write. Both entries are
  * switches the user could already set by hand in `cordis.patch.yml`.
  */
-const WRITABLE_FIELDS = new Set(['enabledModelIds', 'toolEmulation'])
+const WRITABLE_FIELDS = new Set(['enabledModelIds', 'toolEmulation', 'profileDir'])
 
 /** Read and parse a JSON request body, bounded. */
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -231,9 +234,22 @@ export function registerDoubaoSaveRoute(
         const value = body?.value
         const valid = field === 'enabledModelIds'
           ? Array.isArray(value) && value.every(entry => typeof entry === 'string')
-          : typeof value === 'boolean'
+          : field === 'profileDir'
+            ? typeof value === 'string'
+            : typeof value === 'boolean'
         if (!valid) {
           json(res, 400, { error: `invalid value for ${field}` })
+          return
+        }
+        // A profile path is the one value that can point the plugin at the
+        // wrong place, so it is checked BEFORE it is stored: an empty string
+        // means "detect automatically", anything else must really contain a
+        // Chromium profile. Rejecting here keeps the card honest — the same
+        // check the resolver applies, so a save that succeeds also works.
+        if (field === 'profileDir' && typeof value === 'string' && value !== '' && resolveUserProvided(value) === undefined) {
+          json(res, 400, {
+            error: `no Doubao profile at ${String(value)} (expected a folder containing Default\Network\Cookies)`,
+          })
           return
         }
         deps.write(field, value)
@@ -249,6 +265,45 @@ export function registerDoubaoSaveRoute(
           errorName: (error as Error)?.name ?? 'unknown',
           error: safeMessage(error),
         })
+      }
+    },
+  })
+}
+
+/**
+ * Register the profile-discovery route.
+ *
+ * The card needs two things the settings file cannot give it: what the plugin
+ * DETECTED (so the user can see whether automatic discovery already worked),
+ * and why a manual path was rejected. Both are read-only and contain paths
+ * only — never a cookie.
+ */
+export function registerDoubaoProfileRoute(
+  ctx: { webServer: WebServerLike },
+  deps: { candidates: () => Array<{ dir: string; source: string }> },
+): () => void {
+  return ctx.webServer.register({
+    kind: 'exact',
+    path: DOUBAO_PROFILE_PATH,
+    handler: (req, res) => {
+      if (req.method !== 'GET') {
+        json(res, 405, { error: 'method not allowed' })
+        return
+      }
+      if (!loopbackOrigin(req)) {
+        json(res, 403, { error: 'origin-not-trusted' })
+        return
+      }
+      try {
+        const candidates = deps.candidates()
+        json(res, 200, {
+          ok: true,
+          detected: candidates[0]?.dir ?? null,
+          candidates,
+          env: PROFILE_ENV,
+        })
+      } catch (error: unknown) {
+        json(res, 500, { ok: false, error: safeMessage(error) })
       }
     },
   })
