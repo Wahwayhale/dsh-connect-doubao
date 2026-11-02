@@ -100,7 +100,9 @@ export function buildToolContract(tools: readonly InboundTool[]): string {
     // 「出现 75 次」/「出现 0 次」, and left a corrupted file. Reading after every
     // mutation is what keeps a multi-step edit honest.
     '- 每次修改文件之后，先重新读取该文件，再决定下一步；不要凭记忆连续拼接多次改动。',
-    '- 全部完成后用一句话说明你改了哪个文件、改了什么。',
+    '- 全部完成后，用下列格式说明你做了什么（不要只说「已修改」）：',
+    '  **改了哪个文件** → 具体改了什么（哪个函数/哪一行），为什么这么改。',
+    '  如果有多处改动，逐条列出。',
   ].join('\n')
 }
 
