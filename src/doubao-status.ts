@@ -183,7 +183,17 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
  */
 export function registerDoubaoSaveRoute(
   ctx: { webServer: WebServerLike; get(name: string): unknown },
-  deps: { settingsNamespace: () => string; onApplied?: (field: string, value: unknown) => void },
+  deps: {
+    settingsNamespace: () => string
+    onApplied?: (field: string, value: unknown) => void
+    /**
+     * Where the settings-presentation registration got to. Reported only on the
+     * 503 path, because "namespace missing" has four indistinguishable causes
+     * (inject never ran / effect never ran / configure threw / configure ran but
+     * the host ignored it) and guessing between them is how this took hours.
+     */
+    diagnostics?: () => unknown
+  },
 ): () => void {
   return ctx.webServer.register({
     kind: 'exact',
@@ -223,10 +233,18 @@ export function registerDoubaoSaveRoute(
         // Resolve the namespace from describe(): the host serves the Loader
         // entry id, which a profile may mount differently from our declaration.
         const ns = deps.settingsNamespace()
-        const row = settings.describe().find(entry => entry.ns === ns)
-          ?? settings.describe().find(entry => entry.ns.includes('doubao'))
+        const rows = settings.describe()
+        const row = rows.find(entry => entry.ns === ns)
+          ?? rows.find(entry => entry.ns.includes('doubao'))
+          ?? rows.find(entry => String(entry.ns).includes(String(ns)))
         if (row === undefined) {
-          json(res, 503, { error: `namespace ${ns} missing from describe()` })
+          // Report what the host ACTUALLY serves. Without this the failure is a
+          // guess about a name, and the guess is exactly what went wrong.
+          json(res, 503, {
+            error: `namespace ${ns} missing from describe()`,
+            known: rows.map(entry => String(entry.ns)),
+            ...(deps.diagnostics === undefined ? {} : { diagnostics: deps.diagnostics() }),
+          })
           return
         }
         await settings.mutate(row.ns, [{ op: 'set', path: [field], value }])

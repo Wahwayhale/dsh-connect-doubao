@@ -76,10 +76,35 @@ export function isConfigured(config: unknown): boolean {
  * schemastery is a peer dependency resolved from the Harness at runtime and is
  * never bundled (see tsdown.config.ts).
  */
+/**
+ * Mark one schema field as volatile.
+ *
+ * This is what makes the field WRITABLE from a settings form at all. The host
+ * only surfaces volatile fields (`Forms expose only volatile fields from
+ * active, uniquely addressed profile entries`), and its write gate rejects
+ * everything else:
+ *
+ *   Plugin entry "<id>" has no volatile fields
+ *
+ * — which is exactly why `settings.describe()` listed 33 namespaces and this
+ * plugin's was the one missing: the namespace is derived from the marker, not
+ * from the Loader entry. The comparison plugin states the failure verbatim:
+ * "the scope's `set()` still resolves — so the card would look like it saved
+ * and silently revert", which is precisely the symptom that started this hunt.
+ *
+ * `volatile()` ships in schemastery 3.18.3+ and the peer range requires
+ * >=3.18.4, so the function probe is a safety net rather than the normal path;
+ * it degrades to the bare schema on an older resolution instead of throwing.
+ */
+function asVolatile<T>(schema: T): T {
+  const candidate = schema as unknown as { volatile?: () => T }
+  return typeof candidate.volatile === 'function' ? candidate.volatile() : schema
+}
+
 export const Config: z<DoubaoSettings> = z.object({
-  enabledModelIds: z.array(z.string()).default([])
+  enabledModelIds: asVolatile(z.array(z.string()).default([]))
     .description('Catalog ids enabled in the DSH model picker. Doubao routes upstream by content, so this selects which entries are offered, never which model answers. Empty means "not yet configured" and serves the whole catalog.'),
-  toolEmulation: z.boolean().default(false)
+  toolEmulation: asVolatile(z.boolean().default(false))
     .description('实验性：豆包没有函数调用通道（tools 字段会被静默忽略），此项改用提示词模拟工具调用，让豆包能驱动 Harness 的本地工具。约 11.5 秒/轮，且可能随上游模型变化而退化，故默认关闭。'),
 })
 

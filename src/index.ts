@@ -36,6 +36,38 @@ import type { DoubaoSettings } from './doubao-config.ts'
 export const PLUGIN_ID = 'dsh-connect-doubao'
 export const PLUGIN_NAME = 'DSH Connect Doubao'
 
+/**
+ * Diagnostic trail for the settings-presentation registration.
+ *
+ * `settings.configure()` is what makes this plugin a settings namespace, and it
+ * can fail in four completely different places without raising: the inject
+ * child never runs (no `settings` service), `ctx.effect` never runs, the call
+ * itself throws, or it succeeds and the host still does not list us. Those look
+ * identical from the outside — a missing namespace — so each step records
+ * whether it was reached and the save route reports the trail.
+ */
+export const presentationDiag: {
+  injectRan?: boolean
+  hasSettings?: boolean
+  hasFiber?: boolean
+  effectRan?: boolean
+  configureRan?: boolean
+  error?: string
+} = {}
+/**
+ * The plugin's Cordis name — the value the Loader and the Settings service key
+ * on. It must be the ENTRY ID, not a human-readable title.
+ *
+ * Two working siblings prove the rule: `dsh-connect-trae` and
+ * `dsh-connect-workbuddy` both export `name === their entry id`, and both have
+ * a namespace in `settings.describe()`. This plugin exported
+ * `'DSH Connect Doubao'`, and its namespace was the ONE absent from a 28-entry
+ * `describe()` list even though it calls `settings.configure()` exactly like
+ * they do. A display title is not an identifier; the settings row never existed
+ * because nothing registered under that name.
+ */
+export const name = PLUGIN_ID
+
 export * from './doubao-auth.ts'
 export * from './doubao-upstream.ts'
 export * from './doubao-quota.ts'
@@ -108,12 +140,10 @@ export interface DoubaoPluginContext {
 }
 
 /**
- * Stable Cordis plugin name.
- *
  * A bare `apply` export (not a `plugin = { ... }` object): the Loader reads
  * `name` / `inject` / `Config` / `apply` as named exports of the entry module.
+ * `name` is exported above, next to PLUGIN_ID, which is what it must equal.
  */
-export const name = PLUGIN_NAME
 
 /**
  * Services required before the provider may register.
@@ -234,20 +264,49 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
       ctx.logger.error('dsh-connect-doubao: model discovery registration failed', error)
     }
 
-    // Soft settings probe: `settings` is NOT an inject entry (see above), so it
-    // must be reached with ctx.get() — reading an undeclared property throws.
-    const settings = (ctx as unknown as { get(name: string): unknown }).get('settings') as
-      | {
-          configure(presentation: { auto?: boolean }, owner?: unknown): () => void
-          on?(name: string, listener: () => void): unknown
-        }
-      | undefined
-    if (settings !== undefined) {
-      try {
-        ctx.effect(() => settings.configure({ auto: true }, (ctx as unknown as { fiber?: unknown }).fiber))
-      } catch (error: unknown) {
-        ctx.logger.error('dsh-connect-doubao: settings presentation failed', error)
+    /**
+     * Settings presentation, via a NESTED `ctx.inject(['settings'], ...)`.
+     *
+     * This used to be a soft `ctx.get('settings')` probe at apply time, and that
+     * is why this plugin's settings row never existed: `apply` can run BEFORE
+     * the settings service is mounted, so the probe returned `undefined` and
+     * `configure()` was simply never called — no error, no retry, and the
+     * namespace stayed absent from `settings.describe()` while
+     * `dsh-connect-trae` and `dsh-connect-workbuddy` were both listed.
+     *
+     * Both working siblings use an inject child for exactly this reason: the
+     * child is held back until the service exists, and re-runs if it is replaced.
+     * The soft probe stays only as the fallback for hosts that never provide
+     * `settings` at all (that is also why `settings` is not in the top-level
+     * `inject`, which would stop `apply` from running entirely).
+     */
+    const presentationOwner = (ctx as unknown as { fiber?: unknown }).fiber
+    try {
+      if (typeof ctx.inject === 'function') {
+        ctx.inject(['settings'], (settingsCtx: never) => {
+          const child = settingsCtx as unknown as {
+            settings?: { configure(presentation: { auto?: boolean }, owner?: unknown): () => void }
+          }
+          presentationDiag.injectRan = true
+          presentationDiag.hasSettings = child.settings !== undefined
+          presentationDiag.hasFiber = presentationOwner !== undefined
+          if (child.settings === undefined) return
+          const settings = child.settings
+          // Both working siblings pass the OUTER `ctx.fiber` here and register
+          // their effect on the OUTER ctx, character for character. Matching them
+          // exactly is the point: this call is the only place the host learns the
+          // plugin exists as a settings namespace.
+          ctx.effect(() => {
+            presentationDiag.effectRan = true
+            const dispose = settings.configure({ auto: true }, presentationOwner)
+            presentationDiag.configureRan = true
+            return dispose
+          })
+        })
       }
+    } catch (error: unknown) {
+      presentationDiag.error = (error as Error)?.message ?? String(error)
+      ctx.logger.error('dsh-connect-doubao: settings presentation registration failed', error)
     }
 
     // Re-filter the picker whenever the user saves a different selection.
@@ -278,6 +337,7 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
           },
           {
             settingsNamespace: () => settingsNs,
+            diagnostics: () => ({ ...presentationDiag, pluginName: name }),
             // Keep the live switch in sync with a write made through this route:
             // the host's own change event is not guaranteed on every line, and a
             // save that only lands on disk would otherwise take effect at restart.
