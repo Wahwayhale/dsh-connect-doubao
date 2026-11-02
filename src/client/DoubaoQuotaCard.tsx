@@ -27,6 +27,7 @@ import {
   DOUBAO_CATALOG_PATH,
   DOUBAO_ENABLED_MODELS_FIELD,
   DOUBAO_QUOTA_PATH,
+  DOUBAO_SAVE_PATH,
   classifyQuotaView,
   clampPercent,
   enabledModelIdsOf,
@@ -333,15 +334,44 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
   }, [])
 
   /**
+   * Persist one settings field through the HOST endpoint.
+   *
+   * `scope.set()` is NOT the write path any more: measured on DSH 0.2.1
+   * (2026-11-02), it resolves without an error, the host rewrites
+   * `cordis.patch.yml`, and the field is still absent on the next read — every
+   * save "succeeded" and persisted nothing. This endpoint runs the write inside
+   * the Host process with `settings.mutate`, the same path
+   * `dsh-connect-workbuddy` and `dsh-connect-trae` use, and it returns the
+   * host's own refusal text so a failure names its cause.
+   */
+  const persistField = useCallback(async (field: string, value: unknown): Promise<void> => {
+    let response: Response
+    try {
+      response = await fetch(DOUBAO_SAVE_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ field, value }),
+      })
+    } catch (error: unknown) {
+      throw new Error(`host save endpoint unreachable: ${(error as Error)?.message ?? String(error)}`)
+    }
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({ error: `HTTP ${String(response.status)}` })) as {
+        errorName?: unknown
+        error?: unknown
+      }
+      const reason = `${String(detail.errorName ?? '')} ${String(detail.error ?? '')}`.trim()
+      throw new Error(reason === '' ? `HTTP ${String(response.status)}` : reason)
+    }
+  }, [])
+
+  /**
    * Save the draft, then READ IT BACK.
    *
-   * `scope.set()` resolving is not proof of persistence: the host writes the
-   * active profile's patch file through a temp-file-and-rename, and a Windows
-   * scanner or sync client holding the file makes the host reload state and
-   * simply RETURN — so the await succeeds with nothing written. The read-back
-   * is the only reliable confirmation, and here it matters more than usual: a
-   * save discards the draft, so a silently-failed write would throw away the
-   * user's edits while reporting success.
+   * The endpoint reporting `ok` is the commit; the read-back only confirms the
+   * page's own snapshot caught up. Here it matters more than usual because a
+   * save discards the draft — so a snapshot that never refreshes is reported
+   * rather than silently losing the user's edits.
    */
   const onSave = useCallback(async (): Promise<void> => {
     if (scope === undefined || draft === undefined) return
@@ -349,10 +379,11 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     setSaveError(null)
     const ids = [...draft]
     try {
-      await scope.set(DOUBAO_ENABLED_MODELS_FIELD, ids)
+      await persistField(DOUBAO_ENABLED_MODELS_FIELD, ids)
       let readBack = enabledModelIdsOf(scope.getSnapshot().value)
-      // The host may persist asynchronously; a short bounded retry turns a
-      // merely-late write into a confirmed one without waiting unboundedly.
+      // The endpoint already committed, so this loop only gives the page's own
+      // snapshot a moment to catch up. A snapshot that stays stale is NOT a
+      // failed save (that conflation is what produced the old false negative).
       for (let attempt = 0; attempt < 5 && readBack === undefined; attempt += 1) {
         await new Promise(resolve => setTimeout(resolve, 120))
         readBack = enabledModelIdsOf(scope.getSnapshot().value)
@@ -360,7 +391,10 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
       const landed = readBack !== undefined && readBack.length === ids.length &&
         ids.every(id => readBack?.includes(id))
       if (!landed) {
-        setSaveError(t('models.saveFailed', { reason: 'host did not persist the value' }))
+        // Written and committed, but the snapshot has not caught up. Reporting
+        // "save failed" here would be a lie in the other direction, so the draft
+        // is only marked saved when the snapshot agrees.
+        setSaveError(t('models.saveFailed', { reason: '已写入宿主，但页面快照未刷新，请重开设置页确认' }))
         return
       }
       setSaved(true)
@@ -369,7 +403,7 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     } finally {
       setBusy(false)
     }
-  }, [scope, draft, t])
+  }, [persistField, scope, draft, t])
 
   /**
    * The tool-emulation switch.
@@ -389,19 +423,22 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     if (scope === undefined) return
     setToolsError(null)
     try {
-      await scope.set(DOUBAO_TOOL_EMULATION_FIELD, next)
+      await persistField(DOUBAO_TOOL_EMULATION_FIELD, next)
       let readBack = toolEmulationOf(scope.getSnapshot().value)
       for (let attempt = 0; attempt < 5 && readBack !== next; attempt += 1) {
         await new Promise(resolve => setTimeout(resolve, 120))
         readBack = toolEmulationOf(scope.getSnapshot().value)
       }
+      // The endpoint already committed, so a stale in-page snapshot is a
+      // display lag rather than a failed save — but say so instead of showing
+      // a toggle that silently disagrees with disk.
       if (readBack !== next) {
-        setToolsError(t('models.saveFailed', { reason: 'host did not persist the value' }))
+        setToolsError(t('models.saveFailed', { reason: '已写入宿主，但页面快照未刷新，请重开设置页确认' }))
       }
     } catch (error: unknown) {
       setToolsError(t('models.saveFailed', { reason: (error as Error)?.message ?? 'unknown error' }))
     }
-  }, [scope, t])
+  }, [persistField, scope, t])
 
   // ---- render -----------------------------------------------------------
   const state: DoubaoAccountState = classifyQuotaView(quota)

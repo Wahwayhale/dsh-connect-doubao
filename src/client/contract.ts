@@ -144,6 +144,17 @@ export interface DoubaoCatalogView {
 /** Host-side route serving the catalog for the checklist. */
 export const DOUBAO_CATALOG_PATH = '/plugins/dsh-connect-doubao/catalog'
 
+/**
+ * The Host-side settings WRITE route.
+ *
+ * The card cannot persist through its injected `settingsScope`: on this host
+ * line `set()` resolves successfully and stores nothing (see
+ * `DoubaoQuotaCard.persistField`). This endpoint does the write in the Host
+ * process with `settings.mutate` — the path `dsh-connect-workbuddy` and
+ * `dsh-connect-trae` also use.
+ */
+export const DOUBAO_SAVE_PATH = '/plugins/dsh-connect-doubao/__save'
+
 /** Settings field holding the ticked entry ids. */
 export const DOUBAO_ENABLED_MODELS_FIELD = 'enabledModelIds'
 

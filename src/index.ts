@@ -18,7 +18,8 @@
  */
 import { createDoubaoAdapter } from './doubao-adapter.ts'
 import { createDoubaoShim } from './doubao-shim.ts'
-import { registerDoubaoQuotaRoute, registerDoubaoCatalogRoute } from './doubao-status.ts'
+import { registerDoubaoQuotaRoute, registerDoubaoCatalogRoute, registerDoubaoSaveRoute } from './doubao-status.ts'
+import type { WebServerLike } from './doubao-status.ts'
 import {
   DOUBAO_CONTEXT_WINDOW,
   DOUBAO_MAX_TOKENS,
@@ -53,8 +54,10 @@ export {
   doubaoQuotaView,
   registerDoubaoQuotaRoute,
   registerDoubaoCatalogRoute,
+  registerDoubaoSaveRoute,
   DOUBAO_QUOTA_PATH,
   DOUBAO_CATALOG_PATH,
+  DOUBAO_SAVE_PATH,
 } from './doubao-status.ts'
 // `Config` is re-exported (not redefined) from './doubao-config.ts' above: the
 // Loader needs it as a real schemastery schema on this entry module.
@@ -268,9 +271,31 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
       try {
         const disposeQuota = registerDoubaoQuotaRoute(webCtx)
         const disposeCatalog = registerDoubaoCatalogRoute(webCtx, { modelsProvider: liveModels })
+        const disposeSave = registerDoubaoSaveRoute(
+          {
+            webServer: (webCtx as unknown as { webServer: WebServerLike }).webServer,
+            get: (name: string) => (webCtx as unknown as { get(name: string): unknown }).get(name),
+          },
+          {
+            settingsNamespace: () => settingsNs,
+            // Keep the live switch in sync with a write made through this route:
+            // the host's own change event is not guaranteed on every line, and a
+            // save that only lands on disk would otherwise take effect at restart.
+            onApplied: (field: string, value: unknown) => {
+              const next: DoubaoSettings = { ...current }
+              if (field === 'enabledModelIds' && Array.isArray(value)) {
+                next.enabledModelIds = value.filter((id): id is string => typeof id === 'string')
+              } else if (field === 'toolEmulation' && typeof value === 'boolean') {
+                next.toolEmulation = value
+              }
+              onSettingsChanged(next)
+            },
+          },
+        )
         ctx.effect(() => () => {
           disposeQuota()
           disposeCatalog()
+          disposeSave()
         })
       } catch (error: unknown) {
         ctx.logger.error('dsh-connect-doubao: web route registration failed', error)

@@ -123,6 +123,126 @@ export interface WebServerLike {
   }): () => void
 }
 
+/** Route the card writes settings through. */
+export const DOUBAO_SAVE_PATH = '/plugins/dsh-connect-doubao/__save'
+
+/**
+ * Minimal shape of the `settings` service the save route needs.
+ *
+ * `mutate` is the ONLY write path that actually persists on this host line.
+ * The browser-side `settingsScope.set()` returns without an error and leaves
+ * the value untouched — measured here on 2026-11-02 against DSH 0.2.1: the
+ * toggle reported success, `cordis.patch.yml` was rewritten, and the field was
+ * absent again on the next read, so the card's read-back failed with
+ * `host did not persist the value`. `dsh-connect-workbuddy` and
+ * `dsh-connect-trae` both route their writes through `settings.mutate` for the
+ * same reason.
+ */
+export interface SettingsLike {
+  describe(): Array<{ ns: string; value?: unknown }>
+  mutate(ns: string, ops: Array<{ op: 'set'; path: string[]; value: unknown }>, revision?: unknown): Promise<unknown>
+}
+
+/**
+ * The ONLY fields this route will write.
+ *
+ * A closed allow-list, not a schema derivation: deriving it would let a future
+ * schema addition quietly widen what the browser can write. Both entries are
+ * switches the user could already set by hand in `cordis.patch.yml`.
+ */
+const WRITABLE_FIELDS = new Set(['enabledModelIds', 'toolEmulation'])
+
+/** Read and parse a JSON request body, bounded. */
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    size += buffer.length
+    // Same ceiling as the shim: settings payloads are a few hundred bytes, so
+    // anything large is a mistake or an attack, not a real save.
+    if (size > 64 * 1024) throw new Error('body too large')
+    chunks.push(buffer)
+  }
+  if (chunks.length === 0) return undefined
+  return JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown
+}
+
+/**
+ * Register the settings WRITE route.
+ *
+ * Why this exists at all: the card's in-page `settingsScope.set()` does not
+ * persist on this host line (see {@link SettingsLike}). Doing the write here,
+ * inside the Host process, reaches `settings.mutate` — the path the reference
+ * connectors use — and reports the host's own refusal text instead of a
+ * swallowed boolean, so a failure names its cause.
+ *
+ * Security posture matches the read routes: loopback Origin only, POST only,
+ * a closed allow-list of two boolean/array switches, no credential in the
+ * response.
+ */
+export function registerDoubaoSaveRoute(
+  ctx: { webServer: WebServerLike; get(name: string): unknown },
+  deps: { settingsNamespace: () => string; onApplied?: (field: string, value: unknown) => void },
+): () => void {
+  return ctx.webServer.register({
+    kind: 'exact',
+    path: DOUBAO_SAVE_PATH,
+    handler: async (req, res) => {
+      if (req.method !== 'POST') {
+        json(res, 405, { error: 'method not allowed' })
+        return
+      }
+      if (!loopbackOrigin(req)) {
+        json(res, 403, { error: 'origin-not-trusted' })
+        return
+      }
+      const settings = ctx.get('settings') as SettingsLike | undefined
+      if (settings === undefined || typeof settings.mutate !== 'function') {
+        json(res, 503, { error: 'settings service unavailable to this fiber' })
+        return
+      }
+      try {
+        const body = await readJsonBody(req) as { field?: unknown; value?: unknown } | undefined
+        const field = body?.field
+        if (typeof field !== 'string' || !WRITABLE_FIELDS.has(field)) {
+          json(res, 400, { error: `field must be one of: ${[...WRITABLE_FIELDS].join(', ')}` })
+          return
+        }
+        // Shape-check before touching the store: a wrong type here would be
+        // accepted by mutate and then fail schemastery validation on the next
+        // host start, taking the plugin down with it.
+        const value = body?.value
+        const valid = field === 'enabledModelIds'
+          ? Array.isArray(value) && value.every(entry => typeof entry === 'string')
+          : typeof value === 'boolean'
+        if (!valid) {
+          json(res, 400, { error: `invalid value for ${field}` })
+          return
+        }
+        // Resolve the namespace from describe(): the host serves the Loader
+        // entry id, which a profile may mount differently from our declaration.
+        const ns = deps.settingsNamespace()
+        const row = settings.describe().find(entry => entry.ns === ns)
+          ?? settings.describe().find(entry => entry.ns.includes('doubao'))
+        if (row === undefined) {
+          json(res, 503, { error: `namespace ${ns} missing from describe()` })
+          return
+        }
+        await settings.mutate(row.ns, [{ op: 'set', path: [field], value }])
+        deps.onApplied?.(field, value)
+        json(res, 200, { ok: true, value: { [field]: value } })
+      } catch (error: unknown) {
+        json(res, 500, {
+          ok: false,
+          errorName: (error as Error)?.name ?? 'unknown',
+          error: safeMessage(error),
+        })
+      }
+    },
+  })
+}
+
 /** Register the quota route. Returns a disposer. */
 export function registerDoubaoQuotaRoute(
   ctx: { webServer: WebServerLike },
