@@ -332,12 +332,17 @@ npm run check       # 以上全部
       200 与完整正常流，没有任何错误帧 —— 它不校验这个字段。
    所以「在 DSH 里指定 2.1 Pro / 2.1 Lite」做不到：模型由服务端按产品/模式/账号决定。
    真要用这两个模型，只能在豆包客户端自己的「工作任务」里用。
-10. **设置必须声明为 volatile，否则整张卡片是只读的。** 宿主用 `volatileForm(schema)`
-    投影表单，没有 volatile 字段的条目会被**整个跳过**，连 `settings.describe()` 都不会列出，
-    写入则以 `Plugin entry "<id>" has no volatile fields` 被拒。三种失败从外部看完全一样：
-    开关点了没反应、报 `host did not persist the value`、或看起来保存成功但刷新后回退。
-    `src/doubao-config.ts` 里的 `asVolatile()` 就是为此，`tests/volatile.test.ts` 复刻了宿主
-    的判定逻辑把它钉住。
+10. **本插件的设置不走宿主 settings，存在自己的 JSON 文件里。**
+    `~/.dsh/dsh-connect-doubao.settings.json`，由插件自己写入（先写临时文件再原子重命名），
+    读取也不依赖任何宿主服务在线。原因是宿主这条路对本插件**完全关闭**：它的 fiber 永远停在
+    `state 1`（LOADING，和 `hmr`、`credentials` 一样），因此 `entry.fiber.runtime.Config`
+    从不挂载 → 宿主 `describe()` 直接过滤掉这个命名空间 → 任何写入都以
+    `No configurable plugin entry "dsh-connect-doubao"` 失败。
+    **历史上这个插件的设置一次都没能落盘过**（包括手工改的），所以卡片会出现「点了没反应 /
+    `host did not persist the value` / 保存成功但刷新后回退」三种症状。
+    schema 里仍然保留 `asVolatile()`：那是宿主侧的正当声明，一旦上游修好 fiber 生命周期，
+    走宿主路径也不会再踩坑；只是在当前版本上它不再决定成败。`tests/store.test.ts` 和
+    `tests/save-route.test.ts` 钉住文件语义与路由安全边界。
 
 ---
 

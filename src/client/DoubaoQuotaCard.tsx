@@ -198,10 +198,15 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
   const [saveError, setSaveError] = useState<string | null>(null)
 
   /**
-   * The settings snapshot, or undefined when the host offers no write seat.
-   * `scope` is a stable injected reference, so it is safe in the dep list.
+   * The settings snapshot, used ONLY as a fallback.
+   *
+   * The authoritative copy is now the plugin's own file, read through
+   * `DOUBAO_SAVE_PATH` below: this plugin's fiber never reaches ACTIVE on DSH
+   * 0.2.1, so the host neither lists nor writes its namespace (`No configurable
+   * plugin entry`). A snapshot that cannot see a save is worse than no
+   * snapshot, hence the file wins when both are available.
    */
-  const configured = useMemo(() => {
+  const scopedValue = useMemo(() => {
     if (scope === undefined) return undefined
     try {
       return scope.getSnapshot().value
@@ -210,13 +215,34 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     }
   }, [scope, settingsRevision])
 
-  const canWrite = scope !== undefined && (() => {
+  /** Settings as persisted by the plugin itself. `undefined` = not read yet. */
+  const [stored, setStored] = useState<unknown>(undefined)
+  const [storeError, setStoreError] = useState<string | null>(null)
+
+  const loadSettings = useCallback(async (): Promise<void> => {
     try {
-      return scope.getSnapshot().writable === true
-    } catch {
-      return false
+      const response = await fetch(DOUBAO_SAVE_PATH, { method: 'GET' })
+      if (!response.ok) throw new Error(`HTTP ${String(response.status)}`)
+      const body = await response.json() as { value?: unknown }
+      setStored(body.value)
+      setStoreError(null)
+    } catch (error: unknown) {
+      // Falling back rather than failing: an older host without this route
+      // still renders, at the cost of not seeing filesystem-persisted values.
+      setStoreError((error as Error)?.message ?? 'unknown error')
+      setStored(scope === undefined ? undefined : scopedValue)
     }
-  })()
+  }, [scope, scopedValue])
+
+  useEffect(() => { void loadSettings() }, [loadSettings])
+
+  const configured = stored ?? scopedValue
+
+  /**
+   * Writes go through the plugin's own endpoint, so they do NOT depend on the
+   * host's `writable` flag — that flag is exactly what was false here.
+   */
+  const canWrite = stored !== undefined || storeError === null
 
   // Re-read whenever the host announces a settings change.
   useEffect(() => {
@@ -334,17 +360,16 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
   }, [])
 
   /**
-   * Persist one settings field through the HOST endpoint.
+   * Persist one settings field through the plugin's OWN endpoint.
    *
-   * `scope.set()` is NOT the write path any more: measured on DSH 0.2.1
-   * (2026-11-02), it resolves without an error, the host rewrites
-   * `cordis.patch.yml`, and the field is still absent on the next read — every
-   * save "succeeded" and persisted nothing. This endpoint runs the write inside
-   * the Host process with `settings.mutate`, the same path
-   * `dsh-connect-workbuddy` and `dsh-connect-trae` use, and it returns the
-   * host's own refusal text so a failure names its cause.
+   * Neither `scope.set()` NOR `settings.mutate` can persist this plugin: its
+   * fiber never reaches ACTIVE on DSH 0.2.1, so the host reports
+   * `No configurable plugin entry "dsh-connect-doubao"` and drops every write.
+   * The endpoint writes a JSON file the plugin owns (write-temp-then-rename),
+   * and returns the value it now reads back — so a successful response is
+   * proof of persistence, not a claim.
    */
-  const persistField = useCallback(async (field: string, value: unknown): Promise<void> => {
+  const persistField = useCallback(async (field: string, value: unknown): Promise<unknown> => {
     let response: Response
     try {
       response = await fetch(DOUBAO_SAVE_PATH, {
@@ -355,14 +380,21 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     } catch (error: unknown) {
       throw new Error(`host save endpoint unreachable: ${(error as Error)?.message ?? String(error)}`)
     }
-    if (!response.ok) {
-      const detail = await response.json().catch(() => ({ error: `HTTP ${String(response.status)}` })) as {
-        errorName?: unknown
-        error?: unknown
-      }
+    const detail = await response.json().catch(() => ({ error: `HTTP ${String(response.status)}` })) as {
+      ok?: unknown
+      value?: unknown
+      errorName?: unknown
+      error?: unknown
+    }
+    if (!response.ok || detail.ok !== true) {
       const reason = `${String(detail.errorName ?? '')} ${String(detail.error ?? '')}`.trim()
       throw new Error(reason === '' ? `HTTP ${String(response.status)}` : reason)
     }
+    // The endpoint returns the file's state AFTER the write, so the card can
+    // render the committed value without a second round trip.
+    setStored(detail.value)
+    setStoreError(null)
+    return detail.value
   }, [])
 
   /**
@@ -374,27 +406,21 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
    * rather than silently losing the user's edits.
    */
   const onSave = useCallback(async (): Promise<void> => {
-    if (scope === undefined || draft === undefined) return
+    if (draft === undefined) return
     setBusy(true)
     setSaveError(null)
     const ids = [...draft]
     try {
-      await persistField(DOUBAO_ENABLED_MODELS_FIELD, ids)
-      let readBack = enabledModelIdsOf(scope.getSnapshot().value)
-      // The endpoint already committed, so this loop only gives the page's own
-      // snapshot a moment to catch up. A snapshot that stays stale is NOT a
-      // failed save (that conflation is what produced the old false negative).
-      for (let attempt = 0; attempt < 5 && readBack === undefined; attempt += 1) {
-        await new Promise(resolve => setTimeout(resolve, 120))
-        readBack = enabledModelIdsOf(scope.getSnapshot().value)
-      }
-      const landed = readBack !== undefined && readBack.length === ids.length &&
-        ids.every(id => readBack?.includes(id))
+      // `persistField` resolves with the file state AFTER the write, so it is
+      // already the read-back. The old loop that polled the host snapshot is
+      // gone: it was polling a channel this plugin does not appear in, so it
+      // could only ever time out (which is what produced the false "save
+      // failed" this whole rewrite exists to remove).
+      const committed = enabledModelIdsOf(await persistField(DOUBAO_ENABLED_MODELS_FIELD, ids))
+      const landed = committed !== undefined && committed.length === ids.length &&
+        ids.every(id => committed?.includes(id))
       if (!landed) {
-        // Written and committed, but the snapshot has not caught up. Reporting
-        // "save failed" here would be a lie in the other direction, so the draft
-        // is only marked saved when the snapshot agrees.
-        setSaveError(t('models.saveFailed', { reason: '已写入宿主，但页面快照未刷新，请重开设置页确认' }))
+        setSaveError(t('models.saveFailed', { reason: '已写入磁盘，但回读的值与提交的不一致' }))
         return
       }
       setSaved(true)
@@ -403,7 +429,7 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     } finally {
       setBusy(false)
     }
-  }, [persistField, scope, draft, t])
+  }, [persistField, draft, t])
 
   /**
    * The tool-emulation switch.
@@ -420,25 +446,18 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
   const toolsOn = toolEmulationOf(configured)
   const [toolsError, setToolsError] = useState<string | null>(null)
   const onToggleTools = useCallback(async (next: boolean): Promise<void> => {
-    if (scope === undefined) return
     setToolsError(null)
     try {
-      await persistField(DOUBAO_TOOL_EMULATION_FIELD, next)
-      let readBack = toolEmulationOf(scope.getSnapshot().value)
-      for (let attempt = 0; attempt < 5 && readBack !== next; attempt += 1) {
-        await new Promise(resolve => setTimeout(resolve, 120))
-        readBack = toolEmulationOf(scope.getSnapshot().value)
-      }
-      // The endpoint already committed, so a stale in-page snapshot is a
-      // display lag rather than a failed save — but say so instead of showing
-      // a toggle that silently disagrees with disk.
-      if (readBack !== next) {
-        setToolsError(t('models.saveFailed', { reason: '已写入宿主，但页面快照未刷新，请重开设置页确认' }))
+      // Same as `onSave`: the returned value IS the read-back, so no polling of
+      // a snapshot that cannot see this plugin's storage.
+      const committed = toolEmulationOf(await persistField(DOUBAO_TOOL_EMULATION_FIELD, next))
+      if (committed !== next) {
+        setToolsError(t('models.saveFailed', { reason: '已写入磁盘，但回读的值与提交的不一致' }))
       }
     } catch (error: unknown) {
       setToolsError(t('models.saveFailed', { reason: (error as Error)?.message ?? 'unknown error' }))
     }
-  }, [persistField, scope, t])
+  }, [persistField, t])
 
   // ---- render -----------------------------------------------------------
   const state: DoubaoAccountState = classifyQuotaView(quota)
@@ -502,7 +521,9 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
             which the upstream does not honour. */}
         <div className="dbq-note">{t('models.routingNote')}</div>
 
-        {scope === undefined && <div className="dbq-note">{t('models.readOnly')}</div>}
+        {/* Read-only is now about the plugin's own store, not the host scope:
+            the scope is present but useless here (it cannot see this plugin). */}
+        {!canWrite && <div className="dbq-note">{t('models.readOnly')}</div>}
         {catalog === undefined && <div className="dbq-note">{t('models.loadFailed')}</div>}
         {catalog?.ok === true && models.length === 0 && <div className="dbq-note">{t('models.empty')}</div>}
 

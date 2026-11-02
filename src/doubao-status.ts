@@ -127,16 +127,15 @@ export interface WebServerLike {
 export const DOUBAO_SAVE_PATH = '/plugins/dsh-connect-doubao/__save'
 
 /**
- * Minimal shape of the `settings` service the save route needs.
+ * Minimal shape of the `settings` service the presentation claim needs.
  *
- * `mutate` is the ONLY write path that actually persists on this host line.
- * The browser-side `settingsScope.set()` returns without an error and leaves
- * the value untouched — measured here on 2026-11-02 against DSH 0.2.1: the
- * toggle reported success, `cordis.patch.yml` was rewritten, and the field was
- * absent again on the next read, so the card's read-back failed with
- * `host did not persist the value`. `dsh-connect-workbuddy` and
- * `dsh-connect-trae` both route their writes through `settings.mutate` for the
- * same reason.
+ * Kept because the entry id is read from it elsewhere, but it is NOT a write
+ * path for this plugin: `mutate` fails with
+ * `No configurable plugin entry "dsh-connect-doubao"` because the plugin's
+ * fiber never reaches ACTIVE on DSH 0.2.1, so the host never attaches
+ * `runtime.Config` and `describe()` omits the namespace entirely. Every write
+ * through the host has therefore always been dropped — see
+ * `src/doubao-store.ts` for the file that replaced it.
  */
 export interface SettingsLike {
   describe(): Array<{ ns: string; value?: unknown }>
@@ -169,28 +168,30 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 }
 
 /**
- * Register the settings WRITE route.
+ * Register the settings READ/WRITE route.
  *
- * Why this exists at all: the card's in-page `settingsScope.set()` does not
- * persist on this host line (see {@link SettingsLike}). Doing the write here,
- * inside the Host process, reaches `settings.mutate` — the path the reference
- * connectors use — and reports the host's own refusal text instead of a
- * swallowed boolean, so a failure names its cause.
+ * Why this exists at all: neither `settingsScope.set()` in the card nor
+ * `settings.mutate` in the host can persist this plugin — its fiber never
+ * reaches ACTIVE (see {@link SettingsLike}), so the host reports
+ * `No configurable plugin entry "dsh-connect-doubao"` and drops the write.
+ * This route writes a JSON file the plugin owns instead, which is also the
+ * only copy the card can read back.
  *
- * Security posture matches the read routes: loopback Origin only, POST only,
- * a closed allow-list of two boolean/array switches, no credential in the
- * response.
+ * Security posture matches the read routes: loopback Origin only, GET or POST
+ * only, a closed allow-list of two switches, no credential in the response.
  */
 export function registerDoubaoSaveRoute(
-  ctx: { webServer: WebServerLike; get(name: string): unknown },
+  ctx: { webServer: WebServerLike },
   deps: {
-    settingsNamespace: () => string
+    /** Where the plugin keeps its own settings file. */
+    write: (field: string, value: unknown) => void
+    /** Read it back, so the card renders what is actually on disk. */
+    read: () => unknown
     onApplied?: (field: string, value: unknown) => void
     /**
-     * Where the settings-presentation registration got to. Reported only on the
-     * 503 path, because "namespace missing" has four indistinguishable causes
-     * (inject never ran / effect never ran / configure threw / configure ran but
-     * the host ignored it) and guessing between them is how this took hours.
+     * Where the host-settings registration got to. Reported alongside a
+     * successful write because it explains WHY this route exists at all: the
+     * host namespace is missing and every write through it is dropped.
      */
     diagnostics?: () => unknown
   },
@@ -199,7 +200,7 @@ export function registerDoubaoSaveRoute(
     kind: 'exact',
     path: DOUBAO_SAVE_PATH,
     handler: async (req, res) => {
-      if (req.method !== 'POST') {
+      if (req.method !== 'POST' && req.method !== 'GET') {
         json(res, 405, { error: 'method not allowed' })
         return
       }
@@ -207,9 +208,15 @@ export function registerDoubaoSaveRoute(
         json(res, 403, { error: 'origin-not-trusted' })
         return
       }
-      const settings = ctx.get('settings') as SettingsLike | undefined
-      if (settings === undefined || typeof settings.mutate !== 'function') {
-        json(res, 503, { error: 'settings service unavailable to this fiber' })
+      // GET is the READ half, and it exists because the injected settings scope
+      // cannot see this plugin's file: the card would otherwise render defaults
+      // no matter what was saved.
+      if (req.method === 'GET') {
+        try {
+          json(res, 200, { ok: true, value: deps.read() })
+        } catch (error: unknown) {
+          json(res, 500, { ok: false, error: safeMessage(error) })
+        }
         return
       }
       try {
@@ -219,9 +226,8 @@ export function registerDoubaoSaveRoute(
           json(res, 400, { error: `field must be one of: ${[...WRITABLE_FIELDS].join(', ')}` })
           return
         }
-        // Shape-check before touching the store: a wrong type here would be
-        // accepted by mutate and then fail schemastery validation on the next
-        // host start, taking the plugin down with it.
+        // Shape-check before touching the file: a wrong type would be written
+        // verbatim and then rejected by the schema on the next host start.
         const value = body?.value
         const valid = field === 'enabledModelIds'
           ? Array.isArray(value) && value.every(entry => typeof entry === 'string')
@@ -230,26 +236,13 @@ export function registerDoubaoSaveRoute(
           json(res, 400, { error: `invalid value for ${field}` })
           return
         }
-        // Resolve the namespace from describe(): the host serves the Loader
-        // entry id, which a profile may mount differently from our declaration.
-        const ns = deps.settingsNamespace()
-        const rows = settings.describe()
-        const row = rows.find(entry => entry.ns === ns)
-          ?? rows.find(entry => entry.ns.includes('doubao'))
-          ?? rows.find(entry => String(entry.ns).includes(String(ns)))
-        if (row === undefined) {
-          // Report what the host ACTUALLY serves. Without this the failure is a
-          // guess about a name, and the guess is exactly what went wrong.
-          json(res, 503, {
-            error: `namespace ${ns} missing from describe()`,
-            known: rows.map(entry => String(entry.ns)),
-            ...(deps.diagnostics === undefined ? {} : { diagnostics: deps.diagnostics() }),
-          })
-          return
-        }
-        await settings.mutate(row.ns, [{ op: 'set', path: [field], value }])
+        deps.write(field, value)
         deps.onApplied?.(field, value)
-        json(res, 200, { ok: true, value: { [field]: value } })
+        json(res, 200, {
+          ok: true,
+          value: deps.read(),
+          ...(deps.diagnostics === undefined ? {} : { diagnostics: deps.diagnostics() }),
+        })
       } catch (error: unknown) {
         json(res, 500, {
           ok: false,

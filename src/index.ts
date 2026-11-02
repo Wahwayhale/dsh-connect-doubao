@@ -30,6 +30,7 @@ import {
   enabledModelsOf,
 } from './doubao-catalog.ts'
 import { ENABLED_MODEL_IDS_FIELD, effectiveIds, toolEmulationOf } from './doubao-config.ts'
+import { writeStoredSetting, readStoredSettings, withStoredSettings } from './doubao-store.ts'
 import { liveModels, invalidateDiscovery, discoverAllCachedModels } from './doubao-discovery.ts'
 import type { DoubaoSettings } from './doubao-config.ts'
 
@@ -53,6 +54,14 @@ export const presentationDiag: {
   effectRan?: boolean
   configureRan?: boolean
   error?: string
+  /** Entry ids the host's config editor actually holds, as seen from the settings service. */
+  editorEntries?: string[]
+  /** Why enumerating them failed, when it did. */
+  editorError?: string
+  /** `ctx.fiber.entry.options.id` — the id `settings.mutate()` resolves against. */
+  fiberEntryId?: string
+  /** The namespace this plugin asks the save route to write into. */
+  settingsNs?: string
 } = {}
 /**
  * The plugin's Cordis name — the value the Loader and the Settings service key
@@ -197,12 +206,15 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
   /**
    * Live config, replaced on every settings write.
    *
-   * Cordis re-invokes nothing here: it hands `apply` the config once, so the
-   * live value is what `loader/volatile-update` refreshes. Kept as a `let` so
-   * the discovery closure always reads the CURRENT selection rather than the one
-   * captured at registration.
+   * Seeded from the plugin's OWN file, which wins over the Loader config: on
+   * this host line the fiber never reaches ACTIVE, so the Loader can neither
+   * expose nor accept a settings write for this plugin (`No configurable plugin
+   * entry "dsh-connect-doubao"`, measured 2026-11-02). The file is the only
+   * place a save can land, which is why it takes precedence — trusting the
+   * Loader value would resurrect the silent-revert bug for any user who ever
+   * saved a switch.
    */
-  let current: DoubaoSettings = config
+  let current: DoubaoSettings = withStoredSettings(config)
 
   try {
     shim = createDoubaoShim({
@@ -283,25 +295,76 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
     const presentationOwner = (ctx as unknown as { fiber?: unknown }).fiber
     try {
       if (typeof ctx.inject === 'function') {
+        // `configEditor` is injected alongside `settings` on purpose. Without it
+        // Cordis refuses even to READ `settingsCtx.configEditor`
+        // ("cannot get property \"configEditor\" without inject"), which is why the
+        // first version of this probe could not tell "entry absent" apart from
+        // "entry present but schemaless".
+        // `configEditor` is deliberately NOT in this array. It brings its own
+        // dependency on `profileContext`, and a child that demands a service the
+        // host does not provide never activates — which would take the card with
+        // it. The probe below asks for it separately, so a failure there costs
+        // only the diagnostic.
         ctx.inject(['settings'], (settingsCtx: never) => {
           const child = settingsCtx as unknown as {
             settings?: { configure(presentation: { auto?: boolean }, owner?: unknown): () => void }
+            effect?: (fn: () => unknown) => unknown
           }
           presentationDiag.injectRan = true
           presentationDiag.hasSettings = child.settings !== undefined
           presentationDiag.hasFiber = presentationOwner !== undefined
-          if (child.settings === undefined) return
+          // The id the host keys settings on. `mutate` looks entries up by
+          // `options.id`, so recording it lets the probe compare the two directly
+          // instead of inferring it from an error message.
+          presentationDiag.fiberEntryId = String(
+            (presentationOwner as { entry?: { options?: { id?: unknown } } } | undefined)?.entry?.options?.id,
+          )
+          presentationDiag.settingsNs = settingsNs
           const settings = child.settings
-          // Both working siblings pass the OUTER `ctx.fiber` here and register
-          // their effect on the OUTER ctx, character for character. Matching them
-          // exactly is the point: this call is the only place the host learns the
-          // plugin exists as a settings namespace.
-          ctx.effect(() => {
+          if (settings === undefined || typeof settings.configure !== 'function') return
+          // The working reference (`@opencode2dsh/dsh-plugin`) claims the page with
+          // `configure({ auto: false }, ...)` registered on the CHILD effect, not the
+          // outer one — `auto: true` asks the host to synthesise a form from the
+          // schema, which is not what a plugin that ships its own card wants.
+          const claim = (): unknown => {
             presentationDiag.effectRan = true
-            const dispose = settings.configure({ auto: true }, presentationOwner)
+            const dispose = settings.configure({ auto: false }, presentationOwner)
             presentationDiag.configureRan = true
             return dispose
-          })
+          }
+          if (typeof child.effect === 'function') child.effect.call(settingsCtx, claim)
+          else claim()
+        })
+        // Diagnostic-only sibling. `ConfigEditor.entries()` keeps a Loader entry
+        // only when its parent is an `include` AND its id is unique across the
+        // profile, so for the save route "not in configEditor" and "not unique"
+        // are the same symptom. Asking here costs one extra service and cannot
+        // stop the card from working if it is unavailable.
+        ctx.inject(['configEditor'], (editorCtx: never) => {
+          try {
+            const editor = editorCtx as unknown as {
+              configEditor?: {
+                entries?: () => Array<{
+                  options?: { id?: unknown }
+                  parent?: { tree?: { ctx?: { fiber?: { entry?: { id?: unknown } } } } }
+                  fiber?: { state?: unknown; runtime?: { Config?: unknown } }
+                }>
+              }
+            }
+            const rows = typeof editor.configEditor?.entries === 'function' ? editor.configEditor.entries() : undefined
+            if (rows === undefined) {
+              presentationDiag.editorError = 'configEditor present but no entries()'
+              return
+            }
+            presentationDiag.editorEntries = rows.map(row => {
+              const runtime = row.fiber?.runtime as { Config?: unknown } | null | undefined
+              const config = runtime?.Config as { toJSON?: unknown } | undefined
+              const ours = String(row.options?.id) === PLUGIN_ID ? ':ours' : ''
+              return `${String(row.options?.id)}@${String(row.fiber?.state)}${config === undefined ? ':noschema' : ':schema'}${ours}`
+            })
+          } catch (error: unknown) {
+            presentationDiag.editorError = (error as Error)?.message ?? String(error)
+          }
         })
       }
     } catch (error: unknown) {
@@ -333,10 +396,14 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
         const disposeSave = registerDoubaoSaveRoute(
           {
             webServer: (webCtx as unknown as { webServer: WebServerLike }).webServer,
-            get: (name: string) => (webCtx as unknown as { get(name: string): unknown }).get(name),
           },
           {
-            settingsNamespace: () => settingsNs,
+            // The write goes to the plugin's OWN file. The host settings path is
+            // unusable for this plugin (fiber stuck at LOADING => no
+            // `runtime.Config` => `No configurable plugin entry`), so the file
+            // is the only place a save can land — see ./doubao-store.ts.
+            write: (field: string, value: unknown) => { writeStoredSetting(field, value) },
+            read: () => readStoredSettings(),
             diagnostics: () => ({ ...presentationDiag, pluginName: name }),
             // Keep the live switch in sync with a write made through this route:
             // the host's own change event is not guaranteed on every line, and a
