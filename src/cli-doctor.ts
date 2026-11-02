@@ -34,6 +34,7 @@ import {
   discoverDoubaoModels,
 } from './doubao-catalog.ts'
 import { doubaoQuotaView, DOUBAO_QUOTA_PATH } from './doubao-status.ts'
+import { discoverAllCachedModels, liveModels } from './doubao-discovery.ts'
 
 export type CheckStatus = 'ok' | 'fail' | 'skip'
 
@@ -177,6 +178,27 @@ export async function runDoctor(): Promise<DoctorReport> {
       },
     })
   }
+
+  // ---- 5. model discovery ----------------------------------------------
+  //
+  // The catalog is discovered from the client's own cache. This reports whether
+  // that worked or whether we are riding the static fallback — the difference
+  // between "new Doubao models show up by themselves" and "they silently don't,
+  // and nobody notices until a user asks where Pro went".
+  const cached = discoverAllCachedModels()
+  const offered = liveModels()
+  checks.push({
+    name: 'models',
+    status: offered.length > 0 ? 'ok' : 'fail',
+    detail: cached.length > 0
+      ? `客户端缓存 ${cached.length} 个模型，开放 ${offered.length} 个（「工作任务」专属的按名字前缀排除）`
+      : `读不到客户端缓存，回落到内置清单（${offered.length} 个）`,
+    data: {
+      source: cached.length > 0 ? 'client-cache' : 'static-fallback',
+      cached: cached.map((entry) => `${entry.key}=${entry.name}${entry.taskOnly ? '[工作任务]' : ''}`),
+      offered: offered.map((model) => `${model.id}=${model.name}`),
+    },
+  })
 
   return {
     ok: checks.every((check) => check.status === 'ok'),

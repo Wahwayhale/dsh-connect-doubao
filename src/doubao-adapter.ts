@@ -137,6 +137,13 @@ export interface DoubaoAdapterOptions {
   shim: DoubaoShim
   /** Initial ticked ids, or undefined for "never configured". */
   enabledModelIds?: string[] | undefined
+  /**
+   * Where the current catalog comes from. Defaults to the static list; the
+   * plugin passes the DISCOVERED list so a model Doubao ships reaches this
+   * provider without waiting for a plugin release. Called on every rebuild, so
+   * it must be cheap — `liveModels()` memoises it.
+   */
+  modelsProvider?: () => readonly DoubaoModelInfo[]
 }
 
 /**
@@ -174,10 +181,11 @@ export function createDoubaoAdapter(options: DoubaoAdapterOptions): DoubaoAdapte
     const address = syncBaseUrl
     if (address === undefined) return []
     const baseUrl = `${address}/v1`
-    // Filtered by the checklist selection: this is the one and only thing the
-    // card's ticks control — which entries exist in DSH's model picker. The
-    // per-request choice among them is sent as `model_item_key`.
-    return enabledModelsOf(enabledIds).map(info => toPiModel(info, baseUrl, providerId))
+    // Filtered by the checklist selection, drawn from the CURRENT catalog (the
+    // discovered one when the client cache yields it). A model Doubao adds shows
+    // up here on the next rebuild rather than after a plugin release.
+    return enabledModelsOf(enabledIds, (options.modelsProvider ?? (() => DOUBAO_MODELS))())
+      .map(info => toPiModel(info, baseUrl, providerId))
   }
 
   const base = createProvider({

@@ -15,7 +15,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { fetchQuota, findWindow, millisUntilReset, invalidateQuotaCache } from './doubao-quota.ts'
 import { describeProfileLocation } from './doubao-auth.ts'
-import { doubaoCatalogEntries } from './doubao-catalog.ts'
+import { doubaoCatalogEntries, type DoubaoModelInfo } from './doubao-catalog.ts'
+import { invalidateDiscovery } from './doubao-discovery.ts'
 import type { DoubaoCatalogEntry } from './doubao-catalog.ts'
 
 /** Route path, relative to the plugin mount point. */
@@ -173,7 +174,10 @@ export interface DoubaoCatalogView {
  * behaviour: it refreshes the VIEW, and the card's note tells the user that
  * selection controls picker entries rather than routing.
  */
-export function registerDoubaoCatalogRoute(ctx: { webServer: WebServerLike }): () => void {
+export function registerDoubaoCatalogRoute(
+  ctx: { webServer: WebServerLike },
+  deps: { modelsProvider?: () => readonly DoubaoModelInfo[] } = {},
+): () => void {
   return ctx.webServer.register({
     kind: 'exact',
     path: DOUBAO_CATALOG_PATH,
@@ -186,7 +190,11 @@ export function registerDoubaoCatalogRoute(ctx: { webServer: WebServerLike }): (
         json(res, 403, { error: 'origin-not-trusted' })
         return
       }
-      const payload: DoubaoCatalogView = { ok: true, models: doubaoCatalogEntries(), error: null }
+      // A POST drops the discovery memo, so the card's 刷新 re-reads the client
+      // cache and a model Doubao just shipped can appear without restarting DSH.
+      if (req.method === 'POST') invalidateDiscovery()
+      const models = deps.modelsProvider === undefined ? undefined : deps.modelsProvider()
+      const payload: DoubaoCatalogView = { ok: true, models: doubaoCatalogEntries(models), error: null }
       json(res, 200, payload)
     },
   })

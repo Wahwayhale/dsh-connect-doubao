@@ -315,8 +315,17 @@ export interface DiscoveredDoubaoModel {
   reasoning: boolean
 }
 
-export function discoverDoubaoModels(): DiscoveredDoubaoModel[] {
-  return DOUBAO_MODELS.map((model) => ({
+/**
+ * Publish the catalog as pi-ai model descriptors.
+ *
+ * `models` defaults to the static list but is normally the DISCOVERED one — the
+ * caller passes whatever the client cache currently reports, so a model Doubao
+ * ships appears without a plugin release.
+ */
+export function discoverDoubaoModels(
+  models: readonly DoubaoModelInfo[] = DOUBAO_MODELS,
+): DiscoveredDoubaoModel[] {
+  return models.map((model) => ({
     id: model.id,
     name: model.badge === undefined ? model.name : `${model.name} · ${model.badge}`,
     contextWindow: DOUBAO_CONTEXT_WINDOW,
@@ -337,11 +346,20 @@ export function discoverDoubaoModels(): DiscoveredDoubaoModel[] {
  *
  * `undefined` (never configured) serves the whole catalog: a first-run install
  * must show its models. Ids that no longer exist are dropped.
+ *
+ * A model DISCOVERED after the user last saved is kept even when it is not in
+ * their tick list — otherwise a new Doubao release would be invisible until the
+ * user thought to reopen the card and re-save, which is exactly the staleness
+ * this path exists to remove.
  */
-export function enabledModelsOf(enabledIds: string[] | undefined): DoubaoModelInfo[] {
-  if (enabledIds === undefined || enabledIds.length === 0) return [...DOUBAO_MODELS]
+export function enabledModelsOf(
+  enabledIds: string[] | undefined,
+  models: readonly DoubaoModelInfo[] = DOUBAO_MODELS,
+): DoubaoModelInfo[] {
+  if (enabledIds === undefined || enabledIds.length === 0) return [...models]
   const wanted = new Set(enabledIds)
-  return DOUBAO_MODELS.filter(model => wanted.has(model.id))
+  const known = new Set(DOUBAO_MODELS.map((model) => model.id))
+  return models.filter((model) => wanted.has(model.id) || !known.has(model.id))
 }
 
 /** One catalog entry as the card's checklist consumes it. */
@@ -355,8 +373,10 @@ export interface DoubaoCatalogEntry {
   reasoningLevels: Array<{ id: string; name: string; level: number; verified: boolean }>
 }
 
-export function doubaoCatalogEntries(): DoubaoCatalogEntry[] {
-  return DOUBAO_MODELS.map((model) => ({
+export function doubaoCatalogEntries(
+  models: readonly DoubaoModelInfo[] = DOUBAO_MODELS,
+): DoubaoCatalogEntry[] {
+  return models.map((model) => ({
     id: model.id,
     name: model.name,
     badge: model.badge ?? null,

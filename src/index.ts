@@ -29,6 +29,7 @@ import {
   enabledModelsOf,
 } from './doubao-catalog.ts'
 import { ENABLED_MODEL_IDS_FIELD, effectiveIds } from './doubao-config.ts'
+import { liveModels, invalidateDiscovery, discoverAllCachedModels } from './doubao-discovery.ts'
 import type { DoubaoSettings } from './doubao-config.ts'
 
 export const PLUGIN_ID = 'dsh-connect-doubao'
@@ -39,6 +40,13 @@ export * from './doubao-upstream.ts'
 export * from './doubao-quota.ts'
 export * from './doubao-catalog.ts'
 export * from './doubao-config.ts'
+export {
+  liveModels,
+  invalidateDiscovery,
+  discoverModels,
+  discoverAllCachedModels,
+  DISCOVERY_TTL_MS,
+} from './doubao-discovery.ts'
 export { createDoubaoAdapter, DOUBAO_STREAM_IDLE_TIMEOUT_MS } from './doubao-adapter.ts'
 export { createDoubaoShim, type DoubaoShim } from './doubao-shim.ts'
 export {
@@ -168,6 +176,7 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
     const { adapter, invalidate, setEnabledModelIds } = createDoubaoAdapter({
       shim,
       enabledModelIds: effectiveIds(config),
+      modelsProvider: liveModels,
     })
 
     // Register the adapter first: an empty INITIAL registration is invalid
@@ -195,14 +204,18 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
     // snapshot after startup already points at the live port.
     invalidate()
 
-    // Model discovery publishes the catalog filtered by the user's ticked
-    // entries. This is the ONLY thing the checklist actually controls: which
-    // entries exist in DSH's model picker. It does not route anything (Doubao
-    // is content-driven — see doubao-catalog.ts).
+    // Model discovery publishes the catalog, filtered by the user's ticked
+    // entries. The list itself comes from the CLIENT'S OWN CACHE (see
+    // doubao-discovery.ts), so a model Doubao ships appears here without a
+    // plugin release; the static catalog is only the fallback.
+    //
+    // The checklist decides which entries exist in DSH's model picker. Routing
+    // is a separate axis: the picked entry travels as `model_item_key`, and
+    // `input_skill` (生图) is a third axis on top of that.
     try {
       discoveryRelease = ctx.llm.registerModelDiscovery(settingsNs, async (request) => {
         if (request.provider !== undefined && request.provider !== DOUBAO_PROVIDER) return []
-        return enabledModelsOf(effectiveIds(current)).map(model => ({
+        return enabledModelsOf(effectiveIds(current), liveModels()).map(model => ({
           id: model.id,
           name: model.name,
           contextWindow: DOUBAO_CONTEXT_WINDOW,
@@ -251,7 +264,7 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
     ctx.inject(['webServer'], (webCtx) => {
       try {
         const disposeQuota = registerDoubaoQuotaRoute(webCtx)
-        const disposeCatalog = registerDoubaoCatalogRoute(webCtx)
+        const disposeCatalog = registerDoubaoCatalogRoute(webCtx, { modelsProvider: liveModels })
         ctx.effect(() => () => {
           disposeQuota()
           disposeCatalog()
