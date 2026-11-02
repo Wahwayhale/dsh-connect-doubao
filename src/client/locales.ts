@@ -67,8 +67,8 @@ export const zh = {
   'profile.clear': '改回自动探测',
   'profile.current': '当前使用',
   'profile.hintTitle': '该选哪个目录？',
-  'profile.hint': '选豆包客户端存放数据的那个文件夹，里面应该有一个叫 Default 的子文件夹（Default\Network\Cookies 就是登录信息）。常见位置：%LOCALAPPDATA%\Doubao\User Data。如果你在装豆包时改过「数据目录」，或后来把整个 User Data 文件夹搬到了 D 盘，就选搬过去的那个。选上层文件夹（例如 D:\Doubao）也可以，插件会自动往下找一层 User Data。',
-  'profile.invalid': '这个目录里没有豆包数据（缺少 Default\Network\Cookies）',
+  'profile.hint': '选豆包客户端存放数据的那个文件夹，里面应该有一个叫 Default 的子文件夹（Default\\Network\\Cookies 就是登录信息）。常见位置：%LOCALAPPDATA%\\Doubao\\User Data。如果你在装豆包时改过「数据目录」，或后来把整个 User Data 文件夹搬到了 D 盘，就选搬过去的那个。选上层文件夹（例如 D:\\Doubao）也可以，插件会自动往下找一层 User Data。',
+  'profile.invalid': '这个目录里没有豆包数据（缺少 Default\\Network\\Cookies）',
   'profile.envNote': '也可以设环境变量 {env}，它的优先级最高。',
   'profile.pickFailed': '打开目录选择器失败：{reason}',
 
@@ -141,8 +141,8 @@ export const en: Record<DoubaoCardKey, string> = {
   'profile.clear': 'Back to automatic',
   'profile.current': 'In use',
   'profile.hintTitle': 'Which folder should I pick?',
-  'profile.hint': 'Pick the folder where the Doubao app keeps its data. It should contain a subfolder called Default — Default\Network\Cookies is the sign-in. The usual place is %LOCALAPPDATA%\Doubao\User Data. If you changed the "data directory" during install, or moved the whole User Data folder to D:, pick where you moved it. Picking the parent (e.g. D:\Doubao) also works: the plugin looks one level down for User Data.',
-  'profile.invalid': 'That folder holds no Doubao data (no Default\Network\Cookies)',
+  'profile.hint': 'Pick the folder where the Doubao app keeps its data. It should contain a subfolder called Default — Default\\Network\\Cookies is the sign-in. The usual place is %LOCALAPPDATA%\\Doubao\\User Data. If you changed the "data directory" during install, or moved the whole User Data folder to D:, pick where you moved it. Picking the parent (e.g. D:\\Doubao) also works: the plugin looks one level down for User Data.',
+  'profile.invalid': 'That folder holds no Doubao data (no Default\\Network\\Cookies)',
   'profile.envNote': 'You can also set the {env} environment variable; it takes precedence over everything.',
   'profile.pickFailed': 'Could not open the folder picker: {reason}',
 

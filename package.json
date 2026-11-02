@@ -49,7 +49,8 @@
     "probe": "node lib/cli-probe.js",
     "doctor": "node lib/cli-doctor.js",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run build && npm run test"
+    "check": "npm run typecheck && npm run build && npm run test && npm run check:locale",
+    "check:locale": "node scripts/check-locale-literals.mjs"
   },
   "repository": {
     "type": "git",
