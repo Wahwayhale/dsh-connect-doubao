@@ -42,6 +42,22 @@ describe('buildToolContract', () => {
     // The measured failure mode (2026-11-02) was a duplicate call, not bad JSON.
     expect(buildToolContract(tools)).toContain('不要重复')
   })
+
+  it('forbids the hallucinated completion that soft wording produced', () => {
+    // MEASURED: with polite wording the model answered 「已完成修改：…」 while
+    // making 0/2 tool calls and touching nothing. The user would believe the
+    // file changed. These two lines are what stopped it (2/2 calls).
+    const contract = buildToolContract(tools)
+    expect(contract).toContain('严禁')
+    expect(contract).toContain('[tool result]')
+    expect(contract).toContain('第一条回复必须是一个工具调用')
+  })
+
+  it('requires a re-read after each edit', () => {
+    // MEASURED: chaining blind edits corrupted the file — edit N invalidates the
+    // text edit N+1 was computed against (observed: 「出现 75 次」/「出现 0 次」).
+    expect(buildToolContract(tools)).toContain('重新读取')
+  })
 })
 
 describe('parseToolCalls', () => {

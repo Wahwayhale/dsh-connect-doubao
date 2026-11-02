@@ -667,6 +667,15 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       const prompt = emulate
         ? `${promptBody}${buildToolContract(parsed.tools ?? [])}`
         : promptBody
+      // Diagnosis for "why did it answer something unrelated": the prompt is the
+      // only thing we control, so being able to see exactly what went upstream is
+      // the difference between debugging and guessing.
+      if (process.env.DSH_DOUBAO_DEBUG_PROMPT === '1') {
+        process.stderr.write(
+          `[prompt] chars=${prompt.length} tools=${parsed.tools?.length ?? 0} emulate=${emulate}\n` +
+          `${prompt.slice(0, 1200)}\n---\n`,
+        )
+      }
       const upstreamOptions = {
         ...requestOptions(parsed),
         ...isContinuationTurn ? { conversationId: known.conversationId, continueConversation: true } : {},

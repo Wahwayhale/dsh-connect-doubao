@@ -51,10 +51,19 @@ const FENCE_RE = new RegExp(
 /**
  * Render the tool contract appended to the prompt.
  *
- * Deliberately blunt and short: every extra sentence is another thing a future
- * model revision can ignore. The rules that matter are "exactly one call",
- * "valid JSON", and "stop when done" — the measured failure mode was repeating
- * a call, so the no-repeat instruction is stated outright.
+ * MEASURED, and the reason this reads like a rulebook rather than a suggestion
+ * (2026-11-02, same task, same model, only the wording changed):
+ *
+ *   polite wording  → 0/2 tool calls, and the model answered 「已完成修改：…」
+ *                     while touching nothing. That is the worst outcome
+ *                     available: the user believes the file changed.
+ *   hard wording    → 2/2 tool calls (read first, then edit).
+ *
+ * So the rules forbid the failure modes explicitly instead of implying them:
+ * "never claim completion without a [tool result]", "do not paste code for the
+ * user to apply themselves", and "your first reply must be a call". A simulation
+ * has no protocol to fall back on — the prompt is the only enforcement there is,
+ * and a soft prompt measurably produces the hallucination.
  */
 export function buildToolContract(tools: readonly InboundTool[]): string {
   const usable = tools
@@ -65,21 +74,33 @@ export function buildToolContract(tools: readonly InboundTool[]): string {
     .filter((tool) => typeof tool.function?.name === 'string')
     .map((tool) => {
       const fn = tool.function
-      const schema = fn?.parameters === undefined ? '' : ` 参数: ${JSON.stringify(fn.parameters)}`
+      const schema = fn?.parameters === undefined ? '' : ` — 参数: ${JSON.stringify(fn.parameters)}`
       const desc = fn?.description === undefined ? '' : ` — ${fn.description}`
       return `- ${fn?.name}${desc}${schema}`
     })
   return [
     '',
     '',
-    '你可以调用下列工具来完成任务：',
+    '你是执行型助手，只能通过工具改动磁盘。可用工具：',
     ...lines,
     '',
     '需要调用工具时，只输出一个代码围栏，语言标记为 ' + TOOL_FENCE_LANGUAGE + '，' +
       '围栏内放恰好一个 JSON 对象：{"name":"<工具名>","arguments":{...}}。',
-    '一次只调用一个工具；JSON 必须严格合法（双引号、无注释、无尾逗号）。',
     '执行结果会以 [tool result] 开头的消息回给你，然后你继续推进。',
-    '不要重复刚刚已经做过的调用。任务完成时不要输出围栏，直接给出简短结论。',
+    '',
+    '硬性规则：',
+    '- 你的第一条回复必须是一个工具调用，不能是解释、计划或代码片段。',
+    '- 严禁在回复里声称「已完成」「已修改」——除非你真的执行了工具调用并收到 [tool result]。没有结果就等于没做。',
+    '- 不要把修改后的代码贴给用户让他自己粘贴；直接调用工具去改。',
+    '- 一次只调用一个工具；JSON 必须严格合法（双引号、无注释、无尾逗号）。',
+    '- 不要重复刚刚已经做过的调用。',
+    // MEASURED: without this rule the model chains several blind edits, and
+    // because `old_string` must be unique, edit N invalidates the text edit N+1
+    // was computed against. The observed run made 4 edits, 2 failed with
+    // 「出现 75 次」/「出现 0 次」, and left a corrupted file. Reading after every
+    // mutation is what keeps a multi-step edit honest.
+    '- 每次修改文件之后，先重新读取该文件，再决定下一步；不要凭记忆连续拼接多次改动。',
+    '- 全部完成后用一句话说明你改了哪个文件、改了什么。',
   ].join('\n')
 }
 
