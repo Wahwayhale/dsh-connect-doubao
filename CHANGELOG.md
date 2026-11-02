@@ -47,6 +47,13 @@
   旧代码只取一边导致「1+1」变成「+1」。已抽出 `assembleReplyText` 统一拼接。
 - **对话模式根本不通** —— `agent_mode` 常量写反（1/2 互相搞错），每一轮都被路由到
   豆包的任务 agent，直接回 `710010702`。已按 CDP 抓到的真实请求体整体重写。
+- **User Data 不在 C 盘就读不到登录信息** —— 凭据查找曾硬编码
+  `%LOCALAPPDATA%\Doubao\User Data`，把数据放到 D 盘（安装器提供这个选项，也有人事后手动搬）
+  的机器会报 `Doubao user profile not found`。现在改为四层回退：环境变量
+  `DSH_DOUBAO_PROFILE` → AppData 候选 → 运行中客户端的 `--user-data-dir` → 限时扫盘。
+  顺序按**代价**而非准确度排：常见情况 4 次 `existsSync` 就命中，不会为 0.8 s 的进程探测
+  拖慢每次冷启动。返回的是候选**列表**而非单一路径，因为「复制而非移动」会留下空壳 profile —
+  凭据加载会逐个尝试，取第一个真正能解出可用会话的。
 
 ### 改进
 
@@ -65,13 +72,16 @@
   `710010702`。插件默认走纯对话模式，`DSH_DOUBAO_TASK=1` 才尝试任务模式。
 - **工具模拟只在豆包自身不具备的能力上可靠**。让它「查天气」时它会改用自带联网搜索，
   不调用我们的工具。
-- **Windows only**。凭据解密依赖 DPAPI。
+- **Windows only**。凭据解密依赖 DPAPI。User Data 可以不在 C 盘（见上文四层回退）。
 
 ### 测试
 
-- 10 个测试文件、**112 个用例**全绿（其中本版新增 `store.test.ts` 15 例、
-  `save-route.test.ts` 11 例，覆盖文件合并语义、原子写入、字段白名单、Origin 校验与 500 契约）。
+- 11 个测试文件、**132 个用例**全绿（其中本版新增 `store.test.ts` 15 例、
+  `save-route.test.ts` 11 例，覆盖文件合并语义、原子写入、字段白名单、Origin 校验与 500 契约；
+  `profile.test.ts` 20 例，覆盖四层回退的优先级、去重、扫描深度与时间预算）。
 - `doctor` 五项全绿：凭据 29 cookie / 账号通过 / shim OK / 额度 / 模型发现。
+  `doctor --json` 的 `credentials.data` 现在同时给出 `profile`（用的是哪个、`via env|appdata|
+  process|scan`）与 `candidates`（全部候选），定位"读不到登录信息"时先看这两项。
 
 ---
 

@@ -30,11 +30,14 @@
  * values as opaque secrets.
  */
 import { createHash, createDecipheriv } from 'node:crypto'
-import { readFileSync, mkdtempSync, rmSync, copyFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, mkdtempSync, rmSync, copyFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
+// Imported AND re-exported: the callers below use these directly, while other
+// modules (shim, doctor, probe) still import them from this module's surface.
+import { listDoubaoProfiles, PROFILE_ENV } from './doubao-profile.ts'
 
 const require_ = createRequire(import.meta.url)
 
@@ -317,31 +320,23 @@ export function decryptCookieValue(masterKey: Buffer, encryptedValue: Buffer, ho
  * Profile location
  * ------------------------------------------------------------------ */
 
-/** Locate the Doubao Chromium profile directory on this machine. */
-export function findDoubaoUserDataDir(): string | undefined {
-  if (process.platform !== 'win32') return undefined
-  const bases = [
-    process.env.LOCALAPPDATA,
-    process.env.APPDATA,
-    'C:\\Users',
-  ].filter((x): x is string => Boolean(x))
-  const candidates: string[] = []
-  for (const base of bases) {
-    candidates.push(join(base, 'Doubao', 'User Data'))
-    if (base.endsWith('Users')) {
-      try {
-        const { readdirSync } = require_('node:fs') as typeof import('node:fs')
-        for (const user of readdirSync(base)) {
-          candidates.push(join(base, user, 'AppData', 'Local', 'Doubao', 'User Data'))
-        }
-      } catch { /* ignore unreadable bases */ }
-    }
-  }
-  for (const candidate of candidates) {
-    if (existsSync(join(candidate, 'Default', 'Network', 'Cookies'))) return candidate
-  }
-  return undefined
-}
+/**
+ * Locate the Doubao Chromium profile directory on this machine.
+ *
+ * Discovery lives in `./doubao-profile.ts` and is re-exported here because
+ * every caller (shim, doctor, probe) reaches for it through this module. It is
+ * no longer hardcoded to `%LOCALAPPDATA%`: the app lets users put `User Data`
+ * on another drive, and a fixed path made those installs look "not installed".
+ */
+export {
+  findDoubaoUserDataDir,
+  listDoubaoProfiles,
+  describeProfileLocation,
+  extractUserDataDir,
+  PROFILE_ENV,
+  type DoubaoProfileLocation,
+  type ProfileSource,
+} from './doubao-profile.ts'
 
 /* ------------------------------------------------------------------ *
  * SQLite access (read-only, via a throwaway copy)
@@ -458,17 +453,41 @@ export function loadDoubaoCredentials(options: { force?: boolean } = {}): Doubao
 
   let credentials: DoubaoCredentials
   try {
-    const userDataDir = findDoubaoUserDataDir()
-    if (!userDataDir) {
+    // A stale leftover profile can shadow the live one: someone who COPIED the
+    // folder to another drive leaves an empty cookie jar behind in AppData, and
+    // taking the first hit would then report "cookies missing" while a perfectly
+    // good session sits on D:. So walk the candidates and keep the first that
+    // actually decrypts into a usable session.
+    const profiles = listDoubaoProfiles()
+    if (profiles.length === 0) {
       credentials = {
         ok: false,
         reason:
-          'Doubao user profile not found. Expected <UserProfile>\\AppData\\Local\\Doubao\\User Data.',
+          'Doubao user profile not found. Looked in %LOCALAPPDATA%, %APPDATA%, the running ' +
+          `client's --user-data-dir, and every drive. Set ${PROFILE_ENV} to the folder ` +
+          'containing "Default" if the app keeps its data somewhere else.',
         header: '',
         pairs: new Map(),
       }
     } else {
-      credentials = decryptFromProfile(userDataDir)
+      let failure: DoubaoCredentials | undefined
+      let settled: DoubaoCredentials | undefined
+      for (const profile of profiles) {
+        const attempt = decryptFromProfile(profile.dir)
+        if (attempt.ok) {
+          settled = attempt
+          break
+        }
+        // Keep the FIRST failure: candidates are ordered env → appdata →
+        // process → scan, so the earliest one is the one the user meant.
+        failure ??= attempt
+      }
+      credentials = settled ?? failure ?? {
+        ok: false,
+        reason: 'no readable Doubao profile',
+        header: '',
+        pairs: new Map(),
+      }
     }
   } catch (error) {
     credentials = {
@@ -566,10 +585,4 @@ function decryptFromProfile(userDataDir: string): DoubaoCredentials {
 /** Drop the in-memory cache. Used by tests and by explicit user refresh. */
 export function invalidateCredentialCache(): void {
   cached = undefined
-}
-
-/** Parent directory of the profile, for diagnostics only. */
-export function describeProfileLocation(): string {
-  const dir = findDoubaoUserDataDir()
-  return dir ? dirname(dir) : '<not found>'
 }

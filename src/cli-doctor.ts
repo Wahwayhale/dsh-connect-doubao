@@ -21,7 +21,8 @@ import {
   loadDoubaoCredentials,
   describeProfileLocation,
   REQUIRED_COOKIE_NAMES,
-  findDoubaoUserDataDir,
+  listDoubaoProfiles,
+  PROFILE_ENV,
 } from './doubao-auth.ts'
 import { probeAccount, classifyDoubaoFailure, DoubaoUpstreamError } from './doubao-upstream.ts'
 import { fetchQuota, findWindow } from './doubao-quota.ts'
@@ -73,13 +74,20 @@ export async function runDoctor(): Promise<DoctorReport> {
   const checks: DoctorCheck[] = []
 
   // ---- 1. credentials -------------------------------------------------
-  const profileDir = findDoubaoUserDataDir()
+  // `listDoubaoProfiles` rather than `findDoubaoUserDataDir`: when a stale copy
+  // and the live profile both exist, "which one got used" is the first question
+  // anyone asks, and it is only answerable if the whole list is kept.
+  const profiles = listDoubaoProfiles()
+  const profileDir = profiles[0]?.dir
   let credentials = loadDoubaoCredentials()
   if (profileDir === undefined) {
     checks.push({
       name: 'credentials',
       status: 'fail',
-      detail: 'Doubao user profile not found. Expected <UserProfile>\\AppData\\Local\\Doubao\\User Data.',
+      detail:
+        'Doubao user profile not found. Looked in %LOCALAPPDATA%, %APPDATA%, every user profile, ' +
+        `the running client's --user-data-dir, and every drive. Set ${PROFILE_ENV} to the folder ` +
+        'containing "Default" if the app keeps its data elsewhere.',
     })
   } else if (!credentials.ok) {
     checks.push({ name: 'credentials', status: 'fail', detail: credentials.reason ?? 'unavailable' })
@@ -90,7 +98,13 @@ export async function runDoctor(): Promise<DoctorReport> {
       status: present.length === REQUIRED_COOKIE_NAMES.length ? 'ok' : 'fail',
       detail: `${credentials.pairs.size} cookies decrypted; ${present.length}/${REQUIRED_COOKIE_NAMES.length} required session cookies present`,
       // Names and counts only — never values.
-      data: { profile: describeProfileLocation(), cookieCount: credentials.pairs.size },
+      data: {
+        profile: describeProfileLocation(),
+        // Every candidate, best first. More than one means the loader had to
+        // choose between them, which is exactly what a bug report needs to see.
+        candidates: profiles.map((entry) => `${entry.dir} (via ${entry.source})`),
+        cookieCount: credentials.pairs.size,
+      },
     })
   }
 
