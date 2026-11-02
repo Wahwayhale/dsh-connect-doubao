@@ -30,6 +30,8 @@ import {
   classifyQuotaView,
   clampPercent,
   enabledModelIdsOf,
+  DOUBAO_TOOL_EMULATION_FIELD,
+  toolEmulationOf,
   formatCountdown,
 } from './contract.ts'
 import type { DoubaoAccountState, DoubaoCatalogView, DoubaoModelEntry, DoubaoQuotaView } from './contract.ts'
@@ -369,6 +371,38 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     }
   }, [scope, draft, t])
 
+  /**
+   * The tool-emulation switch.
+   *
+   * Written immediately (no Save button) because it is a single independent
+   * toggle: bundling it into the checklist's draft would make a model-selection
+   * edit and a privilege change share one commit, and the user cannot tell which
+   * one they are confirming.
+   *
+   * Read back for the same reason the checklist is: the host's write can resolve
+   * while the value never lands (see `onSave`), and silently failing to turn OFF
+   * a capability that lets a model touch files is the worse error.
+   */
+  const toolsOn = toolEmulationOf(configured)
+  const [toolsError, setToolsError] = useState<string | null>(null)
+  const onToggleTools = useCallback(async (next: boolean): Promise<void> => {
+    if (scope === undefined) return
+    setToolsError(null)
+    try {
+      await scope.set(DOUBAO_TOOL_EMULATION_FIELD, next)
+      let readBack = toolEmulationOf(scope.getSnapshot().value)
+      for (let attempt = 0; attempt < 5 && readBack !== next; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 120))
+        readBack = toolEmulationOf(scope.getSnapshot().value)
+      }
+      if (readBack !== next) {
+        setToolsError(t('models.saveFailed', { reason: 'host did not persist the value' }))
+      }
+    } catch (error: unknown) {
+      setToolsError(t('models.saveFailed', { reason: (error as Error)?.message ?? 'unknown error' }))
+    }
+  }, [scope, t])
+
   // ---- render -----------------------------------------------------------
   const state: DoubaoAccountState = classifyQuotaView(quota)
   const stateText = t(`account.${state}`)
@@ -472,6 +506,28 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
           {!dirty && saved && <span className="dbq-saved">{t('models.saved')}</span>}
           {saveError !== null && <span className="dbq-error">{saveError}</span>}
         </div>
+      </div>
+
+      {/* ---- experimental: tool emulation ------------------------------ */}
+      <div className="dbq-section">
+        <div className="dbq-section-title">
+          <span>{t('tools.title')}</span>
+          <span className="dbq-count">{toolsOn ? t('tools.enabled') : t('tools.disabled')}</span>
+        </div>
+        <div className="dbq-note">{t('tools.note')}</div>
+        <label className="dbq-model">
+          <input
+            type="checkbox"
+            checked={toolsOn}
+            disabled={!canWrite}
+            onChange={event => void onToggleTools(event.currentTarget.checked)}
+          />
+          <span className="dbq-model-main">
+            <span className="dbq-model-name"><span>{t('tools.toggle')}</span></span>
+          </span>
+        </label>
+        {toolsOn && <div className="dbq-note dbq-warn">{t('tools.warning')}</div>}
+        {toolsError !== null && <span className="dbq-error">{toolsError}</span>}
       </div>
     </div>
   )

@@ -48,6 +48,13 @@ import {
   SKILL_CARRIER_MODEL_ID,
   type DoubaoSkillName,
 } from './doubao-catalog.ts'
+import {
+  buildToolContract,
+  parseToolCalls,
+  toolResultAsText,
+  type EmulatedToolCall,
+  type InboundTool,
+} from './doubao-tools.ts'
 
 /** Hostnames the inbound half will accept. */
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]'])
@@ -154,13 +161,24 @@ export interface DoubaoShim {
 /** Minimal OpenAI chat request shape the shim accepts. */
 interface InboundChatRequest {
   model?: string
-  messages?: Array<{ role?: string; content?: unknown }>
+  messages?: Array<{
+    role?: string
+    content?: unknown
+    /** Present on `role: "tool"` messages. */
+    tool_call_id?: string
+    name?: string
+  }>
   stream?: boolean
   /**
    * Thinking level as spelled by the adapter's `thinkingLevelMap`
    * (minimal | low | medium | high, or null for off).
    */
   reasoning_effort?: string | null
+  /**
+   * Declared tools. Doubao ignores these on the wire; they are only used when
+   * tool emulation is switched on, where they become the prompt contract.
+   */
+  tools?: InboundTool[]
 }
 
 /**
@@ -278,14 +296,22 @@ function flattenContent(content: unknown): string {
  * Doubao's endpoint carries one user message; a multi-turn transcript is
  * flattened newest-last with role prefixes so the model still sees the
  * history. The system prompt is folded in as context rather than dropped.
+ *
+ * A `role: "tool"` message becomes a `[tool result] …` line, which is the exact
+ * shape the tool contract promises — the model is asked to recognise that prefix,
+ * so the two sides must not drift apart.
  */
-function buildPrompt(messages: Array<{ role?: string; content?: unknown }> | undefined): string {
+function buildPrompt(messages: Array<{ role?: string; content?: unknown; name?: string }> | undefined): string {
   if (!Array.isArray(messages) || messages.length === 0) return ''
   const turns: string[] = []
   for (const message of messages) {
     const text = flattenContent(message.content)
     if (!text) continue
     const role = message.role ?? 'user'
+    if (role === 'tool') {
+      turns.push(toolResultAsText(message.name, text))
+      continue
+    }
     turns.push(role === 'user' ? text : `[${role}] ${text}`)
   }
   return turns.join('\n\n')
@@ -294,6 +320,13 @@ function buildPrompt(messages: Array<{ role?: string; content?: unknown }> | und
 export interface DoubaoShimOptions {
   /** Resolve credentials per request, so a re-login is picked up without a restart. */
   resolveCredentials?: () => DoubaoCredentials
+  /**
+   * Whether to simulate tool calling in the prompt.
+   *
+   * Read per request (not once at construction) because the user can flip the
+   * setting without restarting the host.
+   */
+  toolEmulation?: () => boolean
 }
 
 export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
@@ -307,6 +340,9 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
    * Kept per shim (i.e. per host process) — a restart simply starts new threads.
    */
   const sessions = new ConversationStore()
+
+  /** Opt-in prompt-level tool calling; off unless the setting says otherwise. */
+  const emulationOn = options.toolEmulation ?? (() => false)
 
   // Per-process shared secret. In memory only; pi-ai sends it as
   // `Authorization: Bearer`, the shim validates it, and it is never
@@ -389,6 +425,12 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
    *
    * `parsed` is needed for the model and thinking level: the prompt alone says
    * nothing about which of them the caller picked.
+   *
+   * `emulate` switches the reply handling: instead of forwarding text deltas as
+   * they arrive, the whole turn is collected and the tool fence is parsed out.
+   * Streaming a fence cannot work — the call is only knowable once its JSON is
+   * complete — and an emulated turn is slow enough (~11.5s measured) that
+   * losing incrementality costs nothing a user would notice.
    */
   async function streamCompletion(
     res: ServerResponse,
@@ -397,6 +439,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     upstreamOptions: ChatRequestOptions,
     remember: (conversationId: string | undefined) => void,
     forget: () => void,
+    emulate: boolean,
   ): Promise<void> {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -427,6 +470,9 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
             send({ choices: [{ index: 0, delta: { reasoning_content: delta }, finish_reason: null }] })
           },
           onText: (delta) => {
+            // In emulated mode the fence is still forming, so nothing can be
+            // forwarded live; the whole turn is parsed after it completes.
+            if (emulate) return
             if (!roleSent) {
               send({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
               roleSent = true
@@ -439,6 +485,30 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       // previous mapping alone so the next attempt can still continue it.
       remember(result.conversationId)
       if (!roleSent) send({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
+
+      let finishReason = 'stop'
+      if (emulate) {
+        const { calls, text } = parseToolCalls(result.text)
+        const visible = text.trim() === '' ? ' ' : text
+        send({ choices: [{ index: 0, delta: { content: visible }, finish_reason: null }] })
+        calls.forEach((call: EmulatedToolCall, index: number) => {
+          send({
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index,
+                  id: call.id,
+                  type: 'function',
+                  function: { name: call.name, arguments: call.arguments },
+                }],
+              },
+              finish_reason: null,
+            }],
+          })
+        })
+        if (calls.length > 0) finishReason = 'tool_calls'
+      }
       // Generated images have no place on the OpenAI assistant side, so they are
       // appended to the text as Markdown — which is both what the user sees and
       // what lets the Harness fetch the file afterwards.
@@ -446,7 +516,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       if (markdown !== '') {
         send({ choices: [{ index: 0, delta: { content: `\n\n${markdown}` }, finish_reason: null }] })
       }
-      send({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
+      send({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })
       if (!res.writableEnded) {
         res.write('data: [DONE]\n\n')
         res.end()
@@ -583,11 +653,20 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       const useDelta = delta.length > 0
       const isContinuationTurn = continuing && useDelta
       const outgoing = useDelta ? delta : (parsed.messages ?? [])
-      const prompt = buildPrompt(outgoing)
-      if (!prompt) {
+      const promptBody = buildPrompt(outgoing)
+      if (!promptBody) {
         writeOpenAIError(res, 400, 'invalid_request', 'no usable message content')
         return
       }
+      /**
+       * Tool emulation: the declared tools become part of the PROMPT, because
+       * Doubao ignores the real `tools` field outright (measured — it answered
+       * with its own server-side search skill instead).
+       */
+      const emulate = emulationOn() && (parsed.tools?.length ?? 0) > 0
+      const prompt = emulate
+        ? `${promptBody}${buildToolContract(parsed.tools ?? [])}`
+        : promptBody
       const upstreamOptions = {
         ...requestOptions(parsed),
         ...isContinuationTurn ? { conversationId: known.conversationId, continueConversation: true } : {},
@@ -612,6 +691,13 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       if (parsed.stream === false) {
         const result = await chat(prompt, upstreamOptions)
         remember(result.conversationId)
+        // Same contract as the streaming path: the fence is parsed out of the
+        // visible text and becomes tool_calls, never prose the user must read.
+        const emulated = emulate ? parseToolCalls(result.text) : { calls: [], text: result.text }
+        const content = [
+          emulated.text,
+          result.images.length > 0 ? imageMarkdown(result.images) : '',
+        ].filter((part) => part !== '').join('\n\n')
         // What we actually sent upstream: the inbound id run through the
         // catalog, so an unknown id degrades to the default instead of being
         // echoed back as if it had been honoured.
@@ -630,17 +716,28 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
             index: 0,
             message: {
               role: 'assistant',
-              content: result.images.length > 0
-                ? `${result.text}\n\n${imageMarkdown(result.images)}`
-                : result.text,
+              content: content === '' ? ' ' : content,
+              ...(emulated.calls.length > 0
+                ? {
+                    tool_calls: emulated.calls.map((call) => ({
+                      id: call.id,
+                      type: 'function',
+                      function: { name: call.name, arguments: call.arguments },
+                    })),
+                  }
+                : {}),
             },
-            finish_reason: 'stop',
+            finish_reason: emulated.calls.length > 0 ? 'tool_calls' : 'stop',
           }],
         })
         return
       }
 
-      await streamCompletion(res, prompt, parsed, upstreamOptions, remember, () => sessions.forget(sessionKey))
+      await streamCompletion(
+        res, prompt, parsed, upstreamOptions, remember,
+        () => sessions.forget(sessionKey),
+        emulate,
+      )
     } catch (error) {
       writeFailure(res, error)
     }

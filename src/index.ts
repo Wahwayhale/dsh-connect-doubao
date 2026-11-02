@@ -28,7 +28,7 @@ import {
   discoverDoubaoModels,
   enabledModelsOf,
 } from './doubao-catalog.ts'
-import { ENABLED_MODEL_IDS_FIELD, effectiveIds } from './doubao-config.ts'
+import { ENABLED_MODEL_IDS_FIELD, effectiveIds, toolEmulationOf } from './doubao-config.ts'
 import { liveModels, invalidateDiscovery, discoverAllCachedModels } from './doubao-discovery.ts'
 import type { DoubaoSettings } from './doubao-config.ts'
 
@@ -153,7 +153,7 @@ export function settingsNamespaceOf(ctx: unknown): string {
  * releases the shim's port, the adapter, the directory entry, the discovery
  * callback and the HTTP routes — nothing outlives the plugin.
  */
-export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabledModelIds: [] }): void {
+export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabledModelIds: [], toolEmulation: false }): void {
   let shim: ReturnType<typeof createDoubaoShim> | undefined
   let adapterRelease: (() => void) | undefined
   let directoryRelease: (() => void) | undefined
@@ -172,7 +172,10 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
   let current: DoubaoSettings = config
 
   try {
-    shim = createDoubaoShim()
+    shim = createDoubaoShim({
+      // Read live so a settings change takes effect without a host restart.
+      toolEmulation: () => toolEmulationOf(current),
+    })
     const { adapter, invalidate, setEnabledModelIds } = createDoubaoAdapter({
       shim,
       enabledModelIds: effectiveIds(config),

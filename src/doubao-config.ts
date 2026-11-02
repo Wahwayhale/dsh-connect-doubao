@@ -34,6 +34,28 @@ export interface DoubaoSettings {
    * `enabledModelsOf` keys off {@link isConfigured} rather than off emptiness.
    */
   enabledModelIds: string[]
+  /**
+   * Simulate tool calling in the prompt so Doubao can drive the Harness tools.
+   *
+   * OFF by default. Doubao's endpoint ignores a `tools` array outright (measured
+   * 2026-10-22: it answered with its OWN server-side search skill and never
+   * referenced our declarations), so the only channel available is the prompt:
+   * describe the tools, then parse a fenced block back into `tool_calls`.
+   *
+   * Measured 2026-11-02 with a two-tool sandbox loop: 9/9 calls well-formed,
+   * 5/5 rounds converged, ~11.5s per round, one duplicate call. That is enough
+   * to be useful and not enough to be trusted silently — hence opt-in.
+   */
+  toolEmulation: boolean
+}
+
+/** The settings field holding the tool-emulation switch. */
+export const TOOL_EMULATION_FIELD = 'toolEmulation'
+
+/** Read the switch out of an arbitrary config snapshot; default false. */
+export function toolEmulationOf(config: unknown): boolean {
+  const value = (config as { toolEmulation?: unknown } | undefined)?.toolEmulation
+  return value === true
 }
 
 /** Whether the user has ever saved a selection (i.e. the field is not the default). */
@@ -57,6 +79,8 @@ export function isConfigured(config: unknown): boolean {
 export const Config: z<DoubaoSettings> = z.object({
   enabledModelIds: z.array(z.string()).default([])
     .description('Catalog ids enabled in the DSH model picker. Doubao routes upstream by content, so this selects which entries are offered, never which model answers. Empty means "not yet configured" and serves the whole catalog.'),
+  toolEmulation: z.boolean().default(false)
+    .description('实验性：豆包没有函数调用通道（tools 字段会被静默忽略），此项改用提示词模拟工具调用，让豆包能驱动 Harness 的本地工具。约 11.5 秒/轮，且可能随上游模型变化而退化，故默认关闭。'),
 })
 
 /**

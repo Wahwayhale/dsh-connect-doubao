@@ -39,7 +39,7 @@ export const zh = {
 
   'models.title': '模型',
   'models.enabledCount': '已启用 {count} ↑',
-  'models.routingNote': '本插件只提供「对话」模式的条目（快速 / 专家）：「工作任务」专属的 2.1 Pro、2.1 Lite 由豆包客户端内的运行时执行，外部客户端接不进去',
+  'models.routingNote': '清单直接读自豆包客户端的缓存，豆包上线新模型时会自动出现，不需要等插件更新。「工作任务」专属的条目（2.1 Pro / Lite / Auto）由客户端内的运行时执行，外部客户端接不进去，已自动隐藏',
   'models.refresh': '刷新',
   'models.refreshing': '刷新中…',
   'models.save': '保存',
@@ -57,6 +57,13 @@ export const zh = {
   'models.readOnly': '当前宿主未提供设置写入通道，勾选不会生效',
   'models.loadFailed': '模型目录读取失败',
   'models.empty': '没有可用的模型条目',
+
+  'tools.title': '实验性：工具调用',
+  'tools.toggle': '让豆包驱动本地工具（读写文件、执行命令）',
+  'tools.note': '豆包的接口没有函数调用通道（声明的 tools 会被静默忽略），此开关改用提示词模拟：把工具清单写进提示词，再把回复里的围栏解析回标准 tool_calls。实测约 11.5 秒/轮，复杂任务可能退化，故默认关闭。',
+  'tools.warning': '开启后豆包可以读写这台机器上的文件。请确认你信任当前会话的权限范围。',
+  'tools.enabled': '已开启',
+  'tools.disabled': '已关闭',
 } as const
 
 /** Every key the card can ask for. */
@@ -110,6 +117,13 @@ export const en: Record<DoubaoCardKey, string> = {
   'models.readOnly': 'This host provides no settings write path; ticking has no effect',
   'models.loadFailed': 'Could not read the model catalog',
   'models.empty': 'No model entries available',
+
+  'tools.title': 'Experimental: tool calling',
+  'tools.toggle': 'Let Doubao drive local tools (read/write files, run commands)',
+  'tools.note': 'Doubao\'s endpoint has no function-calling channel — a declared `tools` array is silently ignored — so this switch simulates it: the tool list goes into the prompt and the fenced block in the reply is parsed back into standard tool_calls. Measured ~11.5s per round; can degrade on complex tasks, hence off by default.',
+  'tools.warning': 'When on, Doubao can read and write files on this machine. Make sure you trust the permission scope of the current session.',
+  'tools.enabled': 'On',
+  'tools.disabled': 'Off',
 }
 
 /** Locale namespace registered by the browser-plugin entry. */

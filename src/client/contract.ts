@@ -161,6 +161,20 @@ export function enabledModelIdsOf(configured: unknown): string[] | undefined {
   return value.filter((entry): entry is string => typeof entry === 'string')
 }
 
+/** Settings field holding the tool-emulation switch. */
+export const DOUBAO_TOOL_EMULATION_FIELD = 'toolEmulation'
+
+/**
+ * Read the tool-emulation switch out of a settings snapshot.
+ *
+ * `undefined` (never saved) means OFF — the emulation is opt-in, so an
+ * unconfigured install must not silently start letting the model touch files.
+ */
+export function toolEmulationOf(configured: unknown): boolean {
+  const value = (configured as { toolEmulation?: unknown } | undefined)?.toolEmulation
+  return value === true
+}
+
 /** Clamp a percentage into the 0-100 range the bars render. */
 export function clampPercent(value: number | undefined): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return 0
