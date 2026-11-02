@@ -82,7 +82,7 @@ works everywhere):
 
 ### Code- and packet-level evidence (not screenshots)
 
-- `doctor` passes all four checks: 29 cookies decrypted with 9/9 required session
+- `doctor` passes all five checks: 29 cookies decrypted with 9/9 required session
   cookies present, the account accepted upstream, the shim bound to a loopback port with
   a wrong bearer refused (401), and both quota windows readable.
 - Reasoning effort low=3 / mid=4 / high=5 was read by **diffing the configuration the
@@ -184,15 +184,27 @@ plugin marketplace and what keeps runtime types consistent.
 | macOS | ❌ unsupported (DPAPI is Windows-only) |
 | Linux | ❌ unsupported (same) |
 
-Credential lookup (`findDoubaoUserDataDir`) tries, in order:
+Credential lookup (`listDoubaoProfiles`) tries, cheapest first:
 
-1. `%LOCALAPPDATA%\Doubao\User Data`
-2. `%APPDATA%\Doubao\User Data`
-3. `C:\Users\<each user>\AppData\Local\Doubao\User Data`
+0. **the folder you picked in the settings card** — the "Doubao data directory" section
+   has a native folder dialog. Validated before it is stored: a folder without
+   `Default\Network\Cookies` is refused, and one deleted later falls back to the probes
+   below instead of wedging credential loading.
+1. `DSH_DOUBAO_PROFILE` — escape hatch for scripted setups. Point it at `User Data` or
+   at its parent.
+2. `%LOCALAPPDATA%\Doubao\User Data`, `%APPDATA%\Doubao\User Data`,
+   `C:\Users\<each user>\AppData\Local\Doubao\User Data` — four `existsSync` calls.
+3. the running client's `--user-data-dir=` from its command line. Authoritative, but it
+   costs a `powershell.exe` (measured ≈0.7 s), so it only runs when the cheap paths miss.
+4. a time-boxed depth-4 scan of every fixed drive (1.5 s budget, system folders skipped).
 
 A candidate matches when `Default\Network\Cookies` exists.
-**Only the first is verified on a real machine**; 2 and 3 are fallback branches in the
-code and are explicitly *not* validated on hardware.
+The result is a **list**, not one path: copying rather than moving `User Data` leaves an
+empty shell on `C:` that still has a cookie jar but is signed out. Credential loading
+walks the list and keeps the first profile that actually decrypts into a usable session.
+
+`node lib/cli-doctor.js --json` reports which one won (`credentials.data.profile`, with
+its source) and every candidate it saw (`credentials.data.candidates`).
 
 ---
 
@@ -218,8 +230,8 @@ Full `probe` flags:
 --timeout <ms>               timeout (default 120000)
 ```
 
-`doctor` reports four independent checks: credentials / account / provider assembly /
-quota. It prints **counts only**, never values.
+`doctor` reports five independent checks: credentials / account / provider assembly /
+quota / model discovery. It prints **counts only**, never values.
 
 ---
 
@@ -253,7 +265,10 @@ npm run check       # all of the above
    What this plugin can establish is that it sends `model_item_key` with the request
    (confirmed by packet capture). How the server interprets that key is the server's
    own business.
-4. **Windows only** — credential decryption relies on DPAPI.
+4. **Windows only** — credential decryption relies on DPAPI. `User Data` does not
+   have to live on `C:` (see the five layers above); a browser-only host has no
+   native folder dialog, so the picker button reports that instead of failing
+   silently — use `DSH_DOUBAO_PROFILE` there.
 5. **Risk-control sliders cannot be automated.** When one fires, send one message in
    the Doubao desktop app to clear it.
 6. **No image input.** The provider sends text blocks only.
