@@ -145,6 +145,76 @@ export function needDeepThinkValue(deepThink: boolean): number {
   return deepThink ? DEEP_THINK_ON : DEEP_THINK_OFF
 }
 
+/* ------------------------------------------------------------------ *
+ * Skills — the capability axis, separate from the model axis
+ * ------------------------------------------------------------------ */
+
+/**
+ * Doubao's skill table, transcribed verbatim from the client bundle
+ * (`{FreeChat:0, SkillWrite:2, SkillImageGen:3, …}`), not inferred.
+ *
+ * `skill_id` is the decimal string of `skill_type`; the two are ALWAYS the same
+ * number, which is why a plain turn carries `{"skill_id":"0","skill_type":0}`.
+ * On the wire it is a JSON STRING inside `ext.input_skill`.
+ *
+ * There is no separate HTTP endpoint for text-to-image in the client — the only
+ * generation URL is `/creativity/canvas/exec`, which is the image EDITOR
+ * (cutout / outpaint / layer split). So a skill turn must go through
+ * `/chat/completion`, and it does: verified 2026-11-02, `skill_type: 3` returns
+ * real `rc_gen_image/*.jpeg` artefacts from Seedream 5.0.
+ */
+export const DOUBAO_SKILLS = {
+  freeChat: 0,
+  write: 2,
+  imageGen: 3,
+  search: 4,
+  translate: 5,
+  read: 6,
+  webpage: 7,
+  deepSearch: 8,
+  musicGen: 9,
+  edu: 11,
+  codeInterpreter: 13,
+  codeAssistant: 16,
+  videoGeneration: 17,
+  aiPPT: 18,
+} as const
+
+export type DoubaoSkillName = keyof typeof DOUBAO_SKILLS
+
+/** The `ext.input_skill` JSON string for a skill; undefined means plain chat. */
+export function inputSkillOf(skill: DoubaoSkillName | undefined): string | undefined {
+  if (skill === undefined || skill === 'freeChat') return undefined
+  const type = DOUBAO_SKILLS[skill]
+  return JSON.stringify({ skill_id: String(type), skill_type: type, variables: {} })
+}
+
+/**
+ * `block_type` of a creation (image-generation) block.
+ *
+ * Shape, from a captured stream:
+ *   content.creation_block.creations[] = {
+ *     type: 1,                       // 1 = image
+ *     id: "<task id>",
+ *     image: { key, status, image_ori{url,width,height}, image_preview{…}, image_thumb{…} }
+ *   }
+ */
+export const CREATION_BLOCK_TYPE = 2074
+
+/**
+ * DSH-side alias for "generate an image".
+ *
+ * NOT a Doubao `model_item_key` — Doubao has no model by this name. Selecting it
+ * makes the shim send an ordinary chat turn with `input_skill: imageGen`, and
+ * Doubao answers with Seedream. Keeping it in the catalog is what puts 生图 in
+ * DSH's model picker without inventing a second UI.
+ */
+export const DOUBAO_IMAGE_MODEL_ID = 'image-gen'
+export const DOUBAO_IMAGE_MODEL_NAME = '豆包 生图（Seedream 5.0）'
+
+/** The chat model a skill turn rides on: the app's own default. */
+export const SKILL_CARRIER_MODEL_ID = '0'
+
 export interface DoubaoModelInfo {
   /**
    * Catalog id, and the exact `model_item_key` to put on the wire. These are the
@@ -192,6 +262,10 @@ export interface DoubaoModelInfo {
 export const DOUBAO_MODELS: readonly DoubaoModelInfo[] = [
   { id: '0', name: '豆包 快速', reasoning: true },
   { id: '3', name: '豆包 2.1 Turbo', badge: '专家', reasoning: true },
+  // Not a Doubao model_item_key — a DSH-side capability alias. Selecting it runs
+  // a chat turn under `input_skill: imageGen`, and Doubao answers with real
+  // generated images (Seedream 5.0), verified live 2026-11-02.
+  { id: DOUBAO_IMAGE_MODEL_ID, name: DOUBAO_IMAGE_MODEL_NAME, reasoning: true },
 ]
 
 /**

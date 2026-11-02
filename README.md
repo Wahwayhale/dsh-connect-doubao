@@ -30,7 +30,8 @@ Chromium cookie（通过 Windows DPAPI 在本进程内解密），把它当作�
 
 ## 功能特性
 
-- **Seed 系列模型接入** —— 豆包桌面客户端发布的 6 个条目（见下表），作为 DSH 的模型 provider。
+- **豆包对话接入** —— 对话模式真正可用的两个条目（见下表），作为 DSH 的模型 provider。
+- **生图（Seedream 5.0）** —— 模型选择器里选「豆包 生图」，回复即以 Markdown 图片返回真实生成图，可直接下载落盘。2026-11-02 实测端到端通过。
 - **推理强度三档** —— 低 / 中 / 高，对应上游 `reasoning_effort` 实测值 **3 / 4 / 5**。
 - **只读额度面板** —— 5 小时限额与周额度两条进度条，各带**重置倒计时**；设置面板里手动刷新 + 5 分钟自动刷新。
 - **模型勾选清单** —— 勾选的条目会出现在 DSH 的模型选择器中，请求时按 `model_item_key` 指定模型。
@@ -102,6 +103,37 @@ Chromium cookie（通过 Windows DPAPI 在本进程内解密），把它当作�
 **推理强度**：低 = `3`、中 = `4`、高 = `5`（由客户端切换档位时重新序列化的配置 diff 读出，
 并由配置里的 `reasoning_effort_config` 独立确认）。深度思考开关本身走
 `need_deep_think: 0`，档位只由 `reasoning_effort` 携带 —— 这是 2026-10-22 CDP 抓包更正的。
+
+---
+
+## 生图（技能轴，与模型轴正交）
+
+豆包把「能力」做成 **skill**，走的是**同一个** `/chat/completion` 端点 —— 客户端里没有独立的文生图 HTTP 接口
+（唯一的生成端点 `/creativity/canvas/exec` 是图片编辑器：抠图 / 扩图 / 分层，不是文生图）。
+
+| 字段 | 值 |
+| --- | --- |
+| 位置 | `ext.input_skill`（**JSON 字符串**） |
+| 内容 | `{"skill_id":"3","skill_type":3,"variables":{}}` |
+| 关系 | `skill_id` 就是 `skill_type` 的十进制字符串；普通对话是 `"0"`/0 |
+| 响应 | `block_type: 2074` → `content.creation_block.creations[].image.{image_ori,image_preview,image_thumb}` |
+| 模型 | `placeholder.description` 显示 **Seedream 5.0 Flash** |
+
+技能全表（客户端枚举原样抄录，非推测）：`0` 自由对话、`2` 写作、`3` 生图、`4` 搜索、`5` 翻译、
+`6` 阅读、`7` 网页、`8` 深度搜索、`9` 音乐、`11` 教育、`13` 代码执行、`16` 代码助手、`17` 视频、`18` PPT。
+
+本插件目前只接了 **生图**：模型选择器里的「豆包 生图（Seedream 5.0）」是 DSH 侧的能力别名
+（`image-gen`，**不是** `model_item_key`），选中后 shim 发一条普通对话轮并带上 `input_skill: imageGen`，
+再把返回的图片以 `![…](url)` 追加到正文。
+
+**两个实测细节**：
+
+- 图片 URL 的签名有效期极长（抓到的 `x-expires` 在 2037 年），但服务端会把 `.jpeg` 结尾的 URL
+  实际返回 **PNG 字节** —— 落盘时按内容判断格式，别信扩展名。
+- 提示词会被服务端改写扩写（`creation_material_info.creation_prompt` 里是扩写后的版本），
+  所以产物质量与措辞由豆包决定，不是逐字照发。
+
+验证脚本：`node scripts/verify-imagegen.mjs`（会真实消耗生图额度）。
 
 ---
 

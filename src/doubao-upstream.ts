@@ -30,9 +30,12 @@ import {
 import {
   CHAT_AGENT_MODE,
   TASK_AGENT_MODE,
+  CREATION_BLOCK_TYPE,
   DOUBAO_CONTEXT_WINDOW,
+  type DoubaoSkillName,
   findDoubaoModel,
   findReasoningLevel,
+  inputSkillOf,
   needDeepThinkValue,
   TASK_RUNTIME_LOCAL_PC,
   TASK_SANDBOX_AUTH_ALLOW_ALL,
@@ -134,6 +137,18 @@ export interface DoubaoUsage {
   completionTokens?: number
 }
 
+/** One generated image from a creation block (`block_type: 2074`). */
+export interface DoubaoImage {
+  /** Server task id for this creation. */
+  taskId?: string
+  /** Stable asset key, e.g. `tos-cn-i-…/rc_gen_image/<uuid>.jpeg`. */
+  key?: string
+  /** Best available URL: original > preview > thumb. */
+  url: string
+  width?: number
+  height?: number
+}
+
 export interface DoubaoChatResult {
   text: string
   /** Model identifier reported by the server for this reply, if any. */
@@ -143,6 +158,14 @@ export interface DoubaoChatResult {
   reasoningText?: string
   /** True when the server routed to a thinking-capable model. */
   thinking: boolean
+  /**
+   * Images produced by a skill turn (`input_skill: imageGen`).
+   *
+   * Empty unless the request asked for a creation. The URLs are signed but
+   * long-lived (`x-expires` in 2037 on the captured ones), so they can be
+   * handed straight to the user or downloaded.
+   */
+  images: DoubaoImage[]
   /**
    * The agent the server says served this turn (`intention_agent_name`).
    *
@@ -178,6 +201,15 @@ export interface ChatRequestOptions {
    * so they must never be parsed to a number.
    */
   modelKey?: string
+  /**
+   * Doubao SKILL to run the turn under — the capability axis.
+   *
+   * Orthogonal to `modelKey`: `imageGen` (3) makes Doubao answer with a
+   * creation block (real generated images) while still riding the chat
+   * endpoint. Verified live 2026-11-02: `input_skill: {skill_id:"3",
+   * skill_type:3}` returns `rc_gen_image/*.jpeg` from Seedream 5.0.
+   */
+  skill?: DoubaoSkillName
   /**
    * Reasoning effort: `low` | `mid` | `high`, mapping to `reasoning_effort`
    * 3 / 4 / 5.
@@ -510,6 +542,14 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
       is_finish: '1',
       conversation_init_option: JSON.stringify({ need_ack_conversation: true }),
       commerce_credit_config_enable: '0',
+      // The skill axis. Absent (or "0") is ordinary chat; `imageGen` turns the
+      // reply into a creation block with generated images. A JSON STRING — the
+      // client stringifies it the same way, and a nested object is a shape the
+      // server never sees from the app.
+      ...(() => {
+        const encoded = inputSkillOf(options.skill)
+        return encoded === undefined ? {} : { input_skill: encoded }
+      })(),
     },
   }
 }
@@ -596,7 +636,7 @@ function harvestText(node: unknown, into: { out: string[] }): void {
  */
 export function collectBlocks(
   node: unknown,
-  into: { answer: string[]; thinking: string[] },
+  into: { answer: string[]; thinking: string[]; images?: DoubaoImage[] },
   thinkingIds: Set<string>,
 ): void {
   if (Array.isArray(node)) {
@@ -610,6 +650,22 @@ export function collectBlocks(
   if (typeof blockType === 'number') {
     const blockId = typeof record.block_id === 'string' ? record.block_id : undefined
     if (blockType === THINKING_BLOCK_TYPE && blockId !== undefined) thinkingIds.add(blockId)
+
+    // A creation block: `content.creation_block.creations[]`. Each creation
+    // streams in pieces (first a placeholder with no URL, later the finished
+    // one), so the same task id can arrive several times — the caller dedupes
+    // by keeping the entries that actually carry a URL.
+    if (blockType === CREATION_BLOCK_TYPE && into.images !== undefined) {
+      const content = record.content as { creation_block?: { creations?: unknown } } | undefined
+      const creations = content?.creation_block?.creations
+      if (Array.isArray(creations)) {
+        for (const raw of creations) {
+          const image = toDoubaoImage(raw)
+          if (image !== undefined) into.images.push(image)
+        }
+      }
+    }
+
     const content = record.content as { text_block?: { text?: unknown } } | undefined
     const text = content?.text_block?.text
     if (typeof text === 'string' && text !== '') {
@@ -622,6 +678,35 @@ export function collectBlocks(
   }
 
   for (const value of Object.values(record)) collectBlocks(value, into, thinkingIds)
+}
+
+/**
+ * Turn one `creations[]` entry into an image, or undefined when it carries no
+ * usable URL yet (the placeholder stage).
+ *
+ * URL preference is original → preview → thumb: `image_ori` is the full-
+ * resolution artefact, the others are watermarked/derivative variants the app
+ * uses for lists and thumbnails.
+ */
+function toDoubaoImage(raw: unknown): DoubaoImage | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const creation = raw as Record<string, unknown>
+  const image = creation.image as Record<string, unknown> | undefined
+  if (image === undefined) return undefined
+  const pick = (key: string): { url?: unknown; width?: unknown; height?: unknown } | undefined => {
+    const value = image[key]
+    return typeof value === 'object' && value !== null ? value as never : undefined
+  }
+  const best = pick('image_ori') ?? pick('image_preview') ?? pick('image_thumb')
+  if (best === undefined || typeof best.url !== 'string' || best.url === '') return undefined
+  const taskId = typeof creation.id === 'string' ? creation.id
+    : typeof creation.id === 'number' ? String(creation.id) : undefined
+  const out: DoubaoImage = { url: best.url }
+  if (taskId !== undefined) out.taskId = taskId
+  if (typeof image.key === 'string') out.key = image.key
+  if (typeof best.width === 'number') out.width = best.width
+  if (typeof best.height === 'number') out.height = best.height
+  return out
 }
 
 /** Read the model identifier the server actually used for a reply. */
@@ -829,6 +914,8 @@ async function consumeStream(
   const texts: string[] = []
   /** Text carried by STREAM_MSG_NOTIFY instead of by chunk deltas. */
   const notifyTexts: string[] = []
+  /** Generated images, in arrival order (may repeat a task while it streams). */
+  const images: DoubaoImage[] = []
   /** Private reasoning (deep-think turns), kept out of the answer. */
   const reasoningParts: string[] = []
   /** block_ids of the `block_type: 10040` thinking containers seen so far. */
@@ -930,7 +1017,7 @@ async function consumeStream(
       // FULL_MSG_NOTIFY stays excluded: it carries the USER's own message, so
       // harvesting it would replay the prompt into the answer.
       if (name === 'STREAM_MSG_NOTIFY') {
-        const acc = { answer: [] as string[], thinking: [] as string[] }
+        const acc = { answer: [] as string[], thinking: [] as string[], images }
         collectBlocks(record.content?.content_block, acc, thinkingBlockIds)
         for (const piece of acc.thinking) {
           if (!piece) continue
@@ -951,7 +1038,7 @@ async function consumeStream(
     if (name === 'STREAM_CHUNK' || name === 'CHUNK_DELTA') {
       model = model ?? extractModel(payload)
       thinking = thinking || extractThinking(payload)
-      const acc = { answer: [] as string[], thinking: [] as string[] }
+      const acc = { answer: [] as string[], thinking: [] as string[], images }
       collectBlocks(payload, acc, thinkingBlockIds)
       for (const piece of acc.thinking) {
         if (!piece) continue
@@ -1000,7 +1087,10 @@ async function consumeStream(
       CODE_TASK_RUNTIME_UNAVAILABLE,
     )
   }
-  if (!text) {
+  // A creation streams the same task several times (placeholder → filled), so
+  // collapse by URL and keep first-seen order.
+  const uniqueImages = [...new Map(images.map((image) => [image.url, image])).values()]
+  if (!text && uniqueImages.length === 0) {
     const seen = [...events]
     throw new DoubaoUpstreamError(
       `Doubao returned an empty completion` +
@@ -1015,6 +1105,7 @@ async function consumeStream(
     ...(messageId !== undefined ? { messageId } : {}),
     ...(reasoningParts.length > 0 ? { reasoningText: reasoningParts.join('') } : {}),
     ...(intentionAgent !== undefined ? { intentionAgent } : {}),
+    images: uniqueImages,
     thinking,
   }
 }

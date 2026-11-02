@@ -134,8 +134,8 @@ describe('a reply is notify opening + chunk deltas, never only one of them', () 
 })
 
 describe('the advertised catalog is only what actually works', () => {
-  it('offers exactly the two 对话-mode entries', () => {
-    expect(DOUBAO_MODELS.map((m) => m.id)).toEqual(['0', '3'])
+  it('offers the two 对话-mode models plus the image-generation alias', () => {
+    expect(DOUBAO_MODELS.map((m) => m.id)).toEqual(['0', '3', 'image-gen'])
   })
 
   it('does not advertise the 工作任务-only models', () => {

@@ -39,9 +39,15 @@ import {
   sessionKeyOf,
 } from './doubao-session.ts'
 import { loadDoubaoCredentials, type DoubaoCredentials } from './doubao-auth.ts'
-import { chat, DoubaoUpstreamError, classifyDoubaoFailure, type ChatRequestOptions, type DoubaoErrorKind } from './doubao-upstream.ts'
+import { chat, DoubaoUpstreamError, classifyDoubaoFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
 import { fetchQuota, findWindow, millisUntilReset } from './doubao-quota.ts'
-import { DOUBAO_MODELS, findDoubaoModel } from './doubao-catalog.ts'
+import {
+  DOUBAO_IMAGE_MODEL_ID,
+  DOUBAO_MODELS,
+  findDoubaoModel,
+  SKILL_CARRIER_MODEL_ID,
+  type DoubaoSkillName,
+} from './doubao-catalog.ts'
 
 /** Hostnames the inbound half will accept. */
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]'])
@@ -210,12 +216,38 @@ function describeRequestedModel(key: string | undefined): {
 function requestOptions(parsed: InboundChatRequest): {
   modelKey?: string
   reasoningLevel?: 'low' | 'mid' | 'high'
+  skill?: DoubaoSkillName
 } {
   const level = toDoubaoLevel(parsed.reasoning_effort)
+  // 「豆包 生图」 is a DSH-side alias, not a Doubao model_item_key: Doubao has no
+  // model by that name. Selecting it runs an ordinary chat turn under the
+  // imageGen skill, which is what makes the reply carry a creation block. The
+  // carrier model is the app's own default.
+  if (parsed.model === DOUBAO_IMAGE_MODEL_ID) {
+    return {
+      modelKey: SKILL_CARRIER_MODEL_ID,
+      skill: 'imageGen',
+      ...level === undefined ? {} : { reasoningLevel: level },
+    }
+  }
   return {
     ...parsed.model === undefined ? {} : { modelKey: parsed.model },
     ...level === undefined ? {} : { reasoningLevel: level },
   }
+}
+
+/**
+ * Render generated images as Markdown so they survive a text-only transport.
+ *
+ * The OpenAI surface pi-ai speaks has no image part on the assistant side, so
+ * the URL in text is what reaches the user — and it is also what makes the
+ * Harness able to download the file afterwards.
+ */
+export function imageMarkdown(images: readonly DoubaoImage[]): string {
+  if (images.length === 0) return ''
+  return images
+    .map((image, i) => `![豆包生图 ${i + 1}](${image.url})`)
+    .join('\n\n')
 }
 
 /**
@@ -407,6 +439,13 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       // previous mapping alone so the next attempt can still continue it.
       remember(result.conversationId)
       if (!roleSent) send({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
+      // Generated images have no place on the OpenAI assistant side, so they are
+      // appended to the text as Markdown — which is both what the user sees and
+      // what lets the Harness fetch the file afterwards.
+      const markdown = imageMarkdown(result.images)
+      if (markdown !== '') {
+        send({ choices: [{ index: 0, delta: { content: `\n\n${markdown}` }, finish_reason: null }] })
+      }
       send({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
       if (!res.writableEnded) {
         res.write('data: [DONE]\n\n')
@@ -587,7 +626,16 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
           // "seed-lite-7b" means nothing to a reader.
           model: sent.id,
           requested_model: describeRequestedModel(parsed.model),
-          choices: [{ index: 0, message: { role: 'assistant', content: result.text }, finish_reason: 'stop' }],
+          choices: [{
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: result.images.length > 0
+                ? `${result.text}\n\n${imageMarkdown(result.images)}`
+                : result.text,
+            },
+            finish_reason: 'stop',
+          }],
         })
         return
       }
