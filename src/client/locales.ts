@@ -30,6 +30,8 @@ export const zh = {
   'quota.expiresIn': '{time} 后到期',
   'quota.incentive': '赠送额度',
   'quota.usedAmounts': '已用 {used} / {total}',
+  'quota.remainingAmount': '剩 {remaining} / {total}',
+  'quota.remainingPercent': '剩 {percent}%',
 
   'account.title': '账号状态',
   'account.ok': '已登录',
@@ -109,6 +111,8 @@ export const en: Record<DoubaoCardKey, string> = {
   'quota.expiresIn': 'expires in {time}',
   'quota.incentive': 'Bonus quota',
   'quota.usedAmounts': '{used} / {total} used',
+  'quota.remainingAmount': '{remaining} of {total} left',
+  'quota.remainingPercent': '{percent}% left',
 
   'account.title': 'Account status',
   'account.ok': 'Signed in',

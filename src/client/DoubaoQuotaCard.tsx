@@ -48,8 +48,18 @@ import type {
 import type { DoubaoCardKey, Translate } from './locales.ts'
 import { DOUBAO_CARD_CSS } from './styles.ts'
 
-/** How often the quota is re-read without the user asking. */
-const POLL_INTERVAL_MS = 5 * 60 * 1000
+/**
+ * How often the quota is re-read while the card is on screen.
+ *
+ * The point of the card is "how much is left", and that number changes as the
+ * user works — a five-minute-old "782" is indistinguishable from a frozen
+ * panel. Thirty seconds costs one small summary call and only runs while the
+ * tab is visible.
+ */
+const POLL_INTERVAL_MS = 30 * 1000
+
+/** How often the local clock ticks, so countdowns move without any request. */
+const TICK_MS = 1000
 
 /**
  * Props the slot delivers.
@@ -122,10 +132,11 @@ async function fetchQuota(signal: AbortSignal): Promise<DoubaoQuotaView | undefi
 }
 
 /** POST forces a host-side cache bypass. Same error contract as {@link fetchQuota}. */
-async function refreshQuota(): Promise<DoubaoQuotaView | undefined> {
+async function refreshQuota(signal?: AbortSignal): Promise<DoubaoQuotaView | undefined> {
   const response = await fetch(DOUBAO_QUOTA_PATH, {
     method: 'POST',
     credentials: 'same-origin',
+    ...(signal === undefined ? {} : { signal }),
     headers: { accept: 'application/json', ...WRITE_HEADERS },
   })
   if (!response.ok) return undefined
@@ -165,6 +176,8 @@ function instantLabel(t: T, resetsInMs: number | null | undefined, kind: 'reset'
 function QuotaBar(props: {
   label: string
   usedPercent: number | undefined
+  /** Absolute instant, so the countdown ticks client-side without a request. */
+  resetsAt: number | null | undefined
   /** Null when Doubao sent no window timestamps: the instant is unknown. */
   resetsInMs: number | null | undefined
   /** True when the window only starts counting on first use. */
@@ -177,7 +190,7 @@ function QuotaBar(props: {
   t: T
   now: number
 }): ReactElement {
-  const { label, usedPercent, resetsInMs, startsOnUse, usedAmount, totalAmount, instantKind, t, now } = props
+  const { label, usedPercent, resetsAt, resetsInMs, startsOnUse, usedAmount, totalAmount, instantKind, t, now } = props
   if (usedPercent === undefined) {
     return (
       <div className="dbq-row">
@@ -188,34 +201,46 @@ function QuotaBar(props: {
       </div>
     )
   }
-  const percent = clampPercent(usedPercent)
-  // Tones are keyed on the CONSUMED percentage: full means nothing left, and a
-  // nearly-full window should read as a warning before it actually runs out.
-  const tone = percent >= 100 ? ' dbq-full' : percent >= 80 ? ' dbq-warn' : ''
+  const used = clampPercent(usedPercent)
+  // The gauge answers "how much is left", so it fills with what remains and the
+  // numbers beside it say the same thing: a bar that fills as it empties is a
+  // reading error waiting to happen.
+  const percent = clampPercent(100 - used)
+  const instantMs =
+    resetsAt !== null && resetsAt !== undefined && resetsAt > 0 ? Math.max(0, resetsAt - now) : null
+  const liveMs = instantMs ?? resetsInMs
+  const remainingAmount =
+    totalAmount !== null && totalAmount !== undefined && totalAmount > 0
+      ? Math.max(0, totalAmount - (usedAmount ?? 0))
+      : null
+  // Keyed on what is LEFT: nearly empty is the warning state now that the bar
+  // measures remaining, not consumed.
+  const tone = percent <= 0 ? ' dbq-full' : percent <= 20 ? ' dbq-warn' : ''
   // The countdown is recomputed from the host's absolute reset instant rather
   // than by decrementing the host's remaining ms, so a stale payload cannot
   // drift: a tab left open for an hour still shows the true remaining time.
   return (
-    <div className="dbq-row">
+    <div className="dbq-row" title={t('quota.usedAmounts', { used: usedAmount ?? used, total: totalAmount ?? 0 })}>
       <div className="dbq-row-head">
         <span className="dbq-label">{label}</span>
         <span className="dbq-meta">
-          {totalAmount !== null && totalAmount !== undefined && totalAmount > 0
-            ? t('quota.usedAmounts', {
-                used: usedAmount ?? 0,
-                total: totalAmount,
+          {remainingAmount !== null
+            ? t('quota.remainingAmount', {
+                remaining: remainingAmount,
+                total: totalAmount ?? 0,
               })
-            : t('quota.used', { percent })}
+            : t('quota.remainingPercent', { percent })}
           {' · '}
-          {startsOnUse === true && (resetsInMs === null || resetsInMs === undefined)
+          {startsOnUse === true && (liveMs === null || liveMs === undefined)
             ? t('quota.startsOnUse')
-            : instantLabel(t, resetsInMs, instantKind === 'expire' ? 'expire' : 'reset')}
+            : instantLabel(t, liveMs, instantKind === 'expire' ? 'expire' : 'reset')}
         </span>
       </div>
       <div
         className="dbq-bar"
         role="progressbar"
         aria-valuenow={percent}
+        aria-valuetext={t('quota.remainingPercent', { percent })}
         aria-valuemin={0}
         aria-valuemax={100}
         aria-label={label}
@@ -303,24 +328,48 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     return scope.subscribe(() => setSettingsRevision(value => value + 1))
   }, [scope])
 
-  // ---- quota: initial read + 5-minute poll -----------------------------
+  // ---- a local clock: countdowns tick every second, zero requests ----
+  //
+  // The host sends absolute instants, so "time until reset/expiry" is pure
+  // subtraction. Refreshing once a second to animate a countdown would be both
+  // slower and rude to the endpoint.
+  const [now, setNow] = useState<number>(() => Date.now())
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), TICK_MS)
+    return () => clearInterval(timer)
+  }, [])
+
+  // ---- quota: initial read, then a live poll while visible ------------
   useEffect(() => {
     let alive = true
     const controller = new AbortController()
-    const load = async (): Promise<void> => {
+    const hidden = (): boolean =>
+      typeof document !== 'undefined' && document.visibilityState === 'hidden'
+    // The first read may come from the host's five-minute memo (GET); every
+    // later read forces a fresh one (POST), because a 30-second poll answered
+    // from the memo would never show a change.
+    const load = async (force: boolean): Promise<void> => {
       try {
-        const view = await fetchQuota(controller.signal)
+        const view = force ? await refreshQuota(controller.signal) : await fetchQuota(controller.signal)
         if (alive) setQuota(view)
       } catch {
         if (alive) setQuota(undefined)
       }
     }
-    void load()
-    const timer = setInterval(() => void load(), POLL_INTERVAL_MS)
+    void load(false)
+    const timer = setInterval(() => {
+      if (!hidden()) void load(true)
+    }, POLL_INTERVAL_MS)
+    // Returning to the tab is exactly when the number is most likely stale.
+    const onVisible = (): void => {
+      if (!hidden()) void load(true)
+    }
+    document.addEventListener('visibilitychange', onVisible)
     return () => {
       alive = false
       controller.abort()
       clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
     }
   }, [])
 
@@ -604,32 +653,35 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
             label={window.label ?? t('quota.incentive')}
             usedPercent={window.usedPercent}
             resetsInMs={window.resetsInMs}
+            resetsAt={window.resetsAt}
             usedAmount={window.usedAmount}
             totalAmount={window.totalAmount}
             instantKind="expire"
             t={t}
-            now={0}
+            now={now}
           />
         ))}
         <QuotaBar
           label={t('quota.fiveHour')}
           usedPercent={quota?.windows.fiveHour?.usedPercent}
           resetsInMs={quota?.windows.fiveHour?.resetsInMs}
+          resetsAt={quota?.windows.fiveHour?.resetsAt}
           startsOnUse={quota?.windows.fiveHour?.startsOnUse}
           usedAmount={quota?.windows.fiveHour?.usedAmount}
           totalAmount={quota?.windows.fiveHour?.totalAmount}
           t={t}
-          now={0}
+          now={now}
         />
         <QuotaBar
           label={t('quota.weekly')}
           usedPercent={quota?.windows.weekly?.usedPercent}
           resetsInMs={quota?.windows.weekly?.resetsInMs}
+          resetsAt={quota?.windows.weekly?.resetsAt}
           startsOnUse={quota?.windows.weekly?.startsOnUse}
           usedAmount={quota?.windows.weekly?.usedAmount}
           totalAmount={quota?.windows.weekly?.totalAmount}
           t={t}
-          now={0}
+          now={now}
         />
         <div className="dbq-actions">
           <button type="button" className="dbq-btn" onClick={() => void onRefresh()} disabled={busy}>
