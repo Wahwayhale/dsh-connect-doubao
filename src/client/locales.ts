@@ -46,7 +46,7 @@ export const zh = {
 
   'models.title': '模型',
   'models.enabledCount': '已启用 {count} ↑',
-  'models.routingNote': '清单直接读自豆包客户端的缓存，豆包上线新模型时会自动出现，不需要等插件更新。「工作任务」专属的条目（2.1 Pro / Lite / Auto）由客户端内的运行时执行，外部客户端接不进去，已自动隐藏',
+  'models.routingNote': '清单直接读自豆包客户端的缓存，豆包上线新模型时会自动出现，不需要等插件更新。带「工作任务」徽章的条目（2.1 Lite / 2.1 Pro / 自动）走任务模式与会员付费额度，插件会自动完成本地指令应答',
   'models.refresh': '刷新',
   'models.refreshing': '刷新中…',
   'models.save': '保存',
@@ -127,7 +127,7 @@ export const en: Record<DoubaoCardKey, string> = {
 
   'models.title': 'Models',
   'models.enabledCount': '{count} enabled ↑',
-  'models.routingNote': 'Only the 对话-mode entries are offered (快速 / 专家). The 「工作任务」-only models (2.1 Pro / 2.1 Lite) are executed by the Doubao desktop app runtime, which an external client cannot join',
+  'models.routingNote': 'The list is read from the Doubao client cache, so new models appear without a plugin update. Entries badged 「工作任务」 (2.1 Lite / 2.1 Pro / Auto) run in task mode against the paid membership quota; the plugin answers the local workspace commands for you',
   'models.refresh': 'Refresh',
   'models.refreshing': 'Refreshing…',
   'models.save': 'Save',

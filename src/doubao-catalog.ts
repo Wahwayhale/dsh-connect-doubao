@@ -44,17 +44,19 @@ export const DOUBAO_MAX_TOKENS = 32_000
  * VERIFIED AGAINST A CDP-CAPTURED REQUEST (2026-10-22, 对话 mode):
  *
  *   agent_mode 2  →  普通对话
- *   agent_mode 1  →  「工作任务」 (where every turn is handed to
- *                    `Agent-GeneralTask` and then fails 710010702 when the
- *                    desktop client's CUA runtime is not the requester)
+ *   agent_mode 1  →  「工作任务」 (every turn is handed to `Agent-GeneralTask`)
  *
  * The previous revision of this constant said 1 for chat and carried a comment
  * claiming work mode sends 2 — BOTH were backwards, and sending 1 is exactly
  * what made every request from this plugin look like a work task.
+ *
+ * Task mode used to end in `710010702` because the executing runtime was the
+ * desktop app's CUA process. Since 0.4.1 the plugin answers the server's
+ * `tool_local` commands over HTTP instead, so task turns complete.
  */
 export const CHAT_AGENT_MODE = 2
 
-/** 「工作任务」 mode. Its executing runtime is the desktop app's own process. */
+/** 「工作任务」 mode. Requires the `tool_local` responder — see `doubao-upstream.ts`. */
 export const TASK_AGENT_MODE = 1
 
 /**
@@ -234,20 +236,22 @@ export interface DoubaoModelInfo {
   badge?: string
   /** Every model in the current catalog offers the reasoning-effort picker. */
   reasoning: true
+  /** True when the model runs in 「工作任务」 (`mode_id: "3"`, `agent_mode: 1`) mode. */
+  taskMode?: boolean
 }
 
 /**
- * The two entries DSH may offer.
+ * The entries DSH may offer.
  *
- * WHY ONLY TWO. Doubao groups models by MODE, and the model list is per-mode:
+ * WHY THESE ENTRIES. Doubao groups models by MODE, and the model list is per-mode:
  *
  *   对话       → 豆包 快速 (0), 豆包 2.1 Turbo·专家 (3)
  *   工作任务   → 自动 (9), 2.1 Lite (seed-lite-7b), 2.1 Pro (5), Turbo (3)
  *
- * The 「工作任务」 group is not offered here because its requests are executed by
- * the desktop client's own CUA runtime (`tasks-mode-resource` + `sbox`), which an
- * external client cannot register; every such turn fails `710010702`. See the
- * README's known limitations.
+ * The 「工作任务」 group (`seed-lite-7b`, `5`, `9`) runs through `Agent-GeneralTask`
+ * (`mode_id: "3"`, `agent_mode: 1`) and is accompanied by an HTTP `tool_local`
+ * workspace responder (`msg/ack` -> `upload_command_result` -> `msg/complete`)
+ * so external turns complete without `710010702`.
  *
  * MEASURED, 2026-10-22: `model_item_key` is forwarded verbatim (the server stores
  * it on the message), but in 对话 mode it does NOT change what answers —
@@ -262,11 +266,20 @@ export interface DoubaoModelInfo {
 export const DOUBAO_MODELS: readonly DoubaoModelInfo[] = [
   { id: '0', name: '豆包 快速', reasoning: true },
   { id: '3', name: '豆包 2.1 Turbo', badge: '专家', reasoning: true },
+  { id: 'seed-lite-7b', name: '豆包 2.1 Lite', badge: '工作任务', reasoning: true, taskMode: true },
+  { id: '5', name: '豆包 2.1 Pro', badge: '工作任务', reasoning: true, taskMode: true },
+  { id: '9', name: '自动', badge: '工作任务', reasoning: true, taskMode: true },
   // Not a Doubao model_item_key — a DSH-side capability alias. Selecting it runs
   // a chat turn under `input_skill: imageGen`, and Doubao answers with real
   // generated images (Seedream 5.0), verified live 2026-11-02.
   { id: DOUBAO_IMAGE_MODEL_ID, name: DOUBAO_IMAGE_MODEL_NAME, reasoning: true },
 ]
+
+/** True when `id` is a 「工作任务」-mode model (`seed-lite-7b`, `5`, `9`). */
+export function isTaskModel(id: string | undefined): boolean {
+  if (id === undefined) return false
+  return DOUBAO_MODELS.some((model) => model.id === id && model.taskMode === true)
+}
 
 /**
  * Entries that exist in the desktop app but are deliberately NOT offered here.
@@ -276,9 +289,6 @@ export const DOUBAO_MODELS: readonly DoubaoModelInfo[] = [
  * to confront this note.
  */
 export const DOUBAO_UNAVAILABLE_MODELS: readonly { id: string; name: string; reason: string }[] = [
-  { id: '5', name: '豆包 2.1 Pro', reason: '「工作任务」专属：执行侧是客户端内的 CUA 运行时，外部客户端注册不进去' },
-  { id: 'seed-lite-7b', name: '豆包 2.1 Lite', reason: '同上（工作任务专属）' },
-  { id: '9', name: '自动', reason: '同上（工作任务专属）' },
   { id: '4', name: '豆包 2.1 Turbo（即将下线）', reason: '客户端已用「即将下线」标注，不引导用户选择' },
 ]
 

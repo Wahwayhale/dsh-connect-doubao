@@ -23,7 +23,7 @@ const FILE = join(ROOT, 'awesome-dsh-plugin-submission', 'Wahwayhale__dsh-connec
 /** Expected owner/repo. The file NAME must carry it, joined by a DOUBLE underscore. */
 const OWNER = 'Wahwayhale'
 const REPO = 'dsh-connect-doubao'
-const raw = readFileSync(FILE, 'utf8')
+const raw = readFileSync(FILE, 'utf8').replace(/\r\n/g, '\n')
 
 const checks = []
 const ok = (name, pass, detail = '') => checks.push({ name, pass, detail })

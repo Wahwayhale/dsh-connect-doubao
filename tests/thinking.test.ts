@@ -78,6 +78,16 @@ describe('collectBlocks', () => {
     expect(out.thinking).toEqual([])
     expect(out.answer).toEqual([])
   })
+
+  it('collects CHUNK_DELTA frames ({ text, id }) into answer or thinking', () => {
+    const out = run(
+      [thinkingBlock],
+      { text: '思考增量', id: THINKING_ID },
+      { text: '回答增量', id: ANSWER_ID },
+    )
+    expect(out.thinking).toEqual(['思考增量'])
+    expect(out.answer).toEqual(['回答增量'])
+  })
 })
 
 describe('the deep-think switch value', () => {

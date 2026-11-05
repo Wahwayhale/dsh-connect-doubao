@@ -4,6 +4,49 @@
 
 ---
 
+## 0.4.1 — 2026-11-05
+
+> 「工作任务」模型接入批次：把豆包客户端里那三个**只能在工作任务模式跑**的条目
+> （2.1 Lite `seed-lite-7b`、2.1 Pro `5`、自动 `9`）真正接到 DSH 里，走的正是会员/
+> 活动付费额度。上一版把它们整个藏起来，理由是「外部客户端注册不进 CUA 运行时」——
+> 那个理由对了一半：运行时确实接不进去，但它不是必需的，`tool_local` 的三条 HTTP
+> 接口就够把一轮任务回合走完。新增 4 例回归测试（另改写 2 例旧的「必须隐藏」断言），
+> 全仓 189 例。
+
+### 新增
+
+- **豆包 2.1 Lite / 2.1 Pro / 自动 进入模型选择器** —— 选中任一条，请求自动切到
+  「工作任务」模式（`mode_id: "3"`、`agent_mode: 1`、`need_deep_think: 10001`、
+  新会话 `conversation_mode: 2`、`model_extra_params.input_token_limit: "256k"`，
+  `seed-lite-7b` 另带 `reasoning_effort`），`general_task_param` 带 `task_input_json`。
+  实机跑通：Lite 与 Pro 各一次纯文本回合，约 5.8 s，`server_model_tag` 为 `38`。
+- **`tool_local` 应答器** —— 任务模式下服务端会按 `${unique_key}:${device_id}:${aid}:message:${seq}`
+  的顺序下发本地工作区指令；插件并发轮询 `msg/ack`，遇到 `command: 6003`（`cmd_call`，
+  如 `local.workspace.apply`）就回 `upload_command_result` + `msg/complete`，遇到
+  `command: 6004`（`agent_finished`）收尾。**这是解开 `710010702` 的全部原因。**
+- **`CHUNK_DELTA` 增量帧** —— 任务模式的正文增量以无 `block_type` 包裹的
+  `{ text, id }` 形式下发，按 `id` 分流到 `reasoning_content` / 正文。
+
+### 修复
+
+- **选 `seed-lite-7b` / `5` 会被静默换成「豆包 快速」** —— `findDoubaoModel` 只在内置
+  清单里查，查不到就回落到 `'0'`。现在三条任务模型都在清单里，不再回落。
+- **`msg/ack` 批量查询必失败** —— `{ msg_ids: [0..6] }` 会整体报
+  `{"code":710010702}`，因为批里只要含一个服务端还没生成的 `seq`，整批就废。
+  现在严格单条轮询，逐 `seq` 递进。
+- **自动发现把工作任务模型全部隐藏** —— 上一版按名称前缀一律排除。现在改为只排除
+  `DOUBAO_UNAVAILABLE_MODELS`（仅剩「即将下线」的 `4`），并按内置清单补齐，避免本机
+  IndexedDB 只缓存了对话子集时任务模型消失。
+
+### 已知边界
+
+- 纯文本、不触发本地工具的小回合，服务端会在 `ext` 里标 `general_agent_task_mode: "simple"`
+  与 `mode_downgrade_reason: "success"`，此时**不扣**活动赠送额度（实测调用前后
+  `usedAmount` 恒为 782）。要消耗付费额度，得让它真的执行多步工具/文档任务。
+- `msg/ack` 的 `seq` 没有可查询的上界，应答器在流结束后最多再补 8 次轮询即退出。
+
+---
+
 ## 0.4.0 — 2026-11-05
 
 > 稳定性与额度准确性批次：让「回答」在中断时说实话，让「停止」真的停下上游，让凭据不再经过

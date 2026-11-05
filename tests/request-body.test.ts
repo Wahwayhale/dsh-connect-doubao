@@ -134,14 +134,33 @@ describe('a reply is notify opening + chunk deltas, never only one of them', () 
 })
 
 describe('the advertised catalog is only what actually works', () => {
-  it('offers the two 对话-mode models plus the image-generation alias', () => {
-    expect(DOUBAO_MODELS.map((m) => m.id)).toEqual(['0', '3', 'image-gen'])
+  it('offers the 对话-mode models, the 工作任务-mode models (2.1 Lite / 2.1 Pro / 自动), and the image-generation alias', () => {
+    expect(DOUBAO_MODELS.map((m) => m.id)).toEqual(['0', '3', 'seed-lite-7b', '5', '9', 'image-gen'])
   })
 
-  it('does not advertise the 工作任务-only models', () => {
+  it('does not advertise the retiring Turbo model', () => {
     const ids = DOUBAO_MODELS.map((m) => m.id)
-    for (const unavailable of ['5', 'seed-lite-7b', '9', '4']) {
-      expect(ids).not.toContain(unavailable)
-    }
+    expect(ids).not.toContain('4')
+  })
+
+  it('automatically switches to 工作任务 mode (mode_id 3, agent_mode 1, need_deep_think 10001) when selecting 2.1 Lite or 2.1 Pro', () => {
+    const lite = body({ modelKey: 'seed-lite-7b' })
+    expect(lite.option.agent_mode).toBe(1)
+    expect(lite.option.need_deep_think).toBe(10001)
+    expect(lite.option.conversation_init_ext.mode_id).toBe('3')
+    expect(lite.option.conversation_init_ext.model_item_key).toBe('seed-lite-7b')
+    expect(lite.option.model_config.model_extra_params).toEqual({
+      input_token_limit: '256k',
+      reasoning_effort: 'high',
+    })
+
+    const pro = body({ modelKey: '5' })
+    expect(pro.option.agent_mode).toBe(1)
+    expect(pro.option.need_deep_think).toBe(10001)
+    expect(pro.option.conversation_init_ext.mode_id).toBe('3')
+    expect(pro.option.conversation_init_ext.model_item_key).toBe('5')
+    expect(pro.option.model_config.model_extra_params).toEqual({
+      input_token_limit: '256k',
+    })
   })
 })

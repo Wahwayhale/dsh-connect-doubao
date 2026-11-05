@@ -1,8 +1,10 @@
 # DSH Connect Doubao
 
 > Connect the sign-in **already held by the local Doubao desktop app** to DeepSeek
-> Harness as a Seed-family model provider, plus a **read-only** quota view
-> (5-hour window / weekly window, with reset countdowns).
+> Harness: **chat models** and **「工作任务」 (task-mode) models** (2.1 Lite / 2.1 Pro /
+> Auto, which spend the paid membership quota), **Seedream image generation**, plus a
+> **read-only** quota panel (5-hour window / weekly window / activity grant, each with
+> a reset countdown). Windows x64 only — credential decryption relies on Windows DPAPI.
 
 [![npm version](https://img.shields.io/npm/v/dsh-connect-doubao.svg)](https://www.npmjs.com/package/dsh-connect-doubao)
 [![license](https://img.shields.io/npm/l/dsh-connect-doubao.svg)](./LICENSE)
@@ -33,12 +35,14 @@ Without a signed-in Doubao app the plugin fails loudly rather than silently.
 
 ## Features
 
-- **Seed-family models** — the 6 entries the Doubao desktop app publishes (table below),
-  exposed as a DSH model provider.
+- **Two groups of Doubao models** — two 对话-mode entries (快速 / 2.1 Turbo·专家) and
+  three 「工作任务」-mode entries (2.1 Lite `seed-lite-7b`, 2.1 Pro `5`, Auto `9`).
+  The task models spend the **paid membership quota**; selecting one switches the
+  request into the full task-mode shape automatically.
 - **Three reasoning-effort levels** — low / mid / high, mapped to the measured upstream
   `reasoning_effort` values **3 / 4 / 5**.
-- **Read-only quota panel** — 5-hour and weekly windows as two bars, each with a
-  **reset countdown**; manual refresh plus a 5-minute automatic poll.
+- **Read-only quota panel** — 5-hour, weekly and activity-grant windows as bars, each
+  with a **reset countdown**; manual refresh plus a 5-minute automatic poll.
 - **Model checklist** — ticked entries appear in DSH's model picker and are sent as
   `model_item_key`.
 - **Account status line** — distinguishes signed in / not signed in / sign-in could
@@ -72,7 +76,10 @@ works everywhere):
 - ✅ **All six catalog entries render** — 豆包 快速 / 2.1 Lite (`0921 新版`) /
   2.1 Turbo (`专家`) / 2.1 Pro / 2.1 Turbo (`即将下线`) / 自动, with badges matching
   the desktop app and a count of `已启用 6 ↑`.
-- ✅ **A 「豆包（Doubao）」 group appears in DSH's model picker** with the six entries
+  > This screenshot is from **0.4.0**: back then the task-mode models were only
+  > rendered, not wired up, and the badges used the client's own names. Since 0.4.1
+  > they carry the `工作任务` badge and actually answer; the screenshot is not re-shot.
+- ✅ **A 「豆包（Doubao）」 group appears in DSH's model picker** with the entries
   listed individually. This is the **end-to-end evidence that provider registration
   and the catalog both work**.
 - ✅ **The checklist is interactive** — one checkbox per row plus `刷新` / `全选` /
@@ -84,7 +91,7 @@ works everywhere):
 
 - `doctor` passes all five checks: 29 cookies decrypted with 9/9 required session
   cookies present, the account accepted upstream, the shim bound to a loopback port with
-  a wrong bearer refused (401), and both quota windows readable.
+  a wrong bearer refused (401), all three quota windows readable, and 5 models offered.
 - Reasoning effort low=3 / mid=4 / high=5 was read by **diffing the configuration the
   client re-serialises when the level is switched**, then independently confirmed
   against `reasoning_effort_config` in the client's own config.
@@ -104,14 +111,18 @@ the document the server hands the app) — not reconstructed by guesswork. The
 `model_item_key` **is** the DSH model id, on purpose: one string instead of a
 translation layer that could only be wrong.
 
-| id | name | badge | reasoning |
-| --- | --- | --- | --- |
-| `0` | 豆包 快速 | — | ✅ |
-| `seed-lite-7b` | 豆包 2.1 Lite | `0921 新版` | ✅ |
-| `3` | 豆包 2.1 Turbo | `专家` | ✅ |
-| `5` | 豆包 2.1 Pro | — | ✅ |
-| `4` | 豆包 2.1 Turbo | `即将下线` | ✅ |
-| `9` | 自动 | — | ✅ |
+| id | name | badge | mode | reasoning |
+| --- | --- | --- | --- | --- |
+| `0` | 豆包 快速 | — | 对话 | ✅ |
+| `3` | 豆包 2.1 Turbo | `专家` | 对话 | ✅ |
+| `seed-lite-7b` | 豆包 2.1 Lite | `工作任务` | 工作任务 | ✅ |
+| `5` | 豆包 2.1 Pro | `工作任务` | 工作任务 | ✅ |
+| `9` | 自动 | `工作任务` | 工作任务 | ✅ |
+
+The three `工作任务` rows switch the request into task mode (`mode_id: "3"`,
+`agent_mode: 1`, `need_deep_think: 10001`) and are answered by the plugin's own
+`tool_local` responder — see 「工作任务」 mode below. They are the entries that spend
+the **paid membership quota**.
 
 **Reasoning effort**: low = `3`, mid = `4`, high = `5`. These values were read by
 **diffing the configuration the client re-serialises when the level is switched**,
@@ -119,7 +130,8 @@ then independently confirmed against `reasoning_effort_config` in the client's o
 config. They are observed, not inferred.
 
 > 「即将下线」 is not a property of the Turbo model: the app publishes **two** Turbo
-> entries and only the retiring one carries that badge.
+> entries and only the retiring one carries that badge. The retiring one (`4`) is
+> the only entry withheld from the picker.
 
 ---
 
@@ -139,7 +151,13 @@ DSH (pi-ai provider)
    (`bot_id` + `reasoning_effort`).
 3. **Streaming** — upstream's three-line frames are parsed into pi-ai's event stream;
    tool calls, compaction and permissions stay Harness-owned.
-4. **Read-only routes** — `/plugins/dsh-connect-doubao/quota` and `/catalog` serve quota
+4. **Task mode** — for the `工作任务` entries, `doubao-upstream` additionally runs a
+   `tool_local` responder: it polls the server's `msg/ack` **one `msg_id` at a time**
+   (a batch containing a not-yet-generated seq fails the whole batch with
+   `710010702`), answers `cmd_call` via `upload_command_result` + `msg/complete`, and
+   stops on `agent_finished`. Incremental `CHUNK_DELTA` frames are split into
+   thinking/answer by their block id.
+5. **Read-only routes** — `/plugins/dsh-connect-doubao/quota` and `/catalog` serve quota
    and catalog from an **explicit allow-list** (no upstream field is passed through),
    and refuse non-loopback origins.
 
@@ -257,22 +275,34 @@ npm run check       # all of the above
 1. **It uses a non-public interface.** Doubao publishes no third-party API; this
    plugin reverses the behaviour of its own client. Any upstream change can break it,
    without notice.
-2. **`'4'` (豆包 2.1 Turbo, "即将下线") is unverified.** The other 5 entries were
-   exercised in real conversations.
-3. **There is no response-side field that proves "the server really used that model".**
+2. **`'4'` (豆包 2.1 Turbo, "即将下线") is unverified** — and withheld from the
+   picker. The other 5 entries were exercised in real conversations, including both
+   task-mode models.
+3. **Task mode works, but whether a turn is billed depends on what it did.** In task
+   mode the server hands each turn to `Agent-GeneralTask`, and the plugin runs a
+   `tool_local` responder alongside (`msg/ack` → `upload_command_result` →
+   `msg/complete`) so the local workspace commands complete instead of failing with
+   `710010702`. **For a plain-text turn that triggers no local tool, the server marks
+   the round `general_agent_task_mode: "simple"` with `mode_downgrade_reason: "success"`,
+   and the activity-grant `usedAmount` does not move** (measured: unchanged at 782
+   across a call — i.e. downgraded, not billed). To actually spend the paid quota, the
+   turn has to do multi-step tool/document work. This is a measurement, not a promise.
+4. **There is no response-side field that proves "the server really used that model".**
    The upstream SSE carries an opaque marker in `message.ext` (observed as `38`); it is
    **not** a version number or a tier, and ByteDance has never published its meaning.
    What this plugin can establish is that it sends `model_item_key` with the request
    (confirmed by packet capture). How the server interprets that key is the server's
-   own business.
-4. **Windows only** — credential decryption relies on DPAPI. `User Data` does not
+   own business — sending an invented key still returns HTTP 200, so the field is not
+   validated. What 0.4.1 offers is **the whole task-mode request shape for a given
+   key** (verified to answer), not a guarantee that Pro rather than Lite did the work.
+5. **Windows only** — credential decryption relies on DPAPI. `User Data` does not
    have to live on `C:` (see the five layers above); a browser-only host has no
    native folder dialog, so the picker button reports that instead of failing
    silently — use `DSH_DOUBAO_PROFILE` there.
-5. **Risk-control sliders cannot be automated.** When one fires, send one message in
+6. **Risk-control sliders cannot be automated.** When one fires, send one message in
    the Doubao desktop app to clear it.
-6. **No image input.** The provider sends text blocks only.
-7. **Single account.** No account pool, no region switching, no check-in.
+7. **No image input.** The provider sends text blocks only.
+8. **Single account.** No account pool, no region switching, no check-in.
 
 ---
 

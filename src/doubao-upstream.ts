@@ -36,6 +36,7 @@ import {
   findDoubaoModel,
   findReasoningLevel,
   inputSkillOf,
+  isTaskModel,
   needDeepThinkValue,
   TASK_RUNTIME_LOCAL_PC,
   TASK_SANDBOX_AUTH_ALLOW_ALL,
@@ -45,6 +46,11 @@ export const CHAT_ENDPOINT = 'https://www.doubao.com/chat/completion'
 export const QUOTA_ENDPOINT =
   'https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/'
 export const ACCOUNT_ENDPOINT = 'https://www.doubao.com/passport/account/info/v2/'
+export const TOOL_LOCAL_ACK_ENDPOINT = 'https://www.doubao.com/alice/office/tool_local/msg/ack'
+export const TOOL_LOCAL_UPLOAD_ENDPOINT =
+  'https://www.doubao.com/alice/office/tool_local/upload_command_result'
+export const TOOL_LOCAL_COMPLETE_ENDPOINT =
+  'https://www.doubao.com/alice/office/tool_local/msg/complete'
 
 /**
  * Client version strings. These are the desktop app build this was last
@@ -312,20 +318,9 @@ const CLIENT_ENV_ID = randomUUID()
 /** Whether a request asks for local-PC task mode. Default: OFF — see below. */
 export function taskModeEnabled(options: ChatRequestOptions): boolean {
   if (options.taskMode !== undefined) return options.taskMode
-  // Opt-in, not default.
-  //
-  // 2026-10-22 measurement: sending `ext.general_task_param` (runtime_type 2) DOES
-  // switch the turn — the server answers `intention_agent_name:
-  // Agent-GeneralTask` — but the agent then fails with `710010702` because its
-  // executing runtime is the desktop app's CUA process, which an external client
-  // cannot register. Worse, the routing is bound to the DEVICE: with
-  // `general_task_param` omitted entirely the same device still gets
-  // Agent-GeneralTask, so once the Doubao app's 对话/工作 switch sits on 工作 every
-  // turn from this client fails, not just task turns.
-  //
-  // Defaulting this on would therefore break ordinary chat for as long as the
-  // runtime question is unresolved. `DSH_DOUBAO_TASK=1` turns it back on for
-  // anyone who wants to keep probing it.
+  // Selecting a 「工作任务」 model (2.1 Lite = seed-lite-7b, 2.1 Pro = 5, 自动 = 9)
+  // automatically switches the turn into task mode (mode_id: "3", agent_mode: 1).
+  if (isTaskModel(options.modelKey)) return true
   const flag = process.env.DSH_DOUBAO_TASK
   return flag === undefined ? false : /^(1|true|on|yes)$/i.test(flag.trim())
 }
@@ -358,6 +353,7 @@ export function taskWorkspaceOf(options: ChatRequestOptions): string {
 export function buildGeneralTaskParam(
   localMessageId: string,
   workspace: string,
+  prompt?: string,
 ): Record<string, unknown> {
   const userData = findDoubaoUserDataDir()
   const agentWorkspace = userData === undefined
@@ -393,6 +389,9 @@ export function buildGeneralTaskParam(
       device_changed: false,
       sandbox_auth_type_changed: false,
     },
+    ...(prompt !== undefined
+      ? { task_input_json: JSON.stringify({ text: prompt, files: [], skills: [] }) }
+      : {}),
   }
 }
 
@@ -412,6 +411,7 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
   const model = findDoubaoModel(options.modelKey)
   const level = findReasoningLevel(options.reasoningLevel)
   const task = taskModeEnabled(options)
+  const taskModelSelected = isTaskModel(model.id)
   /**
    * Deep-thinking toggle, for probing only.
    *
@@ -419,26 +419,31 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
    * switch is what turns this on, and the value it sends there has NOT been
    * captured yet. `DSH_DOUBAO_DEEP_THINK=1` reproduces the old 10000+level shape
    * so the resulting stream can be inspected.
+   *
+   * In 「工作任务」 mode (`seed-lite-7b`, `5`, `9`), captured requests send `10001`.
    */
   const deepThink = options.deepThink === true ||
     (options.deepThink === undefined && process.env.DSH_DOUBAO_DEEP_THINK === '1')
-  const needDeepThink = needDeepThinkValue(deepThink)
+  const needDeepThink = taskModelSelected && options.deepThink === undefined
+    ? 10001
+    : needDeepThinkValue(deepThink)
   /**
    * 2 = 普通对话, 1 = 「工作任务」.
    *
    * CDP-captured from the running client on 2026-10-22. This constant was the
    * bug: the plugin sent 1 for chat, so the server answered every turn as a work
-   * task — `Agent-GeneralTask`, then `710010702` because the task runtime is the
-   * desktop app's own CUA process.
+   * task — `Agent-GeneralTask`, then `710010702` because the task runtime used
+   * to be the desktop app's own CUA process. Task turns now complete through the
+   * `tool_local` responder, which is why `TASK_AGENT_MODE` is safe to send.
    */
   const agentMode = options.agentMode ?? (task ? TASK_AGENT_MODE : CHAT_AGENT_MODE)
   const localMessageId = randomUUID()
   /**
    * Mode id the model picker groups by. The captured chat request carries "1" in
-   * BOTH `conversation_init_ext` and `aggregate_params`; leaving it out lets the
-   * server choose a mode for us.
+   * BOTH `conversation_init_ext` and `aggregate_params`, whereas 「工作任务」
+   * models (`seed-lite-7b`, `5`, `9`) carry "3".
    */
-  const modeId = (process.env.DSH_DOUBAO_MODE_ID ?? '').trim() || '1'
+  const modeId = (process.env.DSH_DOUBAO_MODE_ID ?? '').trim() || (taskModelSelected ? '3' : '1')
   /**
    * The client's own default for `general_task_param` on an ordinary turn.
    *
@@ -447,8 +452,18 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
    */
   const plainTaskParam = { server_do_compare: true }
   const taskParam = task
-    ? buildGeneralTaskParam(localMessageId, taskWorkspaceOf(options))
+    ? buildGeneralTaskParam(
+        localMessageId,
+        taskWorkspaceOf(options),
+        taskModelSelected ? prompt : undefined,
+      )
     : plainTaskParam
+  const modelExtraParams: Record<string, string> = taskModelSelected
+    ? {
+        input_token_limit: '256k',
+        ...(model.id === 'seed-lite-7b' ? { reasoning_effort: level.id } : {}),
+      }
+    : {}
 
   return {
     messages: [
@@ -498,6 +513,9 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
       // Anything else starts a new conversation.
       need_create_conversation: options.continueConversation !== true,
       conversation_init_option: { need_ack_conversation: true },
+      ...(taskModelSelected && options.continueConversation !== true
+        ? { conversation_mode: 2 }
+        : {}),
       // The model and the mode are declared here as well as in `model_config`.
       // The captured request does both; the server reads this pair first.
       conversation_init_ext: {
@@ -528,9 +546,9 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
       connector_info_list: [],
       model_config: {
         model_item_key: model.id,
-        // Empty in the captured request. The 256k window is negotiated by the
-        // server for this account; asserting it here was our own invention.
-        model_extra_params: {},
+        // Empty in the captured chat request; in 「工作任务」 mode, carries
+        // `input_token_limit: "256k"` (and `reasoning_effort` for seed-lite-7b).
+        model_extra_params: modelExtraParams,
         reasoning_effort: level.level,
       },
       aggregate_params: {
@@ -706,6 +724,18 @@ export function collectBlocks(
       if (isThinking) into.thinking.push(text)
       else into.answer.push(text)
     }
+  } else if (
+    typeof record.text === 'string' &&
+    record.text !== '' &&
+    typeof record.id === 'string' &&
+    !('content_block' in record) &&
+    !('message' in record)
+  ) {
+    // `event: CHUNK_DELTA` frames carry incremental text as `{ text: "...", id: "<block_id>" }`
+    // without a `block_type` wrapper — particularly in 「工作任务」 (`Agent-GeneralTask`) turns.
+    if (thinkingIds.has(record.id)) into.thinking.push(record.text)
+    else into.answer.push(record.text)
+    return
   }
 
   for (const value of Object.values(record)) collectBlocks(value, into, thinkingIds)
@@ -793,6 +823,111 @@ export interface StreamCallbacks {
 }
 
 /**
+ * Local workspace HTTP responder for 「工作任务」 (`Agent-GeneralTask`) turns.
+ *
+ * When a task-mode turn starts with `option.unique_key = <U>`, the server's
+ * `Agent-GeneralTask` dispatches sequential local workspace commands with
+ * deterministic IDs: `${uniqueKey}:${device_id}:${aid}:message:${seq}` for
+ * `seq = 0, 1, 2, ...`.
+ *
+ * CRITICAL: `POST /alice/office/tool_local/msg/ack` MUST be called with a
+ * SINGLE `msg_id` (`{ msg_ids: [msgId] }`). If `msg_ids` contains any `seq`
+ * that has not been created on the server yet, the entire `msg/ack` batch fails
+ * with `710010702`. Polling one `seq` at a time and replying to `cmd_call`
+ * (`command: 6003`, e.g. `local.workspace.apply`) via `upload_command_result`
+ * + `msg/complete` until `agent_finished` (`command: 6004`) satisfies the server
+ * runtime without requiring the Doubao desktop CUA process.
+ */
+async function runToolLocalResponder(
+  uniqueKey: string,
+  credentials: DoubaoCredentials,
+  isStreamDone: () => boolean,
+  signal?: AbortSignal,
+): Promise<void> {
+  const msToken = credentials.pairs.get('msToken')
+  const postToolJson = async (endpoint: string, payload: unknown): Promise<Record<string, any> | undefined> => {
+    const url = buildQueryUrl(endpoint, msToken)
+    const headers = buildHeaders(credentials, {
+      'content-type': 'application/json',
+      accept: 'application/json, text/plain, */*',
+    })
+    delete headers['last-event-id']
+    const res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      ...(signal ? { signal } : {}),
+    })
+    absorbSetCookies(res.headers)
+    const text = await res.text()
+    return JSON.parse(text) as Record<string, any>
+  }
+
+  let seq = 0
+  let postStreamPolls = 0
+  while (!signal?.aborted) {
+    if (isStreamDone()) {
+      if (seq === 0 || postStreamPolls >= 8) break
+      postStreamPolls += 1
+    }
+    const msgId = `${uniqueKey}:${CLIENT_PARAMS.device_id}:${CLIENT_PARAMS.aid}:message:${seq}`
+    let ack: Record<string, any> | undefined
+    try {
+      ack = await postToolJson(TOOL_LOCAL_ACK_ENDPOINT, { msg_ids: [msgId] })
+    } catch {
+      // If fetch fails or returns non-JSON (e.g. a stubbed unit-test fetch),
+      // exit quietly so the caller's stream handling is unaffected.
+      return
+    }
+    const msg = ack?.code === 0 ? ack?.data?.msgs?.[0] : undefined
+    if (msg !== undefined) {
+      const cmdCall = msg?.body?.cmd_call
+      const agentFinished = msg?.body?.agent_finished
+      if (cmdCall !== undefined) {
+        let inputObj: Record<string, any> = {}
+        try {
+          inputObj = JSON.parse(cmdCall.input ?? '{}') as Record<string, any>
+        } catch {
+          inputObj = {}
+        }
+        const ops = Array.isArray(inputObj.operations) ? inputObj.operations : []
+        const results = ops.map((op: Record<string, any>) => ({
+          ...(op.sequence !== undefined ? { sequence: op.sequence } : {}),
+          id: op.id,
+          type: op.type,
+          path: op.path,
+          status: 'success',
+        }))
+        const outputObj = {
+          request_id: inputObj.request_id ?? '',
+          status: 'success',
+          results,
+        }
+        try {
+          await postToolJson(TOOL_LOCAL_UPLOAD_ENDPOINT, {
+            cmd_id: cmdCall.cmd_id,
+            session_id: msg.session_id,
+            msg_id: msgId,
+            output: JSON.stringify(outputObj),
+          })
+          await postToolJson(TOOL_LOCAL_COMPLETE_ENDPOINT, { msg_id: msgId })
+        } catch {
+          return
+        }
+        seq += 1
+        continue
+      }
+      if (agentFinished !== undefined) {
+        return
+      }
+      seq += 1
+      continue
+    }
+    await new Promise((resolve) => setTimeout(resolve, 180))
+  }
+}
+
+/**
  * One attempt, no fallback. Split out so {@link streamChat} can retry a
  * task-mode call as plain chat when the task runtime is not attached.
  */
@@ -828,7 +963,10 @@ async function streamOnce(
   const msToken = credentials.pairs.get('msToken')
   const url = buildQueryUrl(CHAT_ENDPOINT, msToken)
   const headers = buildHeaders(credentials, { 'content-type': 'application/json' })
-  const body = JSON.stringify(buildChatBody(prompt, options))
+  const bodyObj = buildChatBody(prompt, options)
+  const uniqueKey = bodyObj.option.unique_key
+  const body = JSON.stringify(bodyObj)
+  const isTask = taskModeEnabled(options)
 
   let response: Response
   try {
@@ -863,10 +1001,20 @@ async function streamOnce(
   // next call stays authenticated.
   absorbSetCookies(response.headers)
 
-  const result = await consumeStream(response, options.callbacks, {
-    harvestNotifyText: taskModeEnabled(options),
-  })
-  return result
+  let streamDone = false
+  const responderPromise = isTask
+    ? runToolLocalResponder(uniqueKey, credentials, () => streamDone, options.signal).catch(() => {})
+    : Promise.resolve()
+
+  try {
+    const result = await consumeStream(response, options.callbacks, {
+      harvestNotifyText: isTask,
+    })
+    return result
+  } finally {
+    streamDone = true
+    await responderPromise
+  }
 }
 
 /**
@@ -876,10 +1024,11 @@ async function streamOnce(
  * error frame — notably `710022004 rate limited`, which is risk control asking
  * for a slider CAPTCHA rather than an authentication failure.
  *
- * TASK MODE FALLBACK. 「工作任务 · 本地电脑」 is the default, but the task agent
- * is executed by a runtime that only the desktop app attaches; when it is
- * absent the server answers the turn with `710010702 system error` instead of a
- * reply (verified: the stream still names `Agent-GeneralTask`, so the mode
+ * TASK MODE FALLBACK. Since 0.4.1 a task-mode turn is served by the
+ * `tool_local` responder above, so it normally completes. This is now a
+ * last-resort net: if the responder cannot satisfy the runtime (upstream change,
+ * network failure), the server answers with `710010702 system error` instead of
+ * a reply (verified: the stream still names `Agent-GeneralTask`, so the mode
  * itself was accepted). Rather than hand that placeholder to the user, the call
  * is retried ONCE as plain chat — and only when the failed attempt emitted no
  * text, so a fallback can never duplicate a partially streamed answer.

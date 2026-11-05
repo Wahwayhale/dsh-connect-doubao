@@ -31,8 +31,10 @@ import { join } from 'node:path'
 import { findDoubaoUserDataDir } from './doubao-auth.ts'
 import {
   DOUBAO_MODELS,
+  DOUBAO_UNAVAILABLE_MODELS,
   DOUBAO_IMAGE_MODEL_ID,
   DOUBAO_IMAGE_MODEL_NAME,
+  isTaskModel,
   type DoubaoModelInfo,
 } from './doubao-catalog.ts'
 
@@ -43,8 +45,12 @@ export const DISCOVERY_TTL_MS = 10 * 60 * 1000
  * Names produced by the client for models that only exist inside 「工作任务」.
  *
  * The app prefixes them itself (「工作任务 Pro」, 「工作任务 Auto」), which is a
- * gift: the mode a model belongs to is legible straight out of the cache, so
- * the plugin can hide exactly the entries that would fail with 710010702.
+ * gift: the mode a model belongs to is legible straight out of the cache.
+ *
+ * The prefix no longer means "hidden": since 0.4.1 these entries are offered
+ * with `taskMode: true` and are answered by the `tool_local` responder, so they
+ * complete instead of failing with 710010702. Only entries listed in
+ * `DOUBAO_UNAVAILABLE_MODELS` are withheld.
  */
 export const TASK_MODE_PREFIX = '工作任务'
 
@@ -196,8 +202,12 @@ export function discoverAllCachedModels(): DiscoveredEntry[] {
  */
 export function discoverModels(now = Date.now()): DoubaoModelInfo[] | undefined {
   const all = discoverAllCachedModels()
-  const usable = all.filter((entry) => !entry.taskOnly && entry.key !== DOUBAO_IMAGE_MODEL_ID)
+  const unavailableIds = new Set(DOUBAO_UNAVAILABLE_MODELS.map((m) => m.id))
+  const usable = all.filter(
+    (entry) => !unavailableIds.has(entry.key) && entry.key !== DOUBAO_IMAGE_MODEL_ID,
+  )
   if (usable.length === 0) return undefined
+  const seenKeys = new Set(usable.map((e) => e.key))
   const models: DoubaoModelInfo[] = usable
     // Stable order: numeric keys ascending, slugs after, so a rescan cannot
     // shuffle the picker between two identical states.
@@ -209,7 +219,25 @@ export function discoverModels(now = Date.now()): DoubaoModelInfo[] | undefined 
       if (bNum) return 1
       return a.key.localeCompare(b.key)
     })
-    .map((entry) => ({ id: entry.key, name: entry.name, reasoning: true }))
+    .map((entry) => {
+      const staticMatch = DOUBAO_MODELS.find((m) => m.id === entry.key)
+      const taskMode = entry.taskOnly || isTaskModel(entry.key)
+      return {
+        id: entry.key,
+        name: staticMatch?.name ?? entry.name,
+        ...(staticMatch?.badge !== undefined ? { badge: staticMatch.badge } : {}),
+        reasoning: true as const,
+        ...(taskMode ? { taskMode: true } : {}),
+      }
+    })
+  // Ensure static task-mode models (seed-lite-7b, 5, 9) are always present even
+  // if the local IndexedDB only cached the chat-mode subset.
+  for (const staticModel of DOUBAO_MODELS) {
+    if (staticModel.id === DOUBAO_IMAGE_MODEL_ID) continue
+    if (!seenKeys.has(staticModel.id)) {
+      models.push({ ...staticModel })
+    }
+  }
   models.push({ id: DOUBAO_IMAGE_MODEL_ID, name: DOUBAO_IMAGE_MODEL_NAME, reasoning: true })
   void now
   return models

@@ -232,7 +232,7 @@ export async function runDoctor(): Promise<DoctorReport> {
     name: 'models',
     status: offered.length > 0 ? 'ok' : 'fail',
     detail: cached.length > 0
-      ? `客户端缓存 ${cached.length} 个模型，开放 ${offered.length} 个（「工作任务」专属的按名字前缀排除）`
+      ? `客户端缓存 ${cached.length} 个模型，开放 ${offered.length} 个（仅排除「即将下线」等不可用条目）`
       : `读不到客户端缓存，回落到内置清单（${offered.length} 个）`,
     data: {
       source: cached.length > 0 ? 'client-cache' : 'static-fallback',
