@@ -74,7 +74,7 @@ Chromium cookie（通过 Windows DPAPI 在本进程内解密），把它当作�
 ### 代码级 / 抓包级证据（非截图）
 
 - `doctor` 五项检查全绿：凭据 29 cookie 解密且 9/9 必需会话 cookie 齐备、账号被上游接受、
-  shim 绑定回环端口且错误 bearer 返回 401、三个额度窗口可读、模型发现开放 5 个。
+  shim 绑定回环端口且错误 bearer 返回 401、三个额度窗口可读、模型发现开放 6 个。
 - 推理强度 低=3 / 中=4 / 高=5：由**抓取客户端切换档位时重新序列化的配置 diff**读出，
   并由客户端配置里的 `reasoning_effort_config` 独立确认。
 - 请求体带 `model_item_key` 与 `reasoning_effort`：抓包确认。
@@ -182,7 +182,7 @@ POST /alice/office/tool_local/msg/complete          # 标记该指令完成
 当前这台机器上的实测输出：
 
 ```
-[ ok ] models  客户端缓存 5 个模型，开放 5 个
+[ ok ] models  客户端缓存 5 个模型，开放 6 个（仅排除「即将下线」等不可用条目）
 ```
 
 ## 实验性：工具调用（默认关闭）

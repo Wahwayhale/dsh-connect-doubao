@@ -91,7 +91,7 @@ works everywhere):
 
 - `doctor` passes all five checks: 29 cookies decrypted with 9/9 required session
   cookies present, the account accepted upstream, the shim bound to a loopback port with
-  a wrong bearer refused (401), all three quota windows readable, and 5 models offered.
+  a wrong bearer refused (401), all three quota windows readable, and 6 models offered.
 - Reasoning effort low=3 / mid=4 / high=5 was read by **diffing the configuration the
   client re-serialises when the level is switched**, then independently confirmed
   against `reasoning_effort_config` in the client's own config.
