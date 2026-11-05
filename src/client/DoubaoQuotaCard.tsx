@@ -220,20 +220,18 @@ function QuotaBar(props: {
   // than by decrementing the host's remaining ms, so a stale payload cannot
   // drift: a tab left open for an hour still shows the true remaining time.
   return (
-    <div className="dbq-row" title={t('quota.usedAmounts', { used: usedAmount ?? used, total: totalAmount ?? 0 })}>
+    <div className="dbq-row">
       <div className="dbq-row-head">
         <span className="dbq-label">{label}</span>
-        <span className="dbq-meta">
+        {/* One loud number per row — what is LEFT — instead of a line that
+            carried the figure, the percentage and the countdown at once. */}
+        <span className="dbq-figure">
           {remainingAmount !== null
             ? t('quota.remainingAmount', {
                 remaining: remainingAmount,
                 total: totalAmount ?? 0,
               })
             : t('quota.remainingPercent', { percent })}
-          {' · '}
-          {startsOnUse === true && (liveMs === null || liveMs === undefined)
-            ? t('quota.startsOnUse')
-            : instantLabel(t, liveMs, instantKind === 'expire' ? 'expire' : 'reset')}
         </span>
       </div>
       <div
@@ -246,6 +244,16 @@ function QuotaBar(props: {
         aria-label={label}
       >
         <div className={`dbq-fill${tone}`} style={{ width: `${percent}%` }} />
+      </div>
+      <div className="dbq-row-foot">
+        <span className="dbq-meta">
+          {startsOnUse === true && (liveMs === null || liveMs === undefined)
+            ? t('quota.startsOnUse')
+            : instantLabel(t, liveMs, instantKind === 'expire' ? 'expire' : 'reset')}
+        </span>
+        {remainingAmount !== null && (
+          <span className="dbq-figure-sub">{t('quota.usedAmounts', { used: usedAmount ?? used, total: totalAmount ?? 0 })}</span>
+        )}
       </div>
       <span className="dbq-meta" hidden>{`now=${now}`}</span>
     </div>
