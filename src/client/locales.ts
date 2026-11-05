@@ -25,6 +25,7 @@ export const zh = {
   'quota.autoNote': '每 5 分钟自动刷新',
   'quota.updatedAt': '更新于 {time}',
   'quota.windowMissing': '未返回该额度窗口',
+  'quota.resetUnknown': '重置时间未知',
 
   'account.title': '账号状态',
   'account.ok': '已登录',
@@ -99,6 +100,7 @@ export const en: Record<DoubaoCardKey, string> = {
   'quota.autoNote': 'Refreshes automatically every 5 minutes',
   'quota.updatedAt': 'updated {time}',
   'quota.windowMissing': 'window not reported',
+  'quota.resetUnknown': 'reset time unknown',
 
   'account.title': 'Account status',
   'account.ok': 'Signed in',

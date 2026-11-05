@@ -148,7 +148,8 @@ async function fetchCatalog(signal: AbortSignal): Promise<DoubaoCatalogView | un
 function QuotaBar(props: {
   label: string
   usedPercent: number | undefined
-  resetsInMs: number | undefined
+  /** Null when Doubao sent no window timestamps: the reset instant is unknown. */
+  resetsInMs: number | null | undefined
   t: T
   now: number
 }): ReactElement {
@@ -175,7 +176,11 @@ function QuotaBar(props: {
       <div className="dbq-row-head">
         <span className="dbq-label">{label}</span>
         <span className="dbq-meta">
-          {t('quota.used', { percent })} · {t('quota.resetsIn', { time: formatCountdown(resetsInMs ?? 0) })}
+          {t('quota.used', { percent })}
+          {' · '}
+          {resetsInMs === null || resetsInMs === undefined
+            ? t('quota.resetUnknown')
+            : t('quota.resetsIn', { time: formatCountdown(resetsInMs) })}
         </span>
       </div>
       <div

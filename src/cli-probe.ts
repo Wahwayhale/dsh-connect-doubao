@@ -88,6 +88,13 @@ async function main(): Promise<number> {
   }
 
   const quota = await fetchQuota({ force: true })
+  const describeWindow = (window: ReturnType<typeof findWindow>): string => {
+    if (window === undefined) return 'not offered by this plan'
+    if (window.resetUnknown === true) {
+      return `${window.usedPercent}% used, reset time unknown`
+    }
+    return `${window.usedPercent}% used, resets in ${formatDuration(millisUntilReset(window))}`
+  }
   const fiveHour = findWindow(quota, 'five_hour')
   const weekly = findWindow(quota, 'weekly')
   out(options.json
@@ -106,8 +113,8 @@ async function main(): Promise<number> {
       }
       : [
           `quota: ${quota.plan ?? 'unknown plan'}${quota.planActive === false ? ' (inactive)' : ''}`,
-          `  5-hour limit : ${fiveHour ? `${fiveHour.usedPercent}% used, resets in ${formatDuration(millisUntilReset(fiveHour))}` : 'n/a'}`,
-          `  weekly quota : ${weekly ? `${weekly.usedPercent}% used, resets in ${formatDuration(millisUntilReset(weekly))}` : 'n/a'}`,
+          `  5-hour limit : ${describeWindow(fiveHour)}`,
+          `  weekly quota : ${describeWindow(weekly)}`,
         ].join('\n'))
 
   if (quota.exhausted) {

@@ -13,7 +13,7 @@
  * @module dsh-connect-doubao/status
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { fetchQuota, findWindow, millisUntilReset, invalidateQuotaCache } from './doubao-quota.ts'
+import { fetchQuota, findWindow, millisUntilReset, invalidateQuotaCache, type QuotaWindow } from './doubao-quota.ts'
 import { describeProfileLocation, resolveUserProvided, PROFILE_ENV, type DoubaoProfileLocation } from './doubao-auth.ts'
 import { doubaoCatalogEntries, type DoubaoModelInfo } from './doubao-catalog.ts'
 import { invalidateDiscovery } from './doubao-discovery.ts'
@@ -118,14 +118,30 @@ function safeMessage(error: unknown): string {
   return message.slice(0, 200)
 }
 
+/**
+ * One window as the card sees it.
+ *
+ * `resetsAt`/`resetsInMs` are null when Doubao sent no timestamps: a made-up
+ * countdown is worse than an honest "unknown", because the user plans around it.
+ */
+export interface QuotaWindowView {
+  usedPercent: number
+  remainingPercent: number
+  resetsAt: number | null
+  resetsInMs: number | null
+  /** Raw amounts, when the plan reports them instead of a percentage. */
+  usedAmount: number | null
+  totalAmount: number | null
+}
+
 export interface DoubaoQuotaView {
   ok: boolean
   profile: string
   plan: string | null
   exhausted: boolean
   windows: {
-    fiveHour: { usedPercent: number; remainingPercent: number; resetsAt: number; resetsInMs: number } | null
-    weekly: { usedPercent: number; remainingPercent: number; resetsAt: number; resetsInMs: number } | null
+    fiveHour: QuotaWindowView | null
+    weekly: QuotaWindowView | null
   }
   fetchedAt: number
   error: string | null
@@ -137,6 +153,20 @@ export interface DoubaoQuotaView {
  * An allow-list on purpose: every field here is a number or a plan name chosen
  * by this function, never a passthrough of the upstream payload.
  */
+/** Map one window into the card's shape; `undefined` means "not reported". */
+function viewOf(window: QuotaWindow | undefined): QuotaWindowView | null {
+  if (window === undefined) return null
+  const unknown = window.resetUnknown === true
+  return {
+    usedPercent: window.usedPercent,
+    remainingPercent: window.remainingPercent,
+    resetsAt: unknown ? null : window.resetsAt,
+    resetsInMs: unknown ? null : millisUntilReset(window),
+    usedAmount: window.usedAmount ?? null,
+    totalAmount: window.totalAmount ?? null,
+  }
+}
+
 export async function doubaoQuotaView(options: { force?: boolean } = {}): Promise<DoubaoQuotaView> {
   const quota = await fetchQuota(options.force === true ? { force: true } : {})
   const fiveHour = findWindow(quota, 'five_hour')
@@ -146,24 +176,7 @@ export async function doubaoQuotaView(options: { force?: boolean } = {}): Promis
     profile: describeProfileLocation(),
     plan: quota.plan ?? null,
     exhausted: quota.exhausted,
-    windows: {
-      fiveHour: fiveHour === undefined
-        ? null
-        : {
-            usedPercent: fiveHour.usedPercent,
-            remainingPercent: fiveHour.remainingPercent,
-            resetsAt: fiveHour.resetsAt,
-            resetsInMs: millisUntilReset(fiveHour),
-          },
-      weekly: weekly === undefined
-        ? null
-        : {
-            usedPercent: weekly.usedPercent,
-            remainingPercent: weekly.remainingPercent,
-            resetsAt: weekly.resetsAt,
-            resetsInMs: millisUntilReset(weekly),
-          },
-    },
+    windows: { fiveHour: viewOf(fiveHour), weekly: viewOf(weekly) },
     fetchedAt: quota.fetchedAt,
     error: quota.error ?? null,
   }

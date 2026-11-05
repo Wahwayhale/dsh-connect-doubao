@@ -25,7 +25,7 @@ import {
   PROFILE_ENV,
 } from './doubao-auth.ts'
 import { probeAccount, classifyDoubaoFailure, DoubaoUpstreamError } from './doubao-upstream.ts'
-import { fetchQuota, findWindow } from './doubao-quota.ts'
+import { fetchQuota, findWindow, formatDuration, millisUntilReset } from './doubao-quota.ts'
 import { createDoubaoShim } from './doubao-shim.ts'
 import { createDoubaoAdapter } from './doubao-adapter.ts'
 import {
@@ -176,13 +176,25 @@ export async function runDoctor(): Promise<DoctorReport> {
     checks.push({ name: 'quota', status: 'skip', detail: 'no credentials' })
   } else {
     const quota = await fetchQuota({ force: true })
+    const describeWindow = (window: ReturnType<typeof findWindow>): string => {
+      if (window === undefined) return 'not offered'
+      if (window.resetUnknown === true) {
+        return `${window.usedPercent}% used, reset time unknown`
+      }
+      return `${window.usedPercent}% used, ${formatDuration(millisUntilReset(window))} to reset`
+    }
     const fiveHour = findWindow(quota, 'five_hour')
     const weekly = findWindow(quota, 'weekly')
     const view = await doubaoQuotaView()
     checks.push({
       name: 'quota',
-      status: quota.error === undefined && fiveHour !== undefined && weekly !== undefined ? 'ok' : 'fail',
-      detail: quota.error ?? `${quota.plan ?? 'unknown plan'}; 5-hour=${fiveHour?.usedPercent ?? 'n/a'}% weekly=${weekly?.usedPercent ?? 'n/a'}%`,
+      // A plan that simply does not HAVE a five-hour window is healthy — the
+      // account shape is not a plugin failure, and reporting it as one sent
+      // the reader hunting for a bug in the mapping.
+      status: quota.error === undefined ? 'ok' : 'fail',
+      detail:
+        quota.error ??
+        `${quota.plan ?? 'unknown plan'}; 5-hour=${describeWindow(fiveHour)}; weekly=${describeWindow(weekly)}`,
       data: {
         plan: quota.plan ?? null,
         exhausted: quota.exhausted,

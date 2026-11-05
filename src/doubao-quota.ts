@@ -37,11 +37,19 @@ export interface QuotaWindow {
   /** Window length in ms, derived from the server's own timestamps. */
   windowMs: number
   /**
-   * True when `resetsAt` was reconstructed from the nominal window length
-   * because the server reported zeroed timestamps. A UI should treat this
-   * instant as approximate.
+   * True when the server sent NO window timestamps at all.
+   *
+   * Doubao zeroes `start_time`/`end_time` for some plans, and silently
+   * inventing "opened when you looked, resets one period from now" produced a
+   * countdown that was wrong by up to a week — the user reads "resets in 6 days"
+   * for a window that may reset in twenty minutes. When the instant is unknown
+   * the UI says so instead.
    */
-  estimatedReset?: boolean
+  resetUnknown?: boolean
+  /** Raw consumed amount, when the server reports it (a "2,100"-style string). */
+  usedAmount?: number
+  /** Raw entitlement total, same shape as {@link usedAmount}. */
+  totalAmount?: number
 }
 
 export interface DoubaoQuota {
@@ -64,6 +72,25 @@ interface RawWindowLimit {
   less_than_one_percent?: boolean
   start_time?: number
   end_time?: number
+  /** Formatted strings, e.g. "2,100". Present even when used_percent is not. */
+  total_amount?: string | number
+  used_amount?: string | number
+}
+
+/**
+ * Parse one of the server's amount fields.
+ *
+ * They arrive as formatted strings ("2,100"), and they are the only source of a
+ * percentage for the plans that omit `used_percent`. Returns undefined rather
+ * than NaN so callers can tell "no data" from "zero".
+ */
+function parseAmount(value: string | number | undefined): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value !== 'string') return undefined
+  const digits = value.replace(/[^0-9.]/g, '')
+  if (digits === '') return undefined
+  const parsed = Number(digits)
+  return Number.isFinite(parsed) ? parsed : undefined
 }
 
 function mapWindowType(value: number): QuotaWindowType | undefined {
@@ -101,20 +128,34 @@ export function normalizeWindow(raw: RawWindowLimit, now = Date.now()): QuotaWin
   if (!type) return undefined
   const start = raw.start_time ?? 0
   const end = raw.end_time ?? 0
-  const used = raw.used_percent ?? 0
+  const usedAmount = parseAmount(raw.used_amount)
+  const totalAmount = parseAmount(raw.total_amount)
+  // used_percent wins when the server sends it; amounts are the fallback for the
+  // plans that only report them.
+  const fromAmounts =
+    usedAmount !== undefined && totalAmount !== undefined && totalAmount > 0
+      ? Math.min(100, Math.max(0, (usedAmount / totalAmount) * 100))
+      : undefined
+  const used = typeof raw.used_percent === 'number' ? raw.used_percent : (fromAmounts ?? 0)
   const degraded = start <= 0 || end <= 0
-  const effectiveStart = degraded ? now : start
-  const effectiveEnd = degraded ? now + WINDOW_MS[type] : end
-  return {
+  const base = {
     type,
     windowType: raw.window_type as number,
     usedPercent: used,
     remainingPercent: Math.max(0, 100 - used),
-    resetsAt: effectiveEnd,
-    startedAt: effectiveStart,
-    windowMs: effectiveEnd > effectiveStart ? effectiveEnd - effectiveStart : 0,
-    /** True when the reset instant was reconstructed rather than reported. */
-    estimatedReset: degraded,
+    ...(usedAmount === undefined ? {} : { usedAmount }),
+    ...(totalAmount === undefined ? {} : { totalAmount }),
+  }
+  if (degraded) {
+    // No timestamps: the reset instant is unknown, and inventing one is a lie
+    // the countdown repeats for a whole period.
+    return { ...base, resetsAt: 0, startedAt: 0, windowMs: 0, resetUnknown: true }
+  }
+  return {
+    ...base,
+    resetsAt: end,
+    startedAt: start,
+    windowMs: end > start ? end - start : 0,
   }
 }
 
@@ -242,6 +283,7 @@ export function findWindow(quota: DoubaoQuota, type: QuotaWindowType): QuotaWind
  * Drives the countdown the user asked for.
  */
 export function millisUntilReset(window: QuotaWindow, now = Date.now()): number {
+  if (window.resetUnknown === true) return 0
   return Math.max(0, window.resetsAt - now)
 }
 
