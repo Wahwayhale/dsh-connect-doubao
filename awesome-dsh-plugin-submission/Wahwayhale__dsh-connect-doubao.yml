@@ -14,13 +14,14 @@
 # Validate locally before opening the PR:
 #   node scripts/validate-submission.mjs
 #
-# Still TODO before the PR is mergeable (see M16-REPORT.md section 5):
-#   [ ] Capture the two screenshots referenced by screenshots.json and commit them.
-#   [ ] Confirm the repository is at least 1 day old (R4, checked by CI).
+# This copy is the source of truth for the upstream entry: it was submitted as
+# PR #12157 against awesome-dsh-plugin, and editing the file upstream without
+# editing this one makes the two drift. Keep them identical.
 
 url: "https://github.com/Wahwayhale/dsh-connect-doubao"
 name: "Wahwayhale/dsh-connect-doubao"
 category: model
 description:
-  en: 'Reuses the sign-in already held by the local Doubao desktop app as a DeepSeek Harness model provider, and adds a read-only quota view for the 5-hour and weekly windows.'
-  zh: '复用本机豆包桌面客户端已有的登录态，作为 DeepSeek Harness 的模型 provider，并提供 5 小时限额与周额度的只读额度概览。'
+  en: 'Reuses the sign-in already held by the local Doubao desktop app as a DeepSeek Harness model provider — chat, Seedream image generation, and a live quota panel covering the 5-hour, weekly and activity-grant windows, showing what is LEFT rather than what is used. Windows x64 only, since the credential is decrypted with DPAPI.'
+  zh: '复用本机豆包桌面客户端已有的登录态，作为 DeepSeek Harness 的模型 provider：对话、Seedream 生图，以及一块实时额度看板，涵盖 5 小时、周与活动赠送额度，显示「还剩多少」而不是「已用多少」。仅 Windows x64：凭据解密依赖 DPAPI。'
+icon: https://raw.githubusercontent.com/Wahwayhale/dsh-connect-doubao/main/docs/assets/dsh-connect-doubao-icon.png
