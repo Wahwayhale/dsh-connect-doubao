@@ -80,7 +80,7 @@ export default [
     platform: 'node',
     target: 'es2024',
     fixedExtension: false,
-    dts: false,
+    dts: true,
     clean: true,
     deps: {
       neverBundle: [

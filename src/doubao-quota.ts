@@ -119,6 +119,30 @@ export function normalizeWindow(raw: RawWindowLimit, now = Date.now()): QuotaWin
 }
 
 /**
+ * How long a FAILED reading is reused.
+ *
+ * The quota endpoint is consulted before every chat turn, and a failure used to
+ * be forgotten immediately — so an outage cost every single turn another round
+ * trip that was going to fail the same way, on the request's critical path. The
+ * window is short enough that a recovery is invisible (a turn later) and long
+ * enough to stop that fan-out.
+ */
+const QUOTA_FAILURE_TTL_MS = 30_000
+
+/**
+ * Remember a failed reading, and return it.
+ *
+ * One helper because all three failure exits (no credentials, HTTP error,
+ * thrown) must go through it: a failure that skips the memo is exactly the bug
+ * this exists to prevent.
+ */
+function rememberFailure(quota: DoubaoQuota): DoubaoQuota {
+  cachedFailure = quota
+  cachedFailureAt = Date.now()
+  return quota
+}
+
+/**
  * Read the account's current quota.
  *
  * Never throws: an unreachable endpoint yields a `DoubaoQuota` carrying an
@@ -129,15 +153,18 @@ export async function fetchQuota(options: { force?: boolean } = {}): Promise<Dou
   if (!options.force && cached && now - cached.fetchedAt < QUOTA_TTL_MS) {
     return cached
   }
+  if (!options.force && cachedFailure !== undefined && now - cachedFailureAt < QUOTA_FAILURE_TTL_MS) {
+    return cachedFailure
+  }
 
   const credentials = loadDoubaoCredentials()
   if (!credentials.ok) {
-    return {
+    return rememberFailure({
       exhausted: false,
       windows: [],
       fetchedAt: now,
       error: credentials.reason ?? 'Doubao credentials unavailable.',
-    }
+    })
   }
 
   try {
@@ -147,7 +174,7 @@ export async function fetchQuota(options: { force?: boolean } = {}): Promise<Dou
       body: JSON.stringify({ product_line: 'membership' }),
     })
     if (!response.ok) {
-      return { exhausted: false, windows: [], fetchedAt: now, error: `HTTP ${response.status}` }
+      return rememberFailure({ exhausted: false, windows: [], fetchedAt: now, error: `HTTP ${response.status}` })
     }
     const payload = (await response.json()) as {
       data?: {
@@ -184,17 +211,25 @@ export async function fetchQuota(options: { force?: boolean } = {}): Promise<Dou
     }
 
     cached = quota
+    cachedFailure = undefined
     return quota
   } catch (error) {
-    return { exhausted: false, windows: [], fetchedAt: now, error: (error as Error).message }
+    return rememberFailure({ exhausted: false, windows: [], fetchedAt: now, error: (error as Error).message })
   }
 }
 
 let cached: DoubaoQuota | undefined
+/** The last FAILED reading, reused for {@link QUOTA_FAILURE_TTL_MS}. */
+let cachedFailure: DoubaoQuota | undefined
+let cachedFailureAt = 0
 
 /** Drop the cached reading so the next call hits the server. */
 export function invalidateQuotaCache(): void {
   cached = undefined
+  // A forced refresh is the user saying "the panel is wrong": it must not be
+  // answered from the failure memo either.
+  cachedFailure = undefined
+  cachedFailureAt = 0
 }
 
 /** Convenience lookup for a specific window. */

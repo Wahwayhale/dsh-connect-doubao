@@ -97,6 +97,16 @@ function useCardStyles(): void {
 }
 
 /**
+ * Header every write carries.
+ *
+ * Not a secret: it makes the request non-simple, so a hostile page cannot send
+ * it without a CORS preflight — which these routes never approve. Without it the
+ * host rejects the write, which is exactly what should happen to a cross-site
+ * request that has no business flipping settings.
+ */
+const WRITE_HEADERS = { 'x-dsh-doubao-write': '1' } as const
+
+/**
  * GET the quota view. Never throws: every failure becomes `undefined`, which
  * classifies as `unreadable` rather than unmounting the card.
  */
@@ -116,7 +126,7 @@ async function refreshQuota(): Promise<DoubaoQuotaView | undefined> {
   const response = await fetch(DOUBAO_QUOTA_PATH, {
     method: 'POST',
     credentials: 'same-origin',
-    headers: { accept: 'application/json' },
+    headers: { accept: 'application/json', ...WRITE_HEADERS },
   })
   if (!response.ok) return undefined
   return (await response.json()) as DoubaoQuotaView
@@ -383,7 +393,7 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     try {
       response = await fetch(DOUBAO_SAVE_PATH, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...WRITE_HEADERS },
         body: JSON.stringify({ field, value }),
       })
     } catch (error: unknown) {

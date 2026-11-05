@@ -30,7 +30,7 @@
  * values as opaque secrets.
  */
 import { createHash, createDecipheriv } from 'node:crypto'
-import { readFileSync, mkdtempSync, rmSync, copyFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { readFileSync, mkdtempSync, rmSync, copyFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -97,11 +97,43 @@ const DPAPI_MAGIC = Buffer.from('DPAPI', 'ascii')
  * addon, so we shell out to the Windows Data Protection API. The master key
  * travels back over stdout and never touches disk.
  */
+/**
+ * Absolute path to Windows PowerShell, or the bare name as a last resort.
+ *
+ * Resolving through PATH means a planted `powershell.exe` earlier in the search
+ * order receives this call's input on stdin — which is a session cookie or the
+ * DPAPI master key. The system copy lives at a fixed location, so ask for it.
+ */
+function powershellPath(): string {
+  const root = process.env.SystemRoot ?? process.env.windir ?? 'C:\\Windows'
+  const direct = join(root, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+  return existsSync(direct) ? direct : 'powershell.exe'
+}
+
+/**
+ * The environment handed to the DPAPI helper.
+ *
+ * An explicit allow-list rather than a spread of the host environment: that
+ * environment carries every API key this DSH install has, and none of them has
+ * any business in a process whose only job is one crypt32 call.
+ */
+function dpapiChildEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  for (const name of ['SystemRoot', 'windir', 'SystemDrive', 'ComSpec', 'PATH', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE']) {
+    const value = process.env[name]
+    if (value !== undefined) env[name] = value
+  }
+  if (env.SystemRoot === undefined && env.windir !== undefined) env.SystemRoot = env.windir
+  return env
+}
+
 function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
   // The script is written to a temp .ps1 and run with `-File`, not passed via
   // -Command/-EncodedCommand: the C# P/Invoke source needs real newlines, and
   // any inline form flattens the here-string header into a parse error.
   const script = [
+    // A param block must be the first statement in the file.
+    'param([string]$Mode = "unprotect")',
     "$ErrorActionPreference = 'Stop'",
     '$ProgressPreference = "SilentlyContinue"',
     // The C# source is built with -TypeDefinition rather than -MemberDefinition.
@@ -117,7 +149,12 @@ function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
     // PowerShell single-quoted string, C# double quotes — one level only.
     '$cs = \'using System; using System.Runtime.InteropServices; [StructLayout(LayoutKind.Sequential)] public struct DshDataBlob { public int cbData; public IntPtr pbData; } public static class DshCrypt { [DllImport("crypt32.dll", SetLastError = true)] public static extern bool CryptUnprotectData(ref DshDataBlob pDataIn, IntPtr szDataDescr, IntPtr pOptionalEntropy, IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DshDataBlob pDataOut); [DllImport("crypt32.dll", SetLastError = true)] public static extern bool CryptProtectData(ref DshDataBlob pDataIn, IntPtr szDataDescr, IntPtr pOptionalEntropy, IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DshDataBlob pDataOut); }\'',
     'Add-Type -TypeDefinition $cs',
-    '$bytes = [System.Convert]::FromBase64String($env:DSH_DOUBAO_DPAPI_BLOB)',
+    // The payload arrives on STDIN, never in the environment: `env` of a child
+    // process is visible to every other process of the same user (Task Manager,
+    // WMI, a crashed-process dump), and this payload is a plaintext session —
+    // the whole point of sealing it is that it does not travel in the clear.
+    '$in = [Console]::In.ReadToEnd()',
+    '$bytes = [System.Convert]::FromBase64String($in.Trim())',
     '$len = [int]$bytes.Length',
     '$mem = [Runtime.InteropServices.Marshal]::AllocHGlobal($len)',
     '[Runtime.InteropServices.Marshal]::Copy($bytes, 0, $mem, $len)',
@@ -127,7 +164,7 @@ function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
     '$outBlob = New-Object DshDataBlob',
     // CRYPTPROTECT_UI_FORBIDDEN = 0x1. Protect and unprotect share every
     // argument shape except the entry point, so the mode is one branch.
-    "if ($env:DSH_DPAPI_MODE -eq 'protect') {",
+    "if ($Mode -eq 'protect') {",
     '  $ok = [DshCrypt]::CryptProtectData([ref]$inBlob, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, 1, [ref]$outBlob)',
     '} else {',
     '  $ok = [DshCrypt]::CryptUnprotectData([ref]$inBlob, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, [IntPtr]::Zero, 1, [ref]$outBlob)',
@@ -148,17 +185,16 @@ function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
     // spawnSync rather than execFileSync: PowerShell writes a CLIXML preamble to
     // stderr even on success, and execFileSync discards stdout when that happens.
     const result = spawnSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath],
+      powershellPath(),
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, mode],
       {
         encoding: 'utf8',
         maxBuffer: 1 << 24,
         windowsHide: true,
-        env: {
-          ...process.env,
-          DSH_DOUBAO_DPAPI_BLOB: blob.toString('base64'),
-          DSH_DPAPI_MODE: mode,
-        },
+        // The payload rides on stdin (see the script above); the environment is
+        // narrowed to what PowerShell needs to start.
+        input: blob.toString('base64'),
+        env: dpapiChildEnv(),
       },
     )
     const stdout = result.stdout ?? ''
@@ -227,7 +263,7 @@ function saveCredentialCache(credentials: DoubaoCredentials): void {
     })
     const sealed = dpapiCall('protect', Buffer.from(payload, 'utf8'))
     mkdirSync(dirname(credentialCachePath()), { recursive: true })
-    writeFileSync(credentialCachePath(), sealed)
+    writeFileSync(credentialCachePath(), sealed, { mode: 0o600 })
   } catch {
     // A cache that cannot be written is a slower plugin, not a broken one.
   }
@@ -240,7 +276,11 @@ function loadCredentialCache(): DoubaoCredentials | undefined {
     const json = dpapiCall('unprotect', sealed).toString('utf8')
     const parsed = JSON.parse(json) as { savedAt?: unknown; header?: unknown; pairs?: unknown }
     if (typeof parsed.savedAt !== 'number') return undefined
-    if (Date.now() - parsed.savedAt > CREDENTIAL_CACHE_TTL_MS) return undefined
+    const age = Date.now() - parsed.savedAt
+    // A negative age means the clock moved backwards (a manual change, a dual
+    // boot, a broken RTC). Treating that as fresh would extend a sealed session
+    // indefinitely — the one case a TTL cannot cover on its own.
+    if (age < 0 || age > CREDENTIAL_CACHE_TTL_MS) return undefined
     if (typeof parsed.header !== 'string' || !Array.isArray(parsed.pairs)) return undefined
     const pairs = new Map<string, string>()
     for (const entry of parsed.pairs) {
@@ -476,7 +516,21 @@ export function loadDoubaoCredentials(options: { force?: boolean } = {}): Doubao
       let failure: DoubaoCredentials | undefined
       let settled: DoubaoCredentials | undefined
       for (const profile of profiles) {
-        const attempt = decryptFromProfile(profile.dir)
+        // One broken candidate must not abort the walk. `decryptFromProfile`
+        // throws on an unreadable Local State or a failing DPAPI call, and a
+        // stale leftover profile with a corrupt file used to bubble into the
+        // outer catch and hide the good session on the next drive.
+        let attempt: DoubaoCredentials
+        try {
+          attempt = decryptFromProfile(profile.dir)
+        } catch (error) {
+          attempt = {
+            ok: false,
+            reason: `${profile.dir}: ${(error as Error).message}`,
+            header: '',
+            pairs: new Map(),
+          }
+        }
         if (attempt.ok) {
           settled = attempt
           break
@@ -588,4 +642,24 @@ function decryptFromProfile(userDataDir: string): DoubaoCredentials {
 /** Drop the in-memory cache. Used by tests and by explicit user refresh. */
 export function invalidateCredentialCache(): void {
   cached = undefined
+}
+
+/**
+ * Revoke the sealed copy on disk as well.
+ *
+ * The sealed cache exists because the Doubao client holds its cookie database
+ * exclusively while it runs, so a cold start can only be served from disk. The
+ * cost is that a session the server has already rejected would otherwise be
+ * handed back for up to twelve hours — every request failing for a reason the
+ * user cannot see or fix. A rejected session is therefore deleted, not merely
+ * expired.
+ */
+export function clearCredentialCache(): void {
+  cached = undefined
+  try {
+    rmSync(credentialCachePath(), { force: true })
+  } catch {
+    // Nothing to revoke, or the file is locked: the in-memory drop above still
+    // applies, and the TTL bounds the rest.
+  }
 }

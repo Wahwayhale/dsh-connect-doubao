@@ -177,14 +177,45 @@ export interface DoubaoChatResult {
   intentionAgent?: string
 }
 
+/**
+ * Extra evidence about a failure, carried on the error itself.
+ *
+ * Classification needs more than the business code: an HTTP status, whether
+ * the transport (fetch/reader) failed, and whether the answer was cut off all
+ * map to different kinds and different retry decisions. Keeping that evidence
+ * on the error means the classifier never has to re-derive it from a message
+ * string, and a throw site can declare its own class when the shape is
+ * unusual (`kind`).
+ */
+export interface DoubaoUpstreamErrorMeta {
+  /** HTTP status of the failing response, when there was one. */
+  httpStatus?: number
+  /** The socket/fetch itself failed — the server never answered. */
+  transport?: boolean
+  /** The stream ended before the reply did: the answer is partial. */
+  truncated?: boolean
+  /** Classify as this kind regardless of code/status. */
+  kind?: DoubaoErrorKind
+}
+
 export class DoubaoUpstreamError extends Error {
+  readonly httpStatus: number | undefined
+  readonly transport: boolean
+  readonly truncated: boolean
+  readonly kindHint: DoubaoErrorKind | undefined
+
   constructor(
     message: string,
     readonly code?: number,
     readonly rateLimited = false,
+    meta: DoubaoUpstreamErrorMeta = {},
   ) {
     super(message)
     this.name = 'DoubaoUpstreamError'
+    this.httpStatus = meta.httpStatus
+    this.transport = meta.transport === true
+    this.truncated = meta.truncated === true
+    this.kindHint = meta.kind
   }
 }
 
@@ -777,11 +808,21 @@ async function streamOnce(
   if (!credentials.ok) {
     throw new DoubaoUpstreamError(
       credentials.reason ?? 'Doubao credentials unavailable.',
+      undefined,
+      false,
+      // Not a network problem: no cookie means "sign in again", and telling the
+      // user to check their connection sends them the wrong way.
+      { kind: 'session_dead' },
     )
   }
   const missing = REQUIRED_COOKIE_NAMES.filter((name) => !credentials.pairs.get(name))
   if (missing.length > 0) {
-    throw new DoubaoUpstreamError(`Doubao session cookies missing: ${missing.join(', ')}`)
+    throw new DoubaoUpstreamError(
+      `Doubao session cookies missing: ${missing.join(', ')}`,
+      undefined,
+      false,
+      { kind: 'session_dead' },
+    )
   }
 
   const msToken = credentials.pairs.get('msToken')
@@ -789,16 +830,32 @@ async function streamOnce(
   const headers = buildHeaders(credentials, { 'content-type': 'application/json' })
   const body = JSON.stringify(buildChatBody(prompt, options))
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body,
-    ...(options.signal ? { signal: options.signal } : {}),
-  })
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body,
+      ...(options.signal ? { signal: options.signal } : {}),
+    })
+  } catch (error) {
+    // A caller abort is not a failure — let the AbortError through untouched so
+    // the shim can tell "user cancelled" from "network broke".
+    if (options.signal?.aborted) throw error
+    throw new DoubaoUpstreamError(
+      `Doubao request did not reach the server: ${(error as Error).message}`,
+      undefined,
+      false,
+      { transport: true },
+    )
+  }
   if (!response.ok) {
     const detail = await response.text().catch(() => '')
     throw new DoubaoUpstreamError(
       `Doubao chat request failed with HTTP ${response.status}. ${detail.slice(0, 200)}`,
+      undefined,
+      false,
+      { httpStatus: response.status },
     )
   }
 
@@ -841,6 +898,10 @@ export async function streamChat(
       if (delta) emittedText = true
       options.callbacks?.onText?.(delta)
     },
+    // Forwarded, or the deep-think deltas die here: consumeStream emits them
+    // through this wrapper, so omitting the field silently swallowed every
+    // reasoning delta and `reasoning_content` was always empty.
+    onThinking: (delta) => options.callbacks?.onThinking?.(delta),
     onEvent: (event) => options.callbacks?.onEvent?.(event),
   }
   const wanted = taskModeEnabled(options)
@@ -1068,7 +1129,19 @@ async function consumeStream(
       for (const frame of frames) handle(frame)
       if (ended) break
     }
+    // Flush the decoder and parse whatever trailing bytes are still buffered:
+    // when the socket closes without a final blank line, the last frame was
+    // left in `buffer` and dropped.
+    const tail = decoder.decode()
+    if (tail) {
+      const { frames, rest } = parseFrames(buffer + tail)
+      buffer = rest
+      for (const frame of frames) handle(frame)
+    }
   } finally {
+    // Cancel before releasing: releasing the lock with the body still unread
+    // leaves the connection (and the upstream turn) running to completion.
+    await reader.cancel().catch(() => {})
     reader.releaseLock()
   }
 
@@ -1087,6 +1160,24 @@ async function consumeStream(
       CODE_TASK_RUNTIME_UNAVAILABLE,
     )
   }
+  // TERMINAL VERDICT.
+  //
+  // Only SSE_REPLY_END means the server finished this reply. A socket that
+  // closes early (proxy reset, idle timeout, client gone) used to be treated as
+  // success: the partial text was returned and the shim wrote
+  // finish_reason:"stop" + [DONE], so a truncated answer looked complete.
+  if (!ended) {
+    const received = texts.join('').length + notifyTexts.join('').length
+    throw new DoubaoUpstreamError(
+      `Doubao closed the stream before the reply finished` +
+        `${received > 0 ? ` after ${received} characters` : ''}; ` +
+        `the answer is incomplete. Retry the turn.`,
+      undefined,
+      false,
+      { truncated: true },
+    )
+  }
+
   // A creation streams the same task several times (placeholder → filled), so
   // collapse by URL and keep first-seen order.
   const uniqueImages = [...new Map(images.map((image) => [image.url, image])).values()]
@@ -1209,12 +1300,39 @@ const THINKING_BLOCK_TYPE = 10040
  */
 const CODE_TASK_RUNTIME_UNAVAILABLE = 710010702
 
-/** Map one upstream error onto its class. */
+/**
+ * Map one upstream error onto its class.
+ *
+ * Order matters: the explicit evidence (code, hint, HTTP status) is consulted
+ * before the generic `upstream` bucket, and the old catch-all was wrong — every
+ * unrecognised failure was reported as `network`, i.e. "check your connection",
+ * for HTTP 400s and business errors that a retry cannot fix.
+ */
 export function classifyDoubaoFailure(error: DoubaoUpstreamError): DoubaoErrorKind {
+  if (error.kindHint !== undefined) return error.kindHint
   if (error.rateLimited || error.code === CODE_RATE_LIMITED) return 'rate_limited'
   if (error.code === CODE_TASK_RUNTIME_UNAVAILABLE) return 'task_runtime_unavailable'
   if (error.code === CODE_SESSION_DEAD) return 'session_dead'
-  return 'network'
+  if (error.httpStatus === 401 || error.httpStatus === 403) return 'session_dead'
+  if (error.httpStatus === 429) return 'quota_exhausted'
+  if (error.transport) return 'network'
+  return 'upstream'
+}
+
+/**
+ * Whether the host should retry this failure.
+ *
+ * Deliberately narrow. Re-sending a turn costs quota AND opens a server-side
+ * thread, so only a failure that provably never produced an answer qualifies:
+ * a transport error before any bytes, or a 5xx. A truncated stream is NOT
+ * retryable here — the retry would be a fresh conversation that silently
+ * abandons the half-received one, so the user is told instead.
+ */
+export function isRetryableFailure(error: unknown): boolean {
+  if (!(error instanceof DoubaoUpstreamError)) return false
+  if (error.transport) return true
+  if (error.httpStatus !== undefined) return error.httpStatus >= 500
+  return false
 }
 
 /**
@@ -1236,7 +1354,7 @@ export const DOUBAO_ERROR_HINTS: Readonly<Record<DoubaoErrorKind, string>> = {
   task_runtime_unavailable:
     '豆包把这个账号路由到了「工作任务」代理，而该任务的执行运行时只存在于豆包客户端进程里，外部客户端接不上。请打开豆包客户端，把输入框上方的开关切回「对话」，然后重试；需要多步执行的话，交给 DSH 自己的工具来做。',
   upstream:
-    '豆包上游返回了未知错误。',
+    '豆包返回了错误响应（不是网络问题，重试通常无效）。',
 }
 
 /** Build a user-facing message for a Doubao failure. */
@@ -1244,7 +1362,8 @@ export function describeDoubaoFailure(error: unknown): string {
   if (error instanceof DoubaoUpstreamError) {
     return `${DOUBAO_ERROR_HINTS[classifyDoubaoFailure(error)]}（${error.message}）`
   }
-  return `${DOUBAO_ERROR_HINTS.network}${(error as Error)?.message ?? ''}`
+  // Not an upstream failure at all — a bug here, not a bad connection.
+  return `豆包请求失败：${(error as Error)?.message ?? String(error)}`
 }
 
 /** Quick reachability probe that does not consume any inference quota. */

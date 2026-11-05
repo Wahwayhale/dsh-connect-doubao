@@ -1,3 +1,9 @@
+# Build output is never tracked. tsdown names the shared chunks by content hash,
+# so every build rewrote these files and the diff said nothing about the change.
+# Publishing is unaffected: npm pack runs prepack -> build, and the package's
+# files field picks lib up from the tarball.
+lib/
+
 node_modules/
 .pnpm-store/
 dist/

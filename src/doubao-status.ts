@@ -34,6 +34,11 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]'])
  */
 function loopbackOrigin(req: IncomingMessage): boolean {
   const origin = req.headers.origin
+  // Absent Origin is the NORMAL case for this card: it fetches its own host
+  // same-origin, and a same-origin request carries no Origin header. Trusting
+  // that absence is why the other two checks below exist — a remote page can
+  // open a same-origin-looking request only if the Host lies (DNS rebinding),
+  // and a browser always labels that attempt cross-site.
   if (origin === undefined || origin.trim() === '') return true
   try {
     const { hostname } = new URL(origin)
@@ -41,6 +46,56 @@ function loopbackOrigin(req: IncomingMessage): boolean {
   } catch {
     return false
   }
+}
+
+/**
+ * Header every write must carry.
+ *
+ * Not a secret — a marker whose only job is to make the request non-simple.
+ * A cross-origin page cannot attach a custom header without a CORS preflight,
+ * and these routes never approve one, so a hostile tab can no longer flip
+ * `profileDir` or the model switches even though it can reach the port.
+ */
+export const WRITE_HEADER = 'x-dsh-doubao-write'
+
+/** Host header must be loopback: a rebound name still sends its own Host. */
+function loopbackHostHeader(req: IncomingMessage): boolean {
+  const host = req.headers.host
+  if (host === undefined || host.trim() === '') return false
+  try {
+    const { hostname } = new URL(`http://${host}`)
+    return LOOPBACK_HOSTS.has(hostname) || hostname === '::1'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * One gate for all four routes.
+ *
+ * Order matters: cheap header checks first, so a rejected request never reaches
+ * the filesystem or the credential store.
+ */
+function guard(req: IncomingMessage, res: ServerResponse, options: { write?: boolean } = {}): boolean {
+  if (!loopbackHostHeader(req)) {
+    json(res, 403, { error: 'host-not-loopback' })
+    return false
+  }
+  // Set by every current browser; absent for curl and for the CLI doctor, which
+  // are on this machine by construction.
+  if (req.headers['sec-fetch-site'] === 'cross-site') {
+    json(res, 403, { error: 'origin-not-trusted' })
+    return false
+  }
+  if (!loopbackOrigin(req)) {
+    json(res, 403, { error: 'origin-not-trusted' })
+    return false
+  }
+  if (options.write === true && req.headers[WRITE_HEADER] === undefined) {
+    json(res, 403, { error: 'missing-write-header' })
+    return false
+  }
+  return true
 }
 
 function json(res: ServerResponse, status: number, payload: unknown): void {
@@ -207,10 +262,7 @@ export function registerDoubaoSaveRoute(
         json(res, 405, { error: 'method not allowed' })
         return
       }
-      if (!loopbackOrigin(req)) {
-        json(res, 403, { error: 'origin-not-trusted' })
-        return
-      }
+      if (!guard(req, res, { write: req.method === 'POST' })) return
       // GET is the READ half, and it exists because the injected settings scope
       // cannot see this plugin's file: the card would otherwise render defaults
       // no matter what was saved.
@@ -290,10 +342,7 @@ export function registerDoubaoProfileRoute(
         json(res, 405, { error: 'method not allowed' })
         return
       }
-      if (!loopbackOrigin(req)) {
-        json(res, 403, { error: 'origin-not-trusted' })
-        return
-      }
+      if (!guard(req, res, { write: false })) return
       try {
         const candidates = deps.candidates()
         json(res, 200, {
@@ -322,10 +371,7 @@ export function registerDoubaoQuotaRoute(
         json(res, 405, { error: 'method not allowed' })
         return
       }
-      if (!loopbackOrigin(req)) {
-        json(res, 403, { error: 'origin-not-trusted' })
-        return
-      }
+      if (!guard(req, res, { write: req.method === 'POST' })) return
       // A POST is an explicit user-driven refresh; a GET reads the 5-minute cache.
       const force = req.method === 'POST'
       if (force) {
@@ -372,10 +418,7 @@ export function registerDoubaoCatalogRoute(
         json(res, 405, { error: 'method not allowed' })
         return
       }
-      if (!loopbackOrigin(req)) {
-        json(res, 403, { error: 'origin-not-trusted' })
-        return
-      }
+      if (!guard(req, res, { write: req.method === 'POST' })) return
       // A POST drops the discovery memo, so the card's 刷新 re-reads the client
       // cache and a model Doubao just shipped can appear without restarting DSH.
       if (req.method === 'POST') invalidateDiscovery()

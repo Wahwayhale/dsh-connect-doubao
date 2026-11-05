@@ -41,11 +41,16 @@ function harness(deps: Parameters<typeof registerDoubaoSaveRoute>[1]) {
     method: string,
     body?: unknown,
     headers: Record<string, string> = {},
+    options: { writeHeader?: boolean } = {},
   ): Promise<Captured> => {
     const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]
+    // A real browser always sends Host, and the guard now requires it to be
+    // loopback. The marker is what a same-origin write carries.
+    const base: Record<string, string> = { host: '127.0.0.1:63052', 'content-type': 'application/json' }
+    if (method === 'POST' && options.writeHeader !== false) base['x-dsh-doubao-write'] = '1'
     const req = {
       method,
-      headers: { 'content-type': 'application/json', ...headers },
+      headers: { ...base, ...headers },
       async *[Symbol.asyncIterator]() { for (const chunk of chunks) yield chunk },
     } as unknown as IncomingMessage
     const captured: Captured = { status: 0, body: {} }
@@ -135,6 +140,39 @@ describe('registerDoubaoSaveRoute', () => {
     expect(res.status).toBe(200)
   })
 
+  it('rejects a write that does not carry the marker header', async () => {
+    let written = false
+    const h = harness({ read: () => ({}), write: () => { written = true } })
+    const result = await h.call('POST', { field: 'toolEmulation', value: true }, {}, { writeHeader: false })
+    expect(result.status).toBe(403)
+    expect(result.body.error).toBe('missing-write-header')
+    expect(written).toBe(false)
+  })
+
+  it('rejects a request whose Host is not loopback', async () => {
+    // DNS rebinding: the page's own hostname resolves to 127.0.0.1, but the
+    // Host header still carries the attacker's name.
+    let written = false
+    const h = harness({ read: () => ({}), write: () => { written = true } })
+    const result = await h.call('POST', { field: 'toolEmulation', value: true }, { host: 'evil.example' })
+    expect(result.status).toBe(403)
+    expect(result.body.error).toBe('host-not-loopback')
+    expect(written).toBe(false)
+  })
+
+  it('rejects a request the browser labels cross-site', async () => {
+    const h = harness({ read: () => ({}), write: () => {} })
+    const result = await h.call('GET', undefined, { 'sec-fetch-site': 'cross-site' })
+    expect(result.status).toBe(403)
+  })
+
+  it('still accepts a plain same-origin read', async () => {
+    // A same-origin fetch sends no Origin at all; that must keep working.
+    const h = harness({ read: () => ({ toolEmulation: true }), write: () => {} })
+    const result = await h.call('GET')
+    expect(result.status).toBe(200)
+  })
+
   it('rejects a field outside the allow-list and does not write', async () => {
     let written = false
     const h = harness({ write: () => { written = true }, read: () => ({}) })
@@ -213,7 +251,11 @@ describe('registerDoubaoProfileRoute', () => {
     }
     registerDoubaoProfileRoute(ctx as never, deps)
     const call = async (method: string): Promise<Captured> => {
-      const req = { method, headers: {}, async *[Symbol.asyncIterator]() { /* no body */ } } as unknown as IncomingMessage
+      const req = {
+        method,
+        headers: { host: '127.0.0.1:63052' },
+        async *[Symbol.asyncIterator]() { /* no body */ },
+      } as unknown as IncomingMessage
       const captured: Captured = { status: 0, body: {} }
       const res = {
         writeHead(status: number) { captured.status = status; return res },

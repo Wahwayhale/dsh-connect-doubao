@@ -38,8 +38,13 @@ import {
   isContinuation,
   sessionKeyOf,
 } from './doubao-session.ts'
-import { loadDoubaoCredentials, type DoubaoCredentials } from './doubao-auth.ts'
-import { chat, DoubaoUpstreamError, classifyDoubaoFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
+import {
+  clearCredentialCache,
+  invalidateCredentialCache,
+  loadDoubaoCredentials,
+  type DoubaoCredentials,
+} from './doubao-auth.ts'
+import { chat, DoubaoUpstreamError, classifyDoubaoFailure, isRetryableFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
 import { fetchQuota, findWindow, millisUntilReset } from './doubao-quota.ts'
 import {
   DOUBAO_IMAGE_MODEL_ID,
@@ -329,6 +334,87 @@ export interface DoubaoShimOptions {
   toolEmulation?: () => boolean
 }
 
+/**
+ * The `error.type` / `error.code` string for one class of failure.
+ *
+ * pi-ai's retry policy reads these names, so they are a contract, not cosmetics:
+ * a non-retryable failure that says TIMEOUT invites a retry storm that cannot
+ * succeed.
+ */
+function errorCodeFor(kind: DoubaoErrorKind, retryable: boolean): string {
+  if (kind === 'rate_limited' || kind === 'quota_exhausted') return 'RATE_LIMIT'
+  if (kind === 'network') return retryable ? 'TIMEOUT' : 'SERVER'
+  return 'SERVER'
+}
+
+/**
+ * Forget a session the server has rejected.
+ *
+ * Both the in-memory copy and the sealed one on disk: a rejected session kept
+ * on disk would be handed back on the next cold start and keep failing for up
+ * to twelve hours, with a message that says "network" or nothing at all. The
+ * user's fix — signing in again in the Doubao app — only takes effect once the
+ * stale copy stops winning.
+ */
+function revokeSession(): void {
+  invalidateCredentialCache()
+  clearCredentialCache()
+}
+
+/**
+ * Per-request cancellation and liveness.
+ *
+ * Two failures share one root cause: nothing ever told the upstream turn to
+ * stop. A client that hung up (Stop button, window closed, Harness shutting
+ * down) left Doubao generating for minutes — spending quota on an answer nobody
+ * would read — and a stream that went silent held the request open with no way
+ * out. Both end in `signal` being aborted, which reaches the socket through
+ * `fetch`, not just our side of it.
+ *
+ * `release` is wired to the response's own terminal events so every exit path
+ * (finished, failed, client gone) tears the watchdog down without each branch
+ * having to remember.
+ */
+export function createRequestLifecycle(
+  res: ServerResponse,
+  options: { idleMs?: number } = {},
+): { signal: AbortSignal; onActivity: () => void; clientGone: () => boolean; release: () => void } {
+  const idleMs = options.idleMs ?? DOUBAO_STREAM_IDLE_TIMEOUT_MS
+  const abort = new AbortController()
+  let gone = false
+  const onClose = (): void => {
+    // `close` also fires after a normal end; only a close before the response
+    // finished means the caller left.
+    if (res.writableEnded) return
+    gone = true
+    abort.abort()
+  }
+  res.on('close', onClose)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const disarm = (): void => {
+    if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
+  }
+  /** Reset the watchdog: an upstream delta is proof of life. */
+  const onActivity = (): void => {
+    disarm()
+    timer = setTimeout(() => {
+      abort.abort(new Error(
+        `豆包 ${Math.round(idleMs / 1000)} 秒内没有返回任何数据，已中止本次请求。`,
+      ))
+    }, idleMs)
+    timer.unref?.()
+  }
+  const release = (): void => {
+    disarm()
+    res.off('close', onClose)
+  }
+  res.once('finish', release)
+  res.once('close', release)
+  onActivity()
+  return { signal: abort.signal, onActivity, clientGone: () => gone, release }
+}
+
 export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
   const resolveCredentials = options.resolveCredentials ?? loadDoubaoCredentials
 
@@ -405,18 +491,24 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     return `http://127.0.0.1:${address.port}`
   }
 
-  /** Translate one Doubao failure into the OpenAI error envelope pi-ai expects. */
+/** Translate one Doubao failure into the OpenAI error envelope pi-ai expects. */
   function writeFailure(res: ServerResponse, error: unknown): void {
+    // A socket that already went away must not be written to: the client asked
+    // for nothing and the write only produces EPIPE noise.
+    if (res.writableEnded || res.destroyed) return
     const kind: DoubaoErrorKind = error instanceof DoubaoUpstreamError
       ? classifyDoubaoFailure(error)
       : 'network'
     const message = (error as Error)?.message ?? 'Doubao upstream failed'
     const status = KIND_STATUS[kind]
-    // The phrasing matters to the host's retry classifier: only genuinely
-    // transient kinds may carry a retryable code, otherwise a slider challenge
-    // would burn the whole retry budget before failing.
-    const code = kind === 'network' ? 'TIMEOUT' : kind === 'quota_exhausted' ? 'RATE_LIMIT' : 'SERVER'
-    writeOpenAIError(res, status, code, message)
+    // The retry flag is decided by the failure, not by its class: a transport
+    // error before any byte is worth retrying, while an HTTP 400 or a truncated
+    // stream is not. Only genuinely transient failures may carry a retryable
+    // code, otherwise a slider challenge would burn the whole retry budget
+    // before failing, and an internal bug would look like a timeout.
+    const retryable = isRetryableFailure(error)
+    if (!res.headersSent) res.setHeader('x-should-retry', retryable ? 'true' : 'false')
+    writeOpenAIError(res, status, errorCodeFor(kind, retryable), message)
   }
 
   /** Stream a completion as OpenAI SSE chunks. */
@@ -440,6 +532,14 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     remember: (conversationId: string | undefined) => void,
     forget: () => void,
     emulate: boolean,
+    lifecycle: {
+      /** Aborted when the client went away or the stream went silent. */
+      signal: AbortSignal
+      /** Called on every upstream delta, to reset the idle watchdog. */
+      onActivity: () => void
+      /** True when the request's client disconnected before we finished. */
+      clientGone: () => boolean
+    },
   ): Promise<void> {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -448,7 +548,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     })
 
     const send = (payload: unknown): void => {
-      if (!res.writableEnded) {
+      if (!res.writableEnded && !res.destroyed) {
         res.write(`data: ${JSON.stringify(payload)}\n\n`)
       }
     }
@@ -457,12 +557,14 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     try {
       const result = await chat(prompt, {
         ...upstreamOptions,
+        signal: lifecycle.signal,
         callbacks: {
           // Private reasoning is forwarded as `reasoning_content`, the field
           // OpenAI-compatible clients read for it. It is NOT mixed into
           // `content`: a client that does not understand it simply ignores it,
           // which is the right degradation.
           onThinking: (delta) => {
+            lifecycle.onActivity()
             if (!roleSent) {
               send({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
               roleSent = true
@@ -470,6 +572,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
             send({ choices: [{ index: 0, delta: { reasoning_content: delta }, finish_reason: null }] })
           },
           onText: (delta) => {
+            lifecycle.onActivity()
             // In emulated mode the fence is still forming, so nothing can be
             // forwarded live; the whole turn is parsed after it completes.
             if (emulate) return
@@ -523,16 +626,29 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       }
       void result
     } catch (error) {
+      const kind: DoubaoErrorKind = error instanceof DoubaoUpstreamError
+        ? classifyDoubaoFailure(error)
+        : 'network'
       // A thread the server no longer knows must not be retried forever: drop it
       // so the NEXT turn opens a fresh conversation instead of failing the same
       // way for the next 30 minutes.
-      if (error instanceof DoubaoUpstreamError && classifyDoubaoFailure(error) === 'session_dead') {
+      if (kind === 'session_dead') {
         forget()
+        revokeSession()
       }
+      // The client hung up (Stop button, window closed, Harness shutting down).
+      // Nothing to report and nobody listening — writing here only produces
+      // EPIPE noise, and the upstream call has already been aborted.
+      if (lifecycle.clientGone()) return
       // The response has already begun, so the failure can only be reported
       // inside the stream. An error chunk is what pi-ai surfaces to the user.
-      send({ error: { message: (error as Error)?.message ?? 'Doubao upstream failed', type: 'SERVER' } })
-      if (!res.writableEnded) {
+      send({
+        error: {
+          message: (error as Error)?.message ?? 'Doubao upstream failed',
+          type: errorCodeFor(kind, isRetryableFailure(error)),
+        },
+      })
+      if (!res.writableEnded && !res.destroyed) {
         res.write('data: [DONE]\n\n')
         res.end()
       }
@@ -676,8 +792,17 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
           `${prompt.slice(0, 1200)}\n---\n`,
         )
       }
+      // ---- cancellation & liveness -------------------------------------
+      //
+      // Both chat paths share this: an abort reaches the upstream socket, and
+      // a stream that stops sending is given up on instead of held forever.
+      const { signal, onActivity, clientGone } = createRequestLifecycle(res)
+
       const upstreamOptions = {
         ...requestOptions(parsed),
+        // Cancellation has to reach the socket, not just our side: without it
+        // the upstream turn keeps running to completion after everyone left.
+        signal,
         ...isContinuationTurn ? { conversationId: known.conversationId, continueConversation: true } : {},
       }
       /** Record the thread id the server handed back, for the next turn. */
@@ -746,6 +871,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         res, prompt, parsed, upstreamOptions, remember,
         () => sessions.forget(sessionKey),
         emulate,
+        { signal, onActivity, clientGone },
       )
     } catch (error) {
       writeFailure(res, error)
@@ -765,7 +891,21 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     token: () => SHARED_SECRET,
     async close() {
       await ready.catch(() => {})
-      await new Promise<void>((resolve) => server.close(() => resolve()))
+      // `server.close()` only stops accepting; it waits for every live
+      // connection to end. An in-flight stream (or a keep-alive client between
+      // requests) therefore kept `dispose` pending for minutes, so the sockets
+      // are dropped explicitly.
+      server.closeAllConnections?.()
+      // `close()` still resolves only once the last connection is really gone,
+      // and a wedged socket must not hold plugin disposal hostage.
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 2_000)
+        timer.unref?.()
+        server.close(() => {
+          clearTimeout(timer)
+          resolve()
+        })
+      })
     },
   }
 }
