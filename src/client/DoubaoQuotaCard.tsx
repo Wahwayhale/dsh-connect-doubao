@@ -144,16 +144,40 @@ async function fetchCatalog(signal: AbortSignal): Promise<DoubaoCatalogView | un
   return (await response.json()) as DoubaoCatalogView
 }
 
+/**
+ * The trailing half of a bar's meta line: when the instant is known, when it
+ * is not, or why it is not.
+ *
+ * "Not started yet" is not the same statement as "unknown": Doubao opens a
+ * weekly window on first use, and saying 「开始使用后计时」 is the truth the app
+ * itself shows, while 「重置时间未知」 would read as a server problem.
+ */
+function instantLabel(t: T, resetsInMs: number | null | undefined, kind: 'reset' | 'expire'): string {
+  if (resetsInMs !== null && resetsInMs !== undefined) {
+    return kind === 'expire'
+      ? t('quota.expiresIn', { time: formatCountdown(resetsInMs) })
+      : t('quota.resetsIn', { time: formatCountdown(resetsInMs) })
+  }
+  return t('quota.resetUnknown')
+}
+
 /** One quota bar: label, used percent, bar, reset countdown. */
 function QuotaBar(props: {
   label: string
   usedPercent: number | undefined
-  /** Null when Doubao sent no window timestamps: the reset instant is unknown. */
+  /** Null when Doubao sent no window timestamps: the instant is unknown. */
   resetsInMs: number | null | undefined
+  /** True when the window only starts counting on first use. */
+  startsOnUse?: boolean | undefined
+  /** Amounts, when the plan reports them: 「已用 782 / 1,600」 reads better than 48%. */
+  usedAmount?: number | null | undefined
+  totalAmount?: number | null | undefined
+  /** What the instant means: a rolling reset, or a grant expiring. */
+  instantKind?: 'reset' | 'expire'
   t: T
   now: number
 }): ReactElement {
-  const { label, usedPercent, resetsInMs, t, now } = props
+  const { label, usedPercent, resetsInMs, startsOnUse, usedAmount, totalAmount, instantKind, t, now } = props
   if (usedPercent === undefined) {
     return (
       <div className="dbq-row">
@@ -176,11 +200,16 @@ function QuotaBar(props: {
       <div className="dbq-row-head">
         <span className="dbq-label">{label}</span>
         <span className="dbq-meta">
-          {t('quota.used', { percent })}
+          {totalAmount !== null && totalAmount !== undefined && totalAmount > 0
+            ? t('quota.usedAmounts', {
+                used: usedAmount ?? 0,
+                total: totalAmount,
+              })
+            : t('quota.used', { percent })}
           {' · '}
-          {resetsInMs === null || resetsInMs === undefined
-            ? t('quota.resetUnknown')
-            : t('quota.resetsIn', { time: formatCountdown(resetsInMs) })}
+          {startsOnUse === true && (resetsInMs === null || resetsInMs === undefined)
+            ? t('quota.startsOnUse')
+            : instantLabel(t, resetsInMs, instantKind === 'expire' ? 'expire' : 'reset')}
         </span>
       </div>
       <div
@@ -569,10 +598,26 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
           <span>{t('quota.plan')}</span>
           <span className="dbq-count">{quota?.plan ?? '—'}</span>
         </div>
+        {(quota?.windows.incentive ?? []).map((window, index) => (
+          <QuotaBar
+            key={`incentive-${index}`}
+            label={window.label ?? t('quota.incentive')}
+            usedPercent={window.usedPercent}
+            resetsInMs={window.resetsInMs}
+            usedAmount={window.usedAmount}
+            totalAmount={window.totalAmount}
+            instantKind="expire"
+            t={t}
+            now={0}
+          />
+        ))}
         <QuotaBar
           label={t('quota.fiveHour')}
           usedPercent={quota?.windows.fiveHour?.usedPercent}
           resetsInMs={quota?.windows.fiveHour?.resetsInMs}
+          startsOnUse={quota?.windows.fiveHour?.startsOnUse}
+          usedAmount={quota?.windows.fiveHour?.usedAmount}
+          totalAmount={quota?.windows.fiveHour?.totalAmount}
           t={t}
           now={0}
         />
@@ -580,6 +625,9 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
           label={t('quota.weekly')}
           usedPercent={quota?.windows.weekly?.usedPercent}
           resetsInMs={quota?.windows.weekly?.resetsInMs}
+          startsOnUse={quota?.windows.weekly?.startsOnUse}
+          usedAmount={quota?.windows.weekly?.usedAmount}
+          totalAmount={quota?.windows.weekly?.totalAmount}
           t={t}
           now={0}
         />

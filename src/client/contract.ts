@@ -21,10 +21,17 @@ export interface DoubaoQuotaWindowView {
   usedPercent: number
   /** Percent still available, 0-100. */
   remainingPercent: number
-  /** Epoch ms when this window resets. */
-  resetsAt: number
-  /** Epoch ms until reset, as computed host-side. */
-  resetsInMs: number
+  /** Epoch ms when this window resets. Null when the server sent no instant. */
+  resetsAt: number | null
+  /** Epoch ms until reset, as computed host-side. Null when unknown. */
+  resetsInMs: number | null
+  /** Server-provided group name, e.g. 「活动赠送额度」. */
+  label: string | null
+  /** True when the window only starts counting on first use. */
+  startsOnUse: boolean
+  /** Raw amounts, when the plan reports them instead of a percentage. */
+  usedAmount: number | null
+  totalAmount: number | null
 }
 
 /** The quota payload `GET|POST {DOUBAO_QUOTA_PATH}` returns. */
@@ -39,6 +46,8 @@ export interface DoubaoQuotaView {
   windows: {
     fiveHour: DoubaoQuotaWindowView | null
     weekly: DoubaoQuotaWindowView | null
+    /** Promotional grants ("活动赠送额度"); usually zero or one. */
+    incentive: DoubaoQuotaWindowView[]
   }
   /** Epoch ms when this reading was taken. */
   fetchedAt: number

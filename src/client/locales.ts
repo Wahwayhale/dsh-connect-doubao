@@ -26,6 +26,10 @@ export const zh = {
   'quota.updatedAt': '更新于 {time}',
   'quota.windowMissing': '未返回该额度窗口',
   'quota.resetUnknown': '重置时间未知',
+  'quota.startsOnUse': '开始使用后计时',
+  'quota.expiresIn': '{time} 后到期',
+  'quota.incentive': '赠送额度',
+  'quota.usedAmounts': '已用 {used} / {total}',
 
   'account.title': '账号状态',
   'account.ok': '已登录',
@@ -101,6 +105,10 @@ export const en: Record<DoubaoCardKey, string> = {
   'quota.updatedAt': 'updated {time}',
   'quota.windowMissing': 'window not reported',
   'quota.resetUnknown': 'reset time unknown',
+  'quota.startsOnUse': 'starts counting on first use',
+  'quota.expiresIn': 'expires in {time}',
+  'quota.incentive': 'Bonus quota',
+  'quota.usedAmounts': '{used} / {total} used',
 
   'account.title': 'Account status',
   'account.ok': 'Signed in',

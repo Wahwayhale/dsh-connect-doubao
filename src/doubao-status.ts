@@ -129,6 +129,10 @@ export interface QuotaWindowView {
   remainingPercent: number
   resetsAt: number | null
   resetsInMs: number | null
+  /** Server-provided group name, e.g. 「活动赠送额度」. */
+  label: string | null
+  /** True when the window only starts counting on first use. */
+  startsOnUse: boolean
   /** Raw amounts, when the plan reports them instead of a percentage. */
   usedAmount: number | null
   totalAmount: number | null
@@ -142,6 +146,8 @@ export interface DoubaoQuotaView {
   windows: {
     fiveHour: QuotaWindowView | null
     weekly: QuotaWindowView | null
+    /** Promotional grants ("活动赠送额度"); usually zero or one. */
+    incentive: QuotaWindowView[]
   }
   fetchedAt: number
   error: string | null
@@ -162,6 +168,8 @@ function viewOf(window: QuotaWindow | undefined): QuotaWindowView | null {
     remainingPercent: window.remainingPercent,
     resetsAt: unknown ? null : window.resetsAt,
     resetsInMs: unknown ? null : millisUntilReset(window),
+    label: window.label ?? null,
+    startsOnUse: window.startsOnUse === true,
     usedAmount: window.usedAmount ?? null,
     totalAmount: window.totalAmount ?? null,
   }
@@ -176,7 +184,14 @@ export async function doubaoQuotaView(options: { force?: boolean } = {}): Promis
     profile: describeProfileLocation(),
     plan: quota.plan ?? null,
     exhausted: quota.exhausted,
-    windows: { fiveHour: viewOf(fiveHour), weekly: viewOf(weekly) },
+    windows: {
+      fiveHour: viewOf(fiveHour),
+      weekly: viewOf(weekly),
+      incentive: quota.windows
+        .filter((window) => window.type === 'incentive')
+        .map((window) => viewOf(window))
+        .filter((window): window is QuotaWindowView => window !== null),
+    },
     fetchedAt: quota.fetchedAt,
     error: quota.error ?? null,
   }

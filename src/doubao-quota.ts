@@ -10,6 +10,8 @@
  *
  *   window_type 1 -> 5-hour limit   (verified: end_time - start_time = 18e6 ms)
  *   window_type 2 -> weekly quota    (verified: end_time - start_time = 604.8e6 ms)
+ *   window_type 3 -> bonus quota     (a promotional grant from `incentive_quota_section`,
+ *                                     with an expiry but no start: "activity bonus quota")
  *
  * The window length was confirmed arithmetically from the server's own
  * timestamps rather than inferred from the UI, so the mapping is pinned.
@@ -20,7 +22,7 @@ import { buildHeaders, buildQueryUrl, QUOTA_ENDPOINT } from './doubao-upstream.t
 /** Quota results are cached briefly so a chatty session does not hammer the API. */
 export const QUOTA_TTL_MS = 5 * 60 * 1000
 
-export type QuotaWindowType = 'five_hour' | 'weekly'
+export type QuotaWindowType = 'five_hour' | 'weekly' | 'incentive'
 
 export interface QuotaWindow {
   type: QuotaWindowType
@@ -48,6 +50,13 @@ export interface QuotaWindow {
   resetUnknown?: boolean
   /** Raw consumed amount, when the server reports it (a "2,100"-style string). */
   usedAmount?: number
+  /** Server-provided group name, e.g. 「活动赠送额度」. */
+  label?: string
+  /**
+   * True when the window has no start instant because it begins counting on
+   * first use. Doubao renders this as 「开始使用后计时」.
+   */
+  startsOnUse?: boolean
   /** Raw entitlement total, same shape as {@link usedAmount}. */
   totalAmount?: number
 }
@@ -96,34 +105,24 @@ function parseAmount(value: string | number | undefined): number | undefined {
 function mapWindowType(value: number): QuotaWindowType | undefined {
   if (value === 1) return 'five_hour'
   if (value === 2) return 'weekly'
+  if (value === 3) return 'incentive'
   return undefined
-}
-
-/**
- * Nominal length of each rolling window, in ms.
- *
- * Verified arithmetically from the server's own timestamps in M2 (5-hour:
- * end-start = 18e6; weekly: 604.8e6). Used ONLY to reconstruct a reset instant
- * when the server reports a window with zeroed timestamps — see
- * {@link normalizeWindow}.
- */
-const WINDOW_MS: Readonly<Record<QuotaWindowType, number>> = {
-  five_hour: 5 * 60 * 60 * 1000,
-  weekly: 7 * 24 * 60 * 60 * 1000,
 }
 
 /**
  * Convert one server window into the shape the UI consumes.
  *
- * A window can come back with `start_time` and `end_time` both zero — observed
- * on a freshly-reset 5-hour window. Passing that through verbatim would render
- * a reset countdown of `0`, i.e. "resets right now", which is worse than
- * useless: the user would read the window as expired while it is actually
- * brand new and fully available. The window LENGTH is still known (it is fixed
- * per window type), so a zeroed window is reconstructed as "opened now, resets
- * one period from now", which is what the server means.
+ * Three shapes are observed:
+ *
+ * - both timestamps present: a rolling window with a real reset instant;
+ * - both zero: the window has not started yet (Doubao renders
+ *   「开始使用后计时」); the reset instant is unknown and MUST NOT be invented;
+ * - only `end_time`: a promotional grant with an expiry but no start.
+ *
+ * Reconstructing a missing start from the nominal window length used to make
+ * the card count down to a moment the server never sent — off by up to a week.
  */
-export function normalizeWindow(raw: RawWindowLimit, now = Date.now()): QuotaWindow | undefined {
+export function normalizeWindow(raw: RawWindowLimit, label?: string): QuotaWindow | undefined {
   const type = raw.window_type === undefined ? undefined : mapWindowType(raw.window_type)
   if (!type) return undefined
   const start = raw.start_time ?? 0
@@ -137,25 +136,27 @@ export function normalizeWindow(raw: RawWindowLimit, now = Date.now()): QuotaWin
       ? Math.min(100, Math.max(0, (usedAmount / totalAmount) * 100))
       : undefined
   const used = typeof raw.used_percent === 'number' ? raw.used_percent : (fromAmounts ?? 0)
-  const degraded = start <= 0 || end <= 0
   const base = {
     type,
     windowType: raw.window_type as number,
     usedPercent: used,
     remainingPercent: Math.max(0, 100 - used),
+    ...(label === undefined || label === '' ? {} : { label }),
     ...(usedAmount === undefined ? {} : { usedAmount }),
     ...(totalAmount === undefined ? {} : { totalAmount }),
   }
-  if (degraded) {
-    // No timestamps: the reset instant is unknown, and inventing one is a lie
-    // the countdown repeats for a whole period.
-    return { ...base, resetsAt: 0, startedAt: 0, windowMs: 0, resetUnknown: true }
+  if (end <= 0) {
+    // Nothing has started: say so instead of counting down to a made-up moment.
+    return { ...base, resetsAt: 0, startedAt: 0, windowMs: 0, resetUnknown: true, startsOnUse: true }
   }
   return {
     ...base,
+    // start 0 with an end means "counts from first use": the expiry is real,
+    // the opening instant simply does not exist yet.
+    ...(start <= 0 ? { startsOnUse: true } : {}),
     resetsAt: end,
-    startedAt: start,
-    windowMs: end > start ? end - start : 0,
+    startedAt: start > 0 ? start : 0,
+    windowMs: start > 0 && end > start ? end - start : 0,
   }
 }
 
@@ -221,27 +222,40 @@ export async function fetchQuota(options: { force?: boolean } = {}): Promise<Dou
       data?: {
         window_limit_section?: {
           usage_exhausted?: boolean
-          window_limit_groups?: Array<{ window_limits?: RawWindowLimit[] }>
+          window_limit_groups?: Array<{ feature_group_name?: string; window_limits?: RawWindowLimit[] }>
         }
         enterprise_window_limit_section?: { usage_exhausted?: boolean }
+        incentive_quota_section?: {
+          usage_exhausted?: boolean
+          window_limit_groups?: Array<{ feature_group_name?: string; window_limits?: RawWindowLimit[] }>
+        }
         current_subscription?: { display?: { short_name?: string; product_name?: string } }
         member_info?: { hasActiveSubscription?: boolean }
       }
     }
 
-    const groups = payload.data?.window_limit_section?.window_limit_groups ?? []
+    // Two sections, one list: the regular windows and the promotional grants
+    // that Doubao shows above them ("活动赠送额度"). Reading only the first
+    // section hid the grant that was actually being consumed.
+    const sections = [
+      payload.data?.window_limit_section,
+      payload.data?.incentive_quota_section,
+    ]
     const windows: QuotaWindow[] = []
-    for (const group of groups) {
-      for (const limit of group.window_limits ?? []) {
-        const normalized = normalizeWindow(limit)
-        if (normalized) windows.push(normalized)
+    for (const section of sections) {
+      for (const group of section?.window_limit_groups ?? []) {
+        for (const limit of group.window_limits ?? []) {
+          const normalized = normalizeWindow(limit, group.feature_group_name)
+          if (normalized) windows.push(normalized)
+        }
       }
     }
 
     const quota: DoubaoQuota = {
       exhausted:
         payload.data?.window_limit_section?.usage_exhausted === true ||
-        payload.data?.enterprise_window_limit_section?.usage_exhausted === true,
+        payload.data?.enterprise_window_limit_section?.usage_exhausted === true ||
+        payload.data?.incentive_quota_section?.usage_exhausted === true,
       windows,
       fetchedAt: now,
     }

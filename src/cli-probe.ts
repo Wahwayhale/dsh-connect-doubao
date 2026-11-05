@@ -90,13 +90,25 @@ async function main(): Promise<number> {
   const quota = await fetchQuota({ force: true })
   const describeWindow = (window: ReturnType<typeof findWindow>): string => {
     if (window === undefined) return 'not offered by this plan'
+    if (window.startsOnUse === true && window.resetUnknown === true) {
+      return `${window.usedPercent}% used, starts counting on first use`
+    }
     if (window.resetUnknown === true) {
       return `${window.usedPercent}% used, reset time unknown`
     }
-    return `${window.usedPercent}% used, resets in ${formatDuration(millisUntilReset(window))}`
+    return `${window.usedPercent}% used, ${formatDuration(millisUntilReset(window))} to reset`
+  }
+  const describeGrant = (window: ReturnType<typeof findWindow>): string => {
+    if (window === undefined) return 'none'
+    const amounts =
+      window.usedAmount !== undefined && window.totalAmount !== undefined
+        ? `${window.usedAmount} / ${window.totalAmount}`
+        : `${window.usedPercent}%`
+    return `${window.label ?? 'bonus'}: ${amounts} used, ${formatDuration(millisUntilReset(window))} to expiry`
   }
   const fiveHour = findWindow(quota, 'five_hour')
   const weekly = findWindow(quota, 'weekly')
+  const grant = findWindow(quota, 'incentive')
   out(options.json
     ? {
         event: 'quota',
@@ -105,6 +117,15 @@ async function main(): Promise<number> {
         exhausted: quota.exhausted,
         fiveHour: fiveHour
           ? { usedPercent: fiveHour.usedPercent, remainingPercent: fiveHour.remainingPercent, resetsIn: formatDuration(millisUntilReset(fiveHour)) }
+          : null,
+        grant: grant
+          ? {
+              label: grant.label ?? null,
+              usedPercent: grant.usedPercent,
+              usedAmount: grant.usedAmount ?? null,
+              totalAmount: grant.totalAmount ?? null,
+              resetsIn: formatDuration(millisUntilReset(grant)),
+            }
           : null,
         weekly: weekly
           ? { usedPercent: weekly.usedPercent, remainingPercent: weekly.remainingPercent, resetsIn: formatDuration(millisUntilReset(weekly)) }
@@ -115,6 +136,7 @@ async function main(): Promise<number> {
           `quota: ${quota.plan ?? 'unknown plan'}${quota.planActive === false ? ' (inactive)' : ''}`,
           `  5-hour limit : ${describeWindow(fiveHour)}`,
           `  weekly quota : ${describeWindow(weekly)}`,
+          `  bonus quota  : ${describeGrant(grant)}`,
         ].join('\n'))
 
   if (quota.exhausted) {

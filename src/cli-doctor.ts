@@ -178,13 +178,25 @@ export async function runDoctor(): Promise<DoctorReport> {
     const quota = await fetchQuota({ force: true })
     const describeWindow = (window: ReturnType<typeof findWindow>): string => {
       if (window === undefined) return 'not offered'
+      if (window.startsOnUse === true && window.resetUnknown === true) {
+        return `${window.usedPercent}% used, starts counting on first use`
+      }
       if (window.resetUnknown === true) {
         return `${window.usedPercent}% used, reset time unknown`
       }
       return `${window.usedPercent}% used, ${formatDuration(millisUntilReset(window))} to reset`
     }
+    const describeGrant = (window: ReturnType<typeof findWindow>): string => {
+      if (window === undefined) return 'none'
+      const amounts =
+        window.usedAmount !== undefined && window.totalAmount !== undefined
+          ? `${window.usedAmount}/${window.totalAmount}`
+          : `${window.usedPercent}%`
+      return `${window.label ?? 'bonus'} ${amounts}, ${formatDuration(millisUntilReset(window))} to expiry`
+    }
     const fiveHour = findWindow(quota, 'five_hour')
     const weekly = findWindow(quota, 'weekly')
+    const grant = findWindow(quota, 'incentive')
     const view = await doubaoQuotaView()
     checks.push({
       name: 'quota',
@@ -194,12 +206,15 @@ export async function runDoctor(): Promise<DoctorReport> {
       status: quota.error === undefined ? 'ok' : 'fail',
       detail:
         quota.error ??
-        `${quota.plan ?? 'unknown plan'}; 5-hour=${describeWindow(fiveHour)}; weekly=${describeWindow(weekly)}`,
+        `${quota.plan ?? 'unknown plan'}; 5-hour=${describeWindow(fiveHour)}; weekly=${describeWindow(weekly)}; bonus=${describeGrant(grant)}`,
       data: {
         plan: quota.plan ?? null,
         exhausted: quota.exhausted,
         fiveHourPercent: fiveHour?.usedPercent ?? null,
         weeklyPercent: weekly?.usedPercent ?? null,
+        grantPercent: grant?.usedPercent ?? null,
+        grantUsedAmount: grant?.usedAmount ?? null,
+        grantTotalAmount: grant?.totalAmount ?? null,
         viewHasNoSecrets: !JSON.stringify(view).match(/sessionid|sid_tt|msToken|odin_tt|ttwid|passport_csrf/i),
       },
     })
