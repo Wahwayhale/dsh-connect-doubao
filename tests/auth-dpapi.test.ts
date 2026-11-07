@@ -38,3 +38,35 @@ describe('DPAPI helper process', () => {
     expect(source).not.toMatch(/spawnSync\(\s*'powershell\.exe'/)
   })
 })
+describe('the client-cookie path stays removed', () => {
+  /**
+   * The decrypt path is gone for a reason that must not be quietly undone: the
+   * Doubao client holds its cookie database with an EXCLUSIVE lock while it runs,
+   * so the live read failed in the normal case, fell back to a 12-hour sealed
+   * copy, and then served a session the server had already rotated — every
+   * request rejected, with local state that still looked signed in.
+   */
+  it('has no client-jar decryption left', () => {
+    expect(source).not.toContain('decryptFromProfile')
+    expect(source).not.toContain('decodeCookiePlaintext')
+    expect(source).not.toContain('decryptCookieValue')
+    expect(source).not.toContain('node:sqlite')
+    expect(source).not.toContain("'Local State'")
+  })
+
+  it('keeps no second sealed cache for a client-sourced session', () => {
+    expect(source).not.toContain("'doubao-credentials.dpapi'")
+    expect(source).toContain("'doubao-credentials-browser.dpapi'")
+  })
+
+  it('reads the one session it has from the browser sign-in', () => {
+    expect(source).toContain('loadBrowserCredentials()')
+    expect(source).toContain('还没有浏览器登录态')
+  })
+
+  it('still re-exports profile discovery for its other callers', () => {
+    // `User Data` is still needed for the task-mode workspace, so the removal
+    // must not take the locator with it.
+    expect(source).toContain('findDoubaoUserDataDir')
+  })
+})

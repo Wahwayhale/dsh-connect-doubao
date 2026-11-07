@@ -94,9 +94,12 @@ export function classifyQuotaView(view: DoubaoQuotaView | undefined): DoubaoAcco
   const text = (view.error ?? '').toLowerCase()
   // A missing profile or a failed decrypt is a LOCAL read failure, not a
   // sign-out: re-logging into the app changes nothing.
-  if (/credential|password data|dpapi|decrypt|profile|encrypted_key|local state/i.test(text)) return 'unreadable'
-  if (/session cookie|sign in|login|710012001|session_dead/i.test(text)) return 'signed_out'
-  if (/710022004|risk|slider|captcha|rate.?limit/i.test(text)) return 'risk_challenge'
+  if (/credential|password data|dpapi|decrypt|profile|encrypted_key|local state|无法解密/i.test(text)) return 'unreadable'
+  // The host's own "no browser session yet" text is Chinese, and so are the
+  // upstream hints, so both languages are matched: a session problem misread as
+  // a network problem sends the user to check their Wi-Fi instead of scanning.
+  if (/session cookie|sign in|login|710012001|session_dead|登录态|重新登录/i.test(text)) return 'signed_out'
+  if (/710022004|risk|slider|captcha|rate.?limit|风控|滑块/i.test(text)) return 'risk_challenge'
   return 'network'
 }
 
@@ -181,42 +184,7 @@ export function enabledModelIdsOf(configured: unknown): string[] | undefined {
   return value.filter((entry): entry is string => typeof entry === 'string')
 }
 
-/** Settings field holding the manually chosen profile directory. */
-export const DOUBAO_PROFILE_DIR_FIELD = 'profileDir'
-
-/** Route that reports which profiles the host detected. */
-export const DOUBAO_PROFILE_PATH = '/plugins/dsh-connect-doubao/profile'
-
-/** One detected profile, as the picker shows it. */
-export interface DoubaoProfileCandidate {
-  dir: string
-  source: string
-}
-
-/** The discovery payload `GET {DOUBAO_PROFILE_PATH}` returns. */
-export interface DoubaoProfileView {
-  ok: boolean
-  /** The profile automatic discovery would use, or null when it found none. */
-  detected: string | null
-  candidates: DoubaoProfileCandidate[]
-  /** Name of the environment variable that overrides everything. */
-  env: string
-  error?: string
-}
-
-/** Read the chosen profile directory out of a settings snapshot. */
-export function profileDirOf(configured: unknown): string {
-  const value = (configured as { profileDir?: unknown } | undefined)?.profileDir
-  return typeof value === 'string' ? value : ''
-}
-
-/**
- * Settings field holding the tool-emulation switch.
- *
- * Declared after `profileDir` on purpose: the card reads the three fields in
- * the order they appear in the settings file, and the file is written in
- * declaration order, so this keeps the JSON readable.
- */
+/** Settings field holding the tool-emulation switch. */
 export const DOUBAO_TOOL_EMULATION_FIELD = 'toolEmulation'
 
 /**
@@ -234,4 +202,26 @@ export function toolEmulationOf(configured: unknown): boolean {
 export function clampPercent(value: number | undefined): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return 0
   return Math.min(100, Math.max(0, value))
+}
+
+/* ------------------------------------------------------------------ *
+ * Session
+ * ------------------------------------------------------------------ */
+
+/** Host route that reports the session and runs a browser sign-in on POST. */
+export const DOUBAO_AUTH_PATH = '/plugins/dsh-connect-doubao/auth'
+
+/**
+ * Payload `GET|POST {DOUBAO_AUTH_PATH}` returns. Counts and instants only.
+ *
+ * No `mode`: the plugin has exactly one way in (a browser QR scan), so the card
+ * has nothing to choose between and no field to branch on.
+ */
+export interface DoubaoAuthView {
+  ok: boolean
+  signedIn: boolean
+  /** Epoch ms of the server-side session expiry, or null when unknown. */
+  expiresAt: number | null
+  daysLeft: number | null
+  detail: string | null
 }

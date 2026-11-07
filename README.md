@@ -1,9 +1,9 @@
 # DSH Connect Doubao
 
-> 把**本机豆包（Doubao）桌面客户端已有的登录态**接入 DeepSeek Harness：**对话模型**与
+> 把**豆包（Doubao）账号**接入 DeepSeek Harness：**对话模型**与
 > **「工作任务」模型**（2.1 Lite / 2.1 Pro / 自动，走会员付费额度）、**Seedream 生图**，
 > 外加一块**只读**额度看板（5 小时限额 / 周额度 / 活动赠送额度，含重置倒计时）。
-> 仅 Windows x64 —— 凭据解密依赖 Windows DPAPI。
+> 登录方式只有一种：**浏览器扫码登录一次**。仅 Windows x64 —— 会话用 Windows DPAPI 密封在本机。
 
 [![npm version](https://img.shields.io/npm/v/dsh-connect-doubao.svg)](https://www.npmjs.com/package/dsh-connect-doubao)
 [![license](https://img.shields.io/npm/l/dsh-connect-doubao.svg)](./LICENSE)
@@ -15,18 +15,22 @@
 
 ## ⚠️ 前置条件（必读）
 
-**本插件复用豆包桌面客户端的登录态，因此必须先在豆包客户端登录。**
+**登录方式只有一种：浏览器扫码登录一次。不需要安装或登录豆包桌面客户端。**
 
-它不会替你登录、也不会输入任何账号密码：它读取豆包客户端已保存在本机的
-Chromium cookie（通过 Windows DPAPI 在本进程内解密），把它当作请求凭据。
+点卡片里的「重新登录」，插件拉起一个独立的 Chromium 窗口打开豆包登录页；你扫码（或手机号
+验证）之后它通过 CDP 取回会话 cookie，并用 Windows DPAPI 密封到
+`%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`。整个流程只在登录那一刻需要人，
+之后都是纯 HTTP 调用。
 
 | 要求 | 说明 |
 | --- | --- |
-| **豆包桌面客户端已登录** | 未登录 → 卡片显示「未登录」，provider 不可用 |
-| **Windows** | 凭据解密依赖 Windows DPAPI。macOS / Linux **不支持** |
+| **扫码登录一次** | 未登录 → 卡片显示「未登录」，provider 不可用 |
+| **Windows** | 会话密封依赖 Windows DPAPI。macOS / Linux **不支持** |
+| 本机有 Chrome 或 Edge | 登录窗口就是它，装在默认路径即可 |
 | 有可用订阅额度 | 免费账号也能连，但配额很小 |
 
-如果你没有登录豆包客户端，插件会明确报错而不是静默失败。
+没有登录态时插件会明确报错（「还没有浏览器登录态。请在豆包卡片里点「重新登录」扫码一次。」），
+而不是静默失败。
 
 ---
 
@@ -37,6 +41,7 @@ Chromium cookie（通过 Windows DPAPI 在本进程内解密），把它当作�
   选中即自动切到任务模式的完整请求形态。
 - **生图（Seedream 5.0）** —— 模型选择器里选「豆包 生图」，回复即以 Markdown 图片返回真实生成图，可直接下载落盘。2026-11-02 实测端到端通过。
 - **推理强度三档** —— 低 / 中 / 高，对应上游 `reasoning_effort` 实测值 **3 / 4 / 5**。
+- **深度思考默认开启** —— 不再需要额外开关：非「工作任务」模型每轮发 `need_deep_think: 3`，任务模型沿用抓包到的真实形态 `10001`。`DSH_DOUBAO_DEEP_THINK=0` 可关掉。
 - **只读额度面板** —— 5 小时限额、周额度、活动赠送额度三条进度条，各带**重置倒计时**；设置面板里手动刷新 + 5 分钟自动刷新。
 - **模型勾选清单** —— 勾选的条目会出现在 DSH 的模型选择器中，请求时按 `model_item_key` 指定模型。
 - **账号状态行** —— 区分「已登录 / 未登录 / 登录信息读不出来」等状态，各自给出不同的处置建议。
@@ -73,7 +78,7 @@ Chromium cookie（通过 Windows DPAPI 在本进程内解密），把它当作�
 
 ### 代码级 / 抓包级证据（非截图）
 
-- `doctor` 五项检查全绿：凭据 29 cookie 解密且 9/9 必需会话 cookie 齐备、账号被上游接受、
+- `doctor` 五项检查全绿：凭据从本机密封会话读出 29 个 cookie 且 9/9 必需会话 cookie 齐备、账号被上游接受、
   shim 绑定回环端口且错误 bearer 返回 401、三个额度窗口可读、模型发现开放 6 个。
 - 推理强度 低=3 / 中=4 / 高=5：由**抓取客户端切换档位时重新序列化的配置 diff**读出，
   并由客户端配置里的 `reasoning_effort_config` 独立确认。
@@ -127,8 +132,19 @@ POST /alice/office/tool_local/msg/complete          # 标记该指令完成
 > 整批就废。这是逆向时最容易踩的坑，`tests/` 里没有钉它（需要真实上游才能复现）。
 
 **推理强度**：低 = `3`、中 = `4`、高 = `5`（由客户端切换档位时重新序列化的配置 diff 读出，
-并由配置里的 `reasoning_effort_config` 独立确认）。深度思考开关本身走
-`need_deep_think: 0`；任务模式下抓到的真实请求固定发 `10001`，档位仍只由 `reasoning_effort` 携带。
+并由配置里的 `reasoning_effort_config` 独立确认）。
+
+**深度思考开关默认打开**（2026-11-07 起）：非「工作任务」模型发 `need_deep_think: 3` 与
+`ext.use_deep_think: "3"`；「工作任务」模型（2.1 Lite / Pro / 自动）沿用官方客户端抓到的真实
+形态 `10001`。设 `DSH_DOUBAO_DEEP_THINK=0` 可恢复成不思考的普通回合。档位始终只由
+`reasoning_effort` 携带，与开关是两个独立的轴。
+
+「豆包 快速」**不参与思考**：深度思考全开、档位拉到高，它的回复仍是 `thinking: false`，流里也没有
+`10040` 思考容器。所以它被标记为不可推理，模型选择器不再给它显示低/中/高。
+
+> **思考过程为什么看不见**：开关打开后服务端确实在思考（响应里出现 `10040` 思考容器和 `10091`
+> 计时块），但**推理正文不下发**。2026-11-07 用官方客户端抓包对照确认：思考容器的子块只有一个
+> `summary: "正在思考"`，正文块里只有正式答案。这是接口限制，不是插件丢内容。
 
 ---
 
@@ -225,11 +241,12 @@ POST /alice/office/tool_local/msg/complete          # 标记该指令完成
 DSH (pi-ai provider)
   └─ doubao-adapter ──► 本机 loopback shim (127.0.0.1，仅本进程密钥)
                          └─ doubao-upstream ──► 豆包 /chat/completion
-                                                 （带上本机读到的会话 cookie）
+                                                （带上密封会话里的 cookie）
 ```
 
-1. **凭据**：从豆包客户端的 Chromium cookie jar 读取，用 Windows DPAPI 在**本进程内**解密。
-   cookie 值**从不**写入磁盘、日志、命令行或网络请求以外的任何地方。
+1. **凭据**：只来自浏览器扫码 —— 一次 CDP `Storage.getCookies`，立刻用 Windows DPAPI
+   密封到 `~/.dsh/doubao-credentials-browser.dpapi`；读出的值只进请求头，**从不**写日志、
+   命令行、环境变量或其它文件。
 2. **provider**：把 pi-ai 的 OpenAI 形状请求翻译成豆包方言（`bot_id` + `reasoning_effort`）。
 3. **流式**：上游的三行帧被解析成 pi-ai 的事件流，工具调用 / 压缩 / 权限仍由 Harness 掌控。
 4. **只读路由**：`/plugins/dsh-connect-doubao/quota` 与 `/catalog` 提供额度与目录，
@@ -276,42 +293,25 @@ dsh plugin --profile desktop add "E:\path\to\dsh-connect-doubao"
 | macOS | ❌ 不支持（DPAPI 是 Windows 专有） |
 | Linux | ❌ 不支持（同上） |
 
-凭据查找逻辑（`listDoubaoProfiles`，`src/doubao-profile.ts`）按**代价从低到高**尝试五层：
+**登录态**只有一个来源（`src/doubao-auth.ts` + `src/doubao-auth-browser.ts`）：
 
-0. **设置卡片里手动选的目录** —— 点「豆包数据目录」那段的「选择目录…」，桌面端会弹原生文件夹
-   对话框。选中的目录必须含 `Default\Network\Cookies`，否则拒绝保存并当场提示；目录后来被
-   删掉则自动退回下面几层，不会把凭据加载卡死。指到 `User Data` 或它的父目录（如 `D:\Doubao`）
-   都行。
-1. **环境变量 `DSH_DOUBAO_PROFILE`** —— 手动指定，指到 `User Data` 目录或它的父目录都行。
-   给脚本化部署留的口子，也是第 0 层之外的第二逃生门。
-2. **AppData 候选**（4 次 `existsSync`，几乎免费）：
-   `%LOCALAPPDATA%\Doubao\User Data`、`%APPDATA%\Doubao\User Data`、
-   `C:\Users\<各用户>\AppData\Local\Doubao\User Data`。
-3. **正在运行的客户端自报家门** —— 读 `Doubao.exe` 进程命令行里的 `--user-data-dir=`。
-   这是**最准**的一层：那是客户端自己写进去的真实路径，不需要任何猜测。
-   代价是要起一个 `powershell.exe`（本机实测约 0.7–0.8 s），所以只在第 1、2 层都没命中时才跑。
-4. **限时扫盘兜底** —— 从每个存在的盘符根开始做深度 4 的广度优先搜索，找
-   `…\Default\Network\Cookies`。默认预算 1500 ms，跳过 `Windows`、`$RECYCLE.BIN`、
-   `node_modules` 等目录。只在前面四层全部落空时启用。
+1. 卡片点「重新登录」→ 拉一个独立的 Chromium 用户目录（`~/.dsh/doubao-browser-profile`），
+   打开 `https://www.doubao.com/chat/`；
+2. 扫码（或手机号验证）完成 → 通过 CDP `Storage.getCookies` 一次取回全部 cookie；
+3. 只保留豆包/Bytedance 域下、且 9 个必需会话 cookie 齐备的那份，用 Windows DPAPI
+   密封到 `%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`（当前用户作用域，别的账户和
+   别的机器解不开）；
+4. 之后所有请求只读这个密封文件，进程内缓存 10 分钟。
 
-命中条件一律是存在 `Default\Network\Cookies`，空目录不算。
+**为什么不再解密豆包客户端的 cookie。** 客户端运行时对 `Default\Network\Cookies` 持**独占锁**，
+而本插件恰恰是为「客户端正在运行」的账号准备的：读不到 → 回退到 12 小时前的密封副本 →
+服务端早已换过会话 → 每个请求都被上游拒绝，而本地状态还显示「已登录」，用户无从判断。
+浏览器扫码没有这个死结：cookie 是当场抓到的，密封的也是刚抓到的，不存在更旧的副本可用。
 
-返回的是**列表**而不是单个路径，因为「复制而不是移动」会留下空壳：把 `User Data` 拷到 D 盘的
-人，C 盘还留着一个能命中 `Cookies` 但已经登出的旧目录。`loadDoubaoCredentials` 按顺序逐个试，
-第一个真的解出可用会话的才算数，失败原因保留最早的那个（那才是用户想修的那个）。
-
-`node lib/cli-doctor.js` 的 `credentials` 会告诉你实际用了哪个：`profile` 是命中的那个
-（带来源，如 `(via process)`），`candidates` 是按顺序找到的全部。
-
-**为什么顺序是"便宜优先"而不是"最准优先"**：常见情况下第 2 层就命中，不能为了 0.8 s 的
-进程探测让每次冷启动都变慢。而真正把数据搬到 D 盘的人，第 3 层一定能救回来。
-
-**为什么返回的是列表而不是单个路径**：有人是"复制"而不是"移动"过去的，AppData 里会留下
-一个空壳。`loadDoubaoCredentials` 会按顺序逐个尝试解密，取**第一个真正能解出可用会话**的
-那份；全失败时才报第一个候选的错误原因（那才是用户想修的那个）。
-
-`dsh-connect-doubao-doctor --json` 的 `credentials.data` 里同时给出 `profile`（最终用的是哪个、
-`via env|appdata|process|scan`）和 `candidates`（全部候选，按优先级）—— 出问题时要先看这两项。
+**数据目录（与登录无关）。** `listDoubaoProfiles`（`src/doubao-profile.ts`）按代价从低到高：
+配置文件里的 `profileDir` / 环境变量 `DSH_DOUBAO_PROFILE` → AppData 候选 → 运行中客户端的
+`--user-data-dir` → 限时扫盘。它现在只用于模型清单的客户端缓存与「工作任务」模式的本地工作区；
+命中不到时工作区退回临时目录，仍然可以对话。
 
 ---
 
@@ -369,13 +369,12 @@ npm run check       # 以上全部
    所以**没有**一个响应侧的字段可以拿来证明"服务端真的用了你选的那个模型"。
    本插件能确定的是：它把 `model_item_key` 随请求发出（这已抓包确认）。
    至于服务端如何解释这个键，只能由服务端回答。
-4. **仅 Windows。** 凭据解密依赖 DPAPI。
-   **User Data 不在 `%LOCALAPPDATA%` 也能用**：设置卡片里可以点「选择目录…」直接指定，
-   也可以留空让插件自动探测（环境变量 `DSH_DOUBAO_PROFILE`、AppData 候选、运行中客户端的
-   `--user-data-dir`、限时扫盘，见上文「凭据查找逻辑」）。全部失效时才报
-   `Doubao user profile not found`。浏览器形态的宿主没有原生目录对话框，那一层的按钮会
-   明确报错，此时请改用 `DSH_DOUBAO_PROFILE`。
-5. **风控滑块无法自动处理。** 触发后需去豆包客户端手动发一条消息完成验证。
+4. **仅 Windows。** 会话密封依赖 DPAPI（macOS / Linux 不支持）。
+   豆包客户端**不需要**安装：登录态只来自浏览器扫码。数据目录只在两处还会被读到 ——
+   模型清单缓存与「工作任务」模式的本地工作区 —— 自动探测几层（配置文件里的 `profileDir`、
+   环境变量 `DSH_DOUBAO_PROFILE`、AppData 候选、运行中客户端的 `--user-data-dir`、限时扫盘）；
+   全落空时工作区退回临时目录，**不再影响登录**。
+5. **风控滑块无法自动处理。** 触发后需在弹出的登录窗口里手动完成验证，再点一次「重新登录」。
 6. **图片输入未提供。** 本 provider 只发送文本块，不转发图片。
 7. **单账号。** 没有账号池、没有区域切换、没有签到。
 8. **「工作任务」能跑，但扣不扣费取决于这一轮做了什么。** `agent_mode` 的取值是

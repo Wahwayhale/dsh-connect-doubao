@@ -234,8 +234,15 @@ export interface DoubaoModelInfo {
    * TWO Turbo entries and only the retiring one carries it.
    */
   badge?: string
-  /** Every model in the current catalog offers the reasoning-effort picker. */
-  reasoning: true
+  /**
+   * Whether this route can actually think.
+   *
+   * NOT the same as "the app shows a reasoning-effort picker for it": the picker
+   * is drawn from the app's own model menu, while this flag is what DSH uses to
+   * decide whether to offer 低/中/高 at all. Measured 2026-11-07 — see
+   * {@link NO_THINKING_MODEL_IDS}.
+   */
+  reasoning: boolean
   /** True when the model runs in 「工作任务」 (`mode_id: "3"`, `agent_mode: 1`) mode. */
   taskMode?: boolean
 }
@@ -264,7 +271,12 @@ export interface DoubaoModelInfo {
  * happens to work.
  */
 export const DOUBAO_MODELS: readonly DoubaoModelInfo[] = [
-  { id: '0', name: '豆包 快速', reasoning: true },
+  // 「豆包 快速」 is the no-CoT route: measured 2026-11-07 with the 深度思考
+  // switch ON and effort 高, the reply still came back `thinking: false` and the
+  // frames carried no 10040 container, while the same request on 2.1 Pro flipped
+  // to `thinking: true`. Declaring `reasoning: false` is therefore what makes the
+  // picker honest — it stops offering 低/中/高 on a route that cannot think.
+  { id: '0', name: '豆包 快速', reasoning: false },
   { id: '3', name: '豆包 2.1 Turbo', badge: '专家', reasoning: true },
   { id: 'seed-lite-7b', name: '豆包 2.1 Lite', badge: '工作任务', reasoning: true, taskMode: true },
   { id: '5', name: '豆包 2.1 Pro', badge: '工作任务', reasoning: true, taskMode: true },
@@ -323,6 +335,23 @@ export interface DiscoveredDoubaoModel {
   maxTokens: number
   inputModalities: ('text' | 'image')[]
   reasoning: boolean
+}
+
+/**
+ * Model ids measured to never think, whatever the 深度思考 switch says.
+ *
+ * 「豆包 快速」 is served by a no-CoT agent: with the switch ON and effort 高 the
+ * reply still came back `thinking: false` and the frames carried no 10040
+ * container, while the identical request on 2.1 Pro flipped to `thinking: true`.
+ * Discovered catalogs come from the client's own menu dump, which marks every
+ * entry as reasoning-capable, so this set has to be applied AFTER discovery —
+ * otherwise the picker would keep advertising a control that does nothing.
+ */
+export const NO_THINKING_MODEL_IDS: ReadonlySet<string> = new Set(['0'])
+
+/** Whether a model can think, by measurement rather than by menu declaration. */
+export function supportsReasoning(id: string): boolean {
+  return !NO_THINKING_MODEL_IDS.has(id)
 }
 
 /**
@@ -390,11 +419,16 @@ export function doubaoCatalogEntries(
     id: model.id,
     name: model.name,
     badge: model.badge ?? null,
-    reasoningLevels: DOUBAO_REASONING_LEVELS.map((level) => ({
-      id: level.id,
-      name: level.name,
-      level: level.level,
-      verified: level.verified,
-    })),
+    // Empty for a no-CoT route. Advertising 低/中/高 here while the DSH picker
+    // hides them would make the card and the picker disagree about the same
+    // model, and the card is the one a user checks first.
+    reasoningLevels: model.reasoning
+      ? DOUBAO_REASONING_LEVELS.map((level) => ({
+        id: level.id,
+        name: level.name,
+        level: level.level,
+        verified: level.verified,
+      }))
+      : [],
   }))
 }

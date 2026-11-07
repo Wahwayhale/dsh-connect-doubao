@@ -50,6 +50,7 @@ import {
   DOUBAO_IMAGE_MODEL_ID,
   DOUBAO_MODELS,
   findDoubaoModel,
+  isTaskModel,
   SKILL_CARRIER_MODEL_ID,
   type DoubaoSkillName,
 } from './doubao-catalog.ts'
@@ -240,8 +241,30 @@ function requestOptions(parsed: InboundChatRequest): {
   modelKey?: string
   reasoningLevel?: 'low' | 'mid' | 'high'
   skill?: DoubaoSkillName
+  deepThink?: boolean
 } {
   const level = toDoubaoLevel(parsed.reasoning_effort)
+  /**
+   * The 深度思考 switch, ON by default.
+   *
+   * The level the picker sends only reaches the wire as `reasoning_effort`
+   * (3/4/5), and the server ignores it for thinking unless this switch is also
+   * open: measured 2026-11-07, the same model answered with `thinking: false`
+   * while effort was already 5, because every turn went out as an ordinary one
+   * with `need_deep_think: 0`. Without this the picker's 低/中/高 is a control
+   * that changes nothing — which is exactly what it looked like.
+   *
+   * `DSH_DOUBAO_DEEP_THINK=0` turns it back off, for the one case worth
+   * debugging that way: a thinking turn whose first token arrives much later.
+   *
+   * 「工作任务」 models are deliberately left UNSET rather than sent `true`:
+   * their captured shape is `need_deep_think: 10001`, and `buildChatBody` only
+   * emits it while `deepThink` is `undefined`. Passing a boolean here would
+   * silently downgrade every task turn to the chat shape.
+   */
+  const think = isTaskModel(parsed.model)
+    ? {}
+    : { deepThink: process.env.DSH_DOUBAO_DEEP_THINK !== '0' }
   // 「豆包 生图」 is a DSH-side alias, not a Doubao model_item_key: Doubao has no
   // model by that name. Selecting it runs an ordinary chat turn under the
   // imageGen skill, which is what makes the reply carry a creation block. The
@@ -250,10 +273,12 @@ function requestOptions(parsed: InboundChatRequest): {
     return {
       modelKey: SKILL_CARRIER_MODEL_ID,
       skill: 'imageGen',
+      ...think,
       ...level === undefined ? {} : { reasoningLevel: level },
     }
   }
   return {
+    ...think,
     ...parsed.model === undefined ? {} : { modelKey: parsed.model },
     ...level === undefined ? {} : { reasoningLevel: level },
   }
@@ -350,11 +375,11 @@ function errorCodeFor(kind: DoubaoErrorKind, retryable: boolean): string {
 /**
  * Forget a session the server has rejected.
  *
- * Both the in-memory copy and the sealed one on disk: a rejected session kept
- * on disk would be handed back on the next cold start and keep failing for up
- * to twelve hours, with a message that says "network" or nothing at all. The
- * user's fix — signing in again in the Doubao app — only takes effect once the
- * stale copy stops winning.
+ * Both the in-memory copy and the sealed one on disk: the sealed session has no
+ * TTL (its real deadline is the server's, not a local clock), so leaving it in
+ * place would hand the rejected cookie back on every later request — with the
+ * card still showing a signed-in account, which makes the user's fix (「重新登录」)
+ * look like it did nothing.
  */
 function revokeSession(): void {
   invalidateCredentialCache()

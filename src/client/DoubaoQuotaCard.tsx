@@ -28,21 +28,19 @@ import {
   DOUBAO_ENABLED_MODELS_FIELD,
   DOUBAO_QUOTA_PATH,
   DOUBAO_SAVE_PATH,
+  DOUBAO_AUTH_PATH,
   classifyQuotaView,
   clampPercent,
   enabledModelIdsOf,
   DOUBAO_TOOL_EMULATION_FIELD,
-  DOUBAO_PROFILE_DIR_FIELD,
-  DOUBAO_PROFILE_PATH,
-  profileDirOf,
   toolEmulationOf,
   formatCountdown,
 } from './contract.ts'
 import type {
   DoubaoAccountState,
+  DoubaoAuthView,
   DoubaoCatalogView,
   DoubaoModelEntry,
-  DoubaoProfileView,
   DoubaoQuotaView,
 } from './contract.ts'
 import type { DoubaoCardKey, Translate } from './locales.ts'
@@ -553,74 +551,6 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
    * while the value never lands (see `onSave`), and silently failing to turn OFF
    * a capability that lets a model touch files is the worse error.
    */
-  // ---- profile directory ------------------------------------------------
-  const [profile, setProfile] = useState<DoubaoProfileView | undefined>(undefined)
-  const [profileBusy, setProfileBusy] = useState(false)
-  const [profileError, setProfileError] = useState<string | null>(null)
-
-  const loadProfile = useCallback(async (): Promise<void> => {
-    try {
-      const response = await fetch(DOUBAO_PROFILE_PATH, { method: 'GET' })
-      if (!response.ok) throw new Error(`HTTP ${String(response.status)}`)
-      setProfile(await response.json() as DoubaoProfileView)
-    } catch (error: unknown) {
-      setProfileError((error as Error)?.message ?? 'unknown error')
-    }
-  }, [])
-
-  useEffect(() => { void loadProfile() }, [loadProfile])
-
-  const chosenProfile = profileDirOf(configured)
-  /** What is actually in use right now: the manual pick, else auto-detection. */
-  const activeProfile = chosenProfile !== '' ? chosenProfile : (profile?.detected ?? '')
-
-  /**
-   * Open the host's native folder picker.
-   *
-   * The desktop shell exposes `__DSH_DIRECTORY_PICKER__.pick()` — an Electron
-   * dialog that runs on the main thread and can therefore create a folder. A
-   * browser-only host has no equivalent, and the card says so rather than
-   * silently doing nothing; `DSH_DOUBAO_PROFILE` remains the escape hatch.
-   */
-  const pickProfile = useCallback(async (): Promise<void> => {
-    setProfileError(null)
-    setProfileBusy(true)
-    try {
-      const desktop = (globalThis as {
-        __DSH_DIRECTORY_PICKER__?: { pick?: () => Promise<string | null> }
-      }).__DSH_DIRECTORY_PICKER__
-      if (typeof desktop?.pick !== 'function') throw new Error('no native picker on this host')
-      const picked = await desktop.pick()
-      // Cancelled — the picker resolves null and the card must stay as it was.
-      if (picked === null || picked === '') return
-      const committed = profileDirOf(await persistField(DOUBAO_PROFILE_DIR_FIELD, picked))
-      // The host validates the path before storing it; a save that came back
-      // empty means the folder held no Cookies and nothing was written.
-      setProfileError(committed === '' ? t('profile.invalid') : null)
-      if (committed !== '') {
-        void loadProfile()
-        // A new profile means a new account: re-read the quota immediately
-        // rather than showing the previous profile's numbers for up to 5 min.
-        void onRefresh()
-      }
-    } catch (error: unknown) {
-      setProfileError(t('profile.pickFailed', { reason: (error as Error)?.message ?? 'unknown' }))
-    } finally {
-      setProfileBusy(false)
-    }
-  }, [persistField, loadProfile, onRefresh, t])
-
-  const clearProfile = useCallback(async (): Promise<void> => {
-    setProfileError(null)
-    try {
-      await persistField(DOUBAO_PROFILE_DIR_FIELD, '')
-      void loadProfile()
-      void onRefresh()
-    } catch (error: unknown) {
-      setProfileError((error as Error)?.message ?? 'unknown error')
-    }
-  }, [persistField, loadProfile, onRefresh])
-
   const toolsOn = toolEmulationOf(configured)
   const [toolsError, setToolsError] = useState<string | null>(null)
   const onToggleTools = useCallback(async (next: boolean): Promise<void> => {
@@ -636,6 +566,74 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
       setToolsError(t('models.saveFailed', { reason: (error as Error)?.message ?? 'unknown error' }))
     }
   }, [persistField, t])
+
+  // ---- session ----------------------------------------------------------
+  /**
+   * The session, read from its own route.
+   *
+   * Deliberately NOT taken from the settings snapshot: what is signed in is not
+   * a setting. The route reads the sealed session itself, so it is the only
+   * honest source for "signed in / expires in N days".
+   */
+  const [auth, setAuth] = useState<DoubaoAuthView | undefined>(undefined)
+  const [authBusy, setAuthBusy] = useState(false)
+  const [authError, setAuthError] = useState<string | null>(null)
+
+  const loadAuth = useCallback(async (): Promise<void> => {
+    try {
+      const response = await fetch(DOUBAO_AUTH_PATH, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+      })
+      if (!response.ok) throw new Error(`HTTP ${String(response.status)}`)
+      setAuth(await response.json() as DoubaoAuthView)
+    } catch (error: unknown) {
+      setAuthError((error as Error)?.message ?? 'unknown error')
+    }
+  }, [])
+
+  useEffect(() => { void loadAuth() }, [loadAuth])
+
+  const postAuth = useCallback(async (): Promise<DoubaoAuthView> => {
+    const response = await fetch(DOUBAO_AUTH_PATH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...WRITE_HEADERS },
+      // The route accepts exactly this one body; anything else is a 400.
+      body: JSON.stringify({ action: 'login' }),
+    })
+    const detail = await response.json().catch(
+      () => ({ error: `HTTP ${String(response.status)}` }),
+    ) as DoubaoAuthView & { error?: unknown }
+    if (!response.ok || detail.ok !== true) {
+      throw new Error(String(detail.error ?? `HTTP ${String(response.status)}`))
+    }
+    setAuth(detail)
+    return detail
+  }, [])
+
+  /**
+   * Start a fresh browser sign-in.
+   *
+   * The route holds this request open for the whole scan, so the button has to
+   * survive a multi-minute wait — `authBusy` is what keeps the user from firing
+   * three overlapping browser windows.
+   */
+  const relogin = useCallback(async (): Promise<void> => {
+    setAuthError(null)
+    setAuthBusy(true)
+    try {
+      const view = await postAuth()
+      if (!view.signedIn) {
+        setAuthError(t('auth.loginFailed', { reason: view.detail ?? 'unknown error' }))
+      } else {
+        void onRefresh()
+      }
+    } catch (error: unknown) {
+      setAuthError(t('auth.loginFailed', { reason: (error as Error)?.message ?? 'unknown error' }))
+    } finally {
+      setAuthBusy(false)
+    }
+  }, [postAuth, onRefresh, t])
 
   // ---- render -----------------------------------------------------------
   const state: DoubaoAccountState = classifyQuotaView(quota)
@@ -711,39 +709,37 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
         )}
       </div>
 
-      {/* ---- data directory ------------------------------------------- */}
+      {/* ---- session --------------------------------------------- */}
       <div className="dbq-section">
         <div className="dbq-section-title">
-          <span>{t('profile.title')}</span>
+          <span>{t('auth.title')}</span>
           <span className="dbq-count">
-            {chosenProfile !== '' ? t('profile.manual') : (profile?.detected != null ? t('profile.detected') : t('profile.none'))}
+            {auth === undefined
+              ? '—'
+              : auth.signedIn ? t('auth.signedIn') : t('auth.signedOut')}
           </span>
         </div>
-        {activeProfile !== '' && (
-          <div className="dbq-profile">{t('profile.current')}: {activeProfile}</div>
+        {auth?.signedIn === true && (
+          <div className="dbq-note">
+            {auth.expiresAt === null
+              ? t('auth.expiryUnknown')
+              : t('auth.expires', { days: auth.daysLeft ?? 0 })}
+          </div>
         )}
-        <div className="dbq-note">{t('profile.hint')}</div>
+        {auth?.signedIn === false && auth.detail !== null && (
+          <div className="dbq-note dbq-warn">{auth.detail}</div>
+        )}
         <div className="dbq-actions">
           <button
             type="button"
-            className="dbq-btn"
-            onClick={() => void pickProfile()}
-            disabled={profileBusy || !canWrite}
+            className="dbq-btn dbq-primary"
+            onClick={() => void relogin()}
+            disabled={!canWrite || authBusy || auth === undefined}
           >
-            {profileBusy ? t('profile.picking') : t('profile.pick')}
+            {authBusy ? t('auth.relogining') : t('auth.relogin')}
           </button>
-          {chosenProfile !== '' && (
-            <button type="button" className="dbq-btn" onClick={() => void clearProfile()} disabled={profileBusy}>
-              {t('profile.clear')}
-            </button>
-          )}
         </div>
-        {profile !== undefined && profile.candidates.length > 0 && (
-          <div className="dbq-candidates">
-            {profile.candidates.map(entry => `${entry.dir} (${entry.source})`).join('\n')}
-          </div>
-        )}
-        {profileError !== null && <span className="dbq-error">{profileError}</span>}
+        {authError !== null && <span className="dbq-error">{authError}</span>}
       </div>
 
       {/* ---- model checklist ---- */}

@@ -35,6 +35,7 @@ import {
   DOUBAO_IMAGE_MODEL_ID,
   DOUBAO_IMAGE_MODEL_NAME,
   isTaskModel,
+  supportsReasoning,
   type DoubaoModelInfo,
 } from './doubao-catalog.ts'
 
@@ -226,7 +227,9 @@ export function discoverModels(now = Date.now()): DoubaoModelInfo[] | undefined 
         id: entry.key,
         name: staticMatch?.name ?? entry.name,
         ...(staticMatch?.badge !== undefined ? { badge: staticMatch.badge } : {}),
-        reasoning: true as const,
+        // The menu dump flags every entry as reasoning-capable; whether it can
+        // actually think is a measurement, not a menu property.
+        reasoning: supportsReasoning(entry.key),
         ...(taskMode ? { taskMode: true } : {}),
       }
     })

@@ -1,64 +1,59 @@
 /**
- * Doubao credential extraction.
+ * Doubao credentials — the sealed browser session, and the DPAPI helper under it.
  *
- * The Doubao desktop app is a Chromium fork. Its sign-in lives in the
- * standard Chromium cookie jar, so an already-signed-in app can serve as the
- * credential source for an external client without any interactive login.
+ * WHY THERE IS ONLY ONE SOURCE
  *
- * Decryption chain (verified end-to-end against Doubao 2.29.10):
+ * This module used to decrypt the desktop client's cookie jar: read the DPAPI
+ * master key out of `<User Data>\Local State`, open
+ * `<User Data>\Default\Network\Cookies` as SQLite, AES-GCM each `v10` value and
+ * strip Chrome's host-binding prefix. It was removed, not merely deprecated,
+ * because of a defect that no amount of care could fix from outside the app:
  *
- *   <User Data>\Local State
- *     -> os_crypt.encrypted_key            (base64 string)
- *     -> strip the leading b"DPAPI" magic   (5 bytes)
- *     -> CryptUnprotectData                 (Windows DPAPI, user scope)
- *     -> 32-byte master key
+ *   the client holds `Default\Network\Cookies` with an EXCLUSIVE lock while it
+ *   runs, and this plugin exists precisely for an account whose app IS running.
+ *   So the live read failed in the normal case, the code fell back to a 12-hour
+ *   sealed copy, and once the server rotated the session every request was
+ *   rejected upstream — with a local state that still looked "signed in", and
+ *   therefore no local explanation for the user.
  *
- *   <User Data>\Default\Network\Cookies     (SQLite)
- *     -> encrypted_value, scheme "v10"
- *     -> AES-256-GCM(nonce = value[3..15], aad = none)
- *     -> plaintext = sha256(host_key).digest()[0..N) || cookie_value
- *     -> strip that N-byte host prefix
+ * The browser sign-in in `./doubao-auth-browser.ts` has neither of those
+ * failure modes: it captures the cookies over CDP from a throwaway Chromium
+ * profile, so there is no lock to lose, and what this module seals is exactly
+ * what was just captured, so there is no stale copy to prefer. One source also
+ * means one account: no fallback can silently serve whoever else happened to be
+ * signed in somewhere on this machine.
  *
- * The N-byte prefix is the part that is easy to get wrong. Chrome 130+ binds
- * each plaintext to its host with `sha256(host_key)`; older builds stored the
- * bare value. Guessing wrong yields a value with trailing binary garbage,
- * which fails far downstream as an opaque "session expired" from the server.
- * `decodeCookiePlaintext` therefore adapts N instead of hardcoding it.
+ * SECURITY: cookie values live in this process's memory and in one file sealed
+ * with Windows DPAPI (current-user scope), which no other Windows account and no
+ * other machine can open. Nothing here is logged, and nothing leaves except the
+ * outbound request's `Cookie:` header.
  *
- * SECURITY: credentials live in this process's memory only. Nothing here is
- * ever written to disk, exported, or logged. Callers must treat the returned
- * values as opaque secrets.
+ * @module dsh-connect-doubao/auth
  */
-import { createHash, createDecipheriv } from 'node:crypto'
-import { readFileSync, mkdtempSync, rmSync, copyFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync, mkdtempSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { createRequire } from 'node:module'
-// Imported AND re-exported: the callers below use these directly, while other
-// modules (shim, doctor, probe) still import them from this module's surface.
-import { listDoubaoProfiles, PROFILE_ENV } from './doubao-profile.ts'
-
-const require_ = createRequire(import.meta.url)
-
-export interface DoubaoCookie {
-  host: string
-  name: string
-  value: string
-}
 
 export interface DoubaoCredentials {
   /** Cookie pairs ready for a `Cookie:` header. */
   header: string
   /** Individual pairs, for selective use (e.g. msToken in a query string). */
   pairs: Map<string, string>
-  /** True when the Doubao app profile was found and decrypted successfully. */
+  /** True when a usable session was loaded. */
   ok: boolean
   /** Human-readable reason when `ok` is false. Never contains a secret. */
   reason?: string
 }
 
-/** Cookie lifetime in the process cache. Doubao rotates `bd_sso_hi3jfd` itself. */
+/**
+ * How long a loaded session stays in the process cache.
+ *
+ * Not a security boundary: DPAPI unprotect costs a PowerShell child process, and
+ * every upstream call wants the header, so the cache is what keeps a chat turn
+ * from spawning one process per request. Doubao rotates its own cookies
+ * server-side; the first rejected request is the accurate expiry signal.
+ */
 export const CREDENTIAL_TTL_MS = 10 * 60 * 1000
 
 /**
@@ -77,8 +72,6 @@ export const REQUIRED_COOKIE_NAMES = [
   's_v_web_id',
 ] as const
 
-const COOKIE_HOST_SUFFIXES = ['doubao.com', 'bytedance.com']
-
 /* ------------------------------------------------------------------ *
  * Windows DPAPI
  * ------------------------------------------------------------------ */
@@ -88,15 +81,6 @@ interface DataBlob {
   pbData: Buffer
 }
 
-const DPAPI_MAGIC = Buffer.from('DPAPI', 'ascii')
-
-/**
- * Call CryptUnprotectData via a short-lived PowerShell child process.
- *
- * Node has no built-in DPAPI binding and the plugin must not pull in a native
- * addon, so we shell out to the Windows Data Protection API. The master key
- * travels back over stdout and never touches disk.
- */
 /**
  * Absolute path to Windows PowerShell, or the bare name as a last resort.
  *
@@ -127,6 +111,13 @@ function dpapiChildEnv(): NodeJS.ProcessEnv {
   return env
 }
 
+/**
+ * Call CryptProtectData / CryptUnprotectData via a short-lived PowerShell child.
+ *
+ * Node has no built-in DPAPI binding and the plugin must not pull in a native
+ * addon, so we shell out to the Windows Data Protection API. The payload travels
+ * over stdin and stdout and never touches disk.
+ */
 function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
   // The script is written to a temp .ps1 and run with `-File`, not passed via
   // -Command/-EncodedCommand: the C# P/Invoke source needs real newlines, and
@@ -221,76 +212,58 @@ function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
   }
 }
 
-/** Convenience wrapper for the decrypt direction. */
-function dpapiUnprotect(cipher: Buffer): Buffer {
-  return dpapiCall('unprotect', cipher)
-}
-
 /* ------------------------------------------------------------------ *
- * Sealed credential cache
+ * The sealed browser session
  * ------------------------------------------------------------------ */
 
 /**
- * Why a cache exists at all.
+ * Where the one usable session lives.
  *
- * The Doubao client takes an EXCLUSIVE lock on `Default\Network\Cookies` while
- * it is active, so an external process cannot read the session at all while the
- * app runs — `EBUSY` on open, on copy, everywhere. That is the NORMAL state for
- * this plugin: its whole point is to use the account whose app is signed in.
+ * The file name keeps the `-browser` suffix it was introduced with so an
+ * existing sealed session survives the upgrade that removed the client path.
  *
- * So a successful read is sealed with Windows DPAPI (current user scope) and
- * kept under the DSH home. The plaintext never touches disk — only the sealed
- * blob does — and that blob cannot be opened by another Windows account or
- * moved to another machine. It expires, because the server rotates session
- * cookies.
+ * There is no TTL here, on purpose: the session lives ~30 days server-side and
+ * the FIRST rejected request is the accurate expiry signal. A clock on top of
+ * that could only invent failures for a session that still works.
  */
-const CREDENTIAL_CACHE_FILENAME = 'doubao-credentials.dpapi'
-/** Long enough to survive a reboot with the app open, short enough to expire. */
-const CREDENTIAL_CACHE_TTL_MS = 12 * 60 * 60 * 1000
+const BROWSER_CACHE_FILENAME = 'doubao-credentials-browser.dpapi'
 
-function credentialCachePath(): string {
-  return join(homedir(), '.dsh', CREDENTIAL_CACHE_FILENAME)
+function browserCachePath(): string {
+  return join(homedir(), '.dsh', BROWSER_CACHE_FILENAME)
 }
 
-/** Seal the current session to disk. Best-effort: never fails a request. */
-function saveCredentialCache(credentials: DoubaoCredentials): void {
-  if (!credentials.ok) return
-  try {
-    const payload = JSON.stringify({
-      savedAt: Date.now(),
-      header: credentials.header,
-      pairs: [...credentials.pairs.entries()],
-    })
-    const sealed = dpapiCall('protect', Buffer.from(payload, 'utf8'))
-    mkdirSync(dirname(credentialCachePath()), { recursive: true })
-    writeFileSync(credentialCachePath(), sealed, { mode: 0o600 })
-  } catch {
-    // A cache that cannot be written is a slower plugin, not a broken one.
-  }
+/** Seal browser-harvested cookies to disk. Throws on a DPAPI failure. */
+export function saveBrowserCredentials(pairs: Map<string, string>): void {
+  const header = [...pairs.entries()].map(([name, value]) => `${name}=${value}`).join('; ')
+  const payload = JSON.stringify({
+    savedAt: Date.now(),
+    source: 'browser',
+    header,
+    pairs: [...pairs.entries()],
+  })
+  const sealed = dpapiCall('protect', Buffer.from(payload, 'utf8'))
+  mkdirSync(dirname(browserCachePath()), { recursive: true })
+  writeFileSync(browserCachePath(), sealed, { mode: 0o600 })
 }
 
-/** Read the sealed cache, or `undefined` when absent/expired/unreadable. */
-function loadCredentialCache(): DoubaoCredentials | undefined {
+/** Read the sealed browser session, or `undefined` when absent/unusable. */
+export function loadBrowserCredentials(): DoubaoCredentials | undefined {
   try {
-    const sealed = readFileSync(credentialCachePath())
+    const sealed = readFileSync(browserCachePath())
     const json = dpapiCall('unprotect', sealed).toString('utf8')
-    const parsed = JSON.parse(json) as { savedAt?: unknown; header?: unknown; pairs?: unknown }
-    if (typeof parsed.savedAt !== 'number') return undefined
-    const age = Date.now() - parsed.savedAt
-    // A negative age means the clock moved backwards (a manual change, a dual
-    // boot, a broken RTC). Treating that as fresh would extend a sealed session
-    // indefinitely — the one case a TTL cannot cover on its own.
-    if (age < 0 || age > CREDENTIAL_CACHE_TTL_MS) return undefined
+    const parsed = JSON.parse(json) as { header?: unknown; pairs?: unknown }
     if (typeof parsed.header !== 'string' || !Array.isArray(parsed.pairs)) return undefined
     const pairs = new Map<string, string>()
     for (const entry of parsed.pairs) {
       if (!Array.isArray(entry) || entry.length !== 2) continue
       const [name, value] = entry as [unknown, unknown]
-      if (typeof name === 'string' && typeof value === 'string' && name !== '') {
-        pairs.set(name, value)
-      }
+      if (typeof name === 'string' && typeof value === 'string' && name !== '') pairs.set(name, value)
     }
     const missing = REQUIRED_COOKIE_NAMES.filter((name) => !pairs.get(name))
+    // A file that decrypts but lacks a required cookie is a HALF session: the
+    // scan was abandoned mid-flow or the server rotated part of the jar. Serving
+    // it would fail upstream with a message about the account, not about the
+    // login, so treat it as absent and let the card ask for a fresh scan.
     if (missing.length > 0) return undefined
     return { ok: true, header: parsed.header, pairs }
   } catch {
@@ -298,62 +271,14 @@ function loadCredentialCache(): DoubaoCredentials | undefined {
   }
 }
 
-/* ------------------------------------------------------------------ *
- * Cookie value decoding
- * ------------------------------------------------------------------ */
-
-/**
- * Strip the host-binding prefix from a decrypted cookie plaintext.
- *
- * `N` is discovered by matching the plaintext against `sha256(host_key)` at
- * decreasing prefix lengths. 32 is Chrome 130+; 0 covers legacy builds that
- * stored the bare value. We never guess: an unmatched plaintext is an error,
- * because silently returning a corrupt value would surface later as an opaque
- * server-side "login invalid" instead of an actionable local failure.
- */
-export function decodeCookiePlaintext(plaintext: Buffer, hostKey: string): string {
-  const digest = createHash('sha256').update(hostKey, 'utf8').digest()
-  for (const n of [32, 24, 16, 0]) {
-    if (n === 0) break
-    if (plaintext.length >= n && plaintext.subarray(0, n).equals(digest.subarray(0, n))) {
-      return plaintext.subarray(n).toString('latin1')
-    }
-  }
-  if (plaintext.length === 0) return ''
-  // No host prefix matched: only accept it if it is entirely printable ASCII,
-  // which is what a legacy bare value looks like.
-  let printable = true
-  for (const byte of plaintext) {
-    if (byte < 0x20 || byte > 0x7e) { printable = false; break }
-  }
-  if (printable) return plaintext.toString('latin1')
-  throw new Error(
-    'cookie plaintext matches no known host prefix and is not printable ASCII; ' +
-    'this Chromium fork may use a different binding scheme',
-  )
+/** True when a sealed browser session exists on disk. */
+export function hasBrowserCredentials(): boolean {
+  return loadBrowserCredentials() !== undefined
 }
 
-/** Decrypt one `v10` cookie value with the profile master key. */
-export function decryptCookieValue(masterKey: Buffer, encryptedValue: Buffer, hostKey: string): string {
-  if (encryptedValue.length < 3) return ''
-  const scheme = encryptedValue.subarray(0, 3).toString('latin1')
-  if (scheme === 'v10' || scheme === 'v11') {
-    const nonce = encryptedValue.subarray(3, 15)
-    const tagAndCiphertext = encryptedValue.subarray(15)
-    const tag = tagAndCiphertext.subarray(tagAndCiphertext.length - 16)
-    const ciphertext = tagAndCiphertext.subarray(0, tagAndCiphertext.length - 16)
-    const decipher = createDecipheriv('aes-256-gcm', masterKey, nonce)
-    decipher.setAuthTag(tag)
-    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()])
-    return decodeCookiePlaintext(plaintext, hostKey)
-  }
-  if (scheme === 'v20') {
-    throw new Error(
-      'cookie uses the v20 App-Bound scheme, which requires the Doubao app ' +
-      'process to decrypt it; run the request from inside the app instead',
-    )
-  }
-  throw new Error(`unsupported cookie encryption scheme "${scheme}"`)
+/** Drop the sealed session (a re-login always overwrites it). */
+export function clearBrowserCredentials(): void {
+  try { unlinkSync(browserCachePath()) } catch { /* already gone */ }
 }
 
 /* ------------------------------------------------------------------ *
@@ -364,9 +289,11 @@ export function decryptCookieValue(masterKey: Buffer, encryptedValue: Buffer, ho
  * Locate the Doubao Chromium profile directory on this machine.
  *
  * Discovery lives in `./doubao-profile.ts` and is re-exported here because
- * every caller (shim, doctor, probe) reaches for it through this module. It is
- * no longer hardcoded to `%LOCALAPPDATA%`: the app lets users put `User Data`
- * on another drive, and a fixed path made those installs look "not installed".
+ * every caller (discovery, upstream, doctor, probe) reaches for it through this
+ * module. It is no longer hardcoded to `%LOCALAPPDATA%`: the app lets users put
+ * `User Data` on another drive, and a fixed path made those installs look "not
+ * installed". The cookie jar inside that folder is no longer read — the paths
+ * still matter for the task-mode workspace and for diagnostics.
  */
 export {
   findDoubaoUserDataDir,
@@ -382,261 +309,37 @@ export {
 } from './doubao-profile.ts'
 
 /* ------------------------------------------------------------------ *
- * SQLite access (read-only, via a throwaway copy)
- * ------------------------------------------------------------------ */
-
-/** Block the current thread for `ms` (no async plumbing in this read path). */
-function sleepSync(ms: number): void {
-  const view = new Int32Array(new SharedArrayBuffer(4))
-  Atomics.wait(view, 0, 0, ms)
-}
-
-/** Select the decryptable cookie rows from an opened database. */
-function selectCookieRows(
-  db: { prepare(sql: string): { all(): unknown[] } },
-): Array<{ host: string; name: string; encrypted: Buffer }> {
-  const stmt = db.prepare(
-    'SELECT host_key, name, encrypted_value FROM cookies WHERE encrypted_value IS NOT NULL',
-  )
-  const rows = stmt.all() as Array<{ host_key: string; name: string; encrypted_value: Uint8Array }>
-  return rows.map((r) => ({
-    host: String(r.host_key),
-    name: String(r.name),
-    encrypted: Buffer.from(r.encrypted_value),
-  }))
-}
-
-/**
- * Read rows from the cookie jar.
- *
- * Two paths, because the live file is held by a running Chromium:
- *
- *   1. a read-only SQLite open on the ORIGINAL file — SQLite only needs a shared
- *      lock, so this normally works even while the app is signed in and running;
- *   2. a throwaway COPY, retried a few times. Windows share-deny locks and
- *      on-access scanners make `copyFileSync` return `EBUSY` for a moment, and
- *      that transient error used to surface as "credentials unreadable" — which
- *      reads like a signed-out account and is the most misleading possible
- *      message for a file that is simply busy.
- *
- * The original profile is only ever read.
- */
-function readCookieRows(userDataDir: string): Array<{ host: string; name: string; encrypted: Buffer }> {
-  const source = join(userDataDir, 'Default', 'Network', 'Cookies')
-  const { DatabaseSync } = require_('node:sqlite') as typeof import('node:sqlite')
-
-  // 1. direct read-only open (retried: the lock is often held only briefly,
-  //    while the client is writing the cookie it just received)
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    try {
-      const db = new DatabaseSync(source, { readOnly: true })
-      try {
-        return selectCookieRows(db)
-      } finally {
-        db.close()
-      }
-    } catch {
-      if (attempt < 3) sleepSync(150)
-    }
-  }
-
-  // 2. copy, with bounded retries
-  const scratch = mkdtempSync(join(tmpdir(), 'dsh-doubao-cookie-'))
-  const copy = join(scratch, 'Cookies.db')
-  try {
-    let copied = false
-    let lastError: unknown
-    for (let attempt = 0; attempt < 6 && !copied; attempt += 1) {
-      try {
-        copyFileSync(source, copy)
-        copied = true
-      } catch (error) {
-        lastError = error
-        sleepSync(120)
-      }
-    }
-    if (!copied) {
-      throw new Error(
-        'the Doubao desktop client holds its Cookies database with an EXCLUSIVE lock ' +
-        '(EBUSY), so no other process can read the session while it is in that state. ' +
-        'Fully quit the Doubao client and retry: credentials are then cached in this ' +
-        'process for 10 minutes, so the app can be reopened straight away.',
-        { cause: lastError },
-      )
-    }
-    const db = new DatabaseSync(copy, { readOnly: true })
-    try {
-      return selectCookieRows(db)
-    } finally {
-      db.close()
-    }
-  } finally {
-    rmSync(scratch, { recursive: true, force: true })
-  }
-}
-
-/* ------------------------------------------------------------------ *
  * Public entry point
  * ------------------------------------------------------------------ */
 
 let cached: { at: number; credentials: DoubaoCredentials } | undefined
 
 /**
- * Decrypt the Doubao session from the local app profile.
+ * The session this plugin runs on: the sealed browser sign-in, or a failure that
+ * tells the user what to do about it.
  *
- * The result is cached in process memory for `CREDENTIAL_TTL_MS`. Nothing is
- * persisted. A failure is reported as `{ ok: false, reason }` rather than
- * thrown so the provider can surface an actionable message.
+ * Cached in process memory for `CREDENTIAL_TTL_MS` because the read costs a
+ * PowerShell child process. A failure is reported as `{ ok: false, reason }`
+ * rather than thrown so the provider can surface an actionable message instead
+ * of a stack trace; the login route drops this cache, so a fresh scan is visible
+ * immediately.
  */
 export function loadDoubaoCredentials(options: { force?: boolean } = {}): DoubaoCredentials {
   const now = Date.now()
-  if (!options.force && cached && now - cached.at < CREDENTIAL_TTL_MS) {
+  if (!options.force && cached !== undefined && now - cached.at < CREDENTIAL_TTL_MS) {
     return cached.credentials
   }
 
-  let credentials: DoubaoCredentials
-  try {
-    // A stale leftover profile can shadow the live one: someone who COPIED the
-    // folder to another drive leaves an empty cookie jar behind in AppData, and
-    // taking the first hit would then report "cookies missing" while a perfectly
-    // good session sits on D:. So walk the candidates and keep the first that
-    // actually decrypts into a usable session.
-    const profiles = listDoubaoProfiles()
-    if (profiles.length === 0) {
-      credentials = {
-        ok: false,
-        reason:
-          'Doubao user profile not found. Looked in %LOCALAPPDATA%, %APPDATA%, the running ' +
-          `client's --user-data-dir, and every drive. Set ${PROFILE_ENV} to the folder ` +
-          'containing "Default" if the app keeps its data somewhere else.',
-        header: '',
-        pairs: new Map(),
-      }
-    } else {
-      let failure: DoubaoCredentials | undefined
-      let settled: DoubaoCredentials | undefined
-      for (const profile of profiles) {
-        // One broken candidate must not abort the walk. `decryptFromProfile`
-        // throws on an unreadable Local State or a failing DPAPI call, and a
-        // stale leftover profile with a corrupt file used to bubble into the
-        // outer catch and hide the good session on the next drive.
-        let attempt: DoubaoCredentials
-        try {
-          attempt = decryptFromProfile(profile.dir)
-        } catch (error) {
-          attempt = {
-            ok: false,
-            reason: `${profile.dir}: ${(error as Error).message}`,
-            header: '',
-            pairs: new Map(),
-          }
-        }
-        if (attempt.ok) {
-          settled = attempt
-          break
-        }
-        // Keep the FIRST failure: candidates are ordered env → appdata →
-        // process → scan, so the earliest one is the one the user meant.
-        failure ??= attempt
-      }
-      credentials = settled ?? failure ?? {
-        ok: false,
-        reason: 'no readable Doubao profile',
-        header: '',
-        pairs: new Map(),
-      }
-    }
-  } catch (error) {
-    credentials = {
-      ok: false,
-      reason: `failed to read Doubao credentials: ${(error as Error).message}`,
-      header: '',
-      pairs: new Map(),
-    }
+  const sealed = loadBrowserCredentials()
+  const credentials: DoubaoCredentials = sealed ?? {
+    ok: false,
+    reason: '还没有浏览器登录态。请在豆包卡片里点「重新登录」扫码一次。',
+    header: '',
+    pairs: new Map(),
   }
-
-  // STALE-WHILE-ERROR.
-  //
-  // A refresh can fail for a reason that does not invalidate what we already
-  // hold — the Doubao client takes an EXCLUSIVE lock on its Cookies database
-  // while it is active, and `EBUSY` on the read is by far the commonest case in
-  // practice. Dropping a working session because a re-read was blocked would
-  // break chat every ten minutes for anyone with the app open, so the previous
-  // good credential stays in force and the freshness clock restarts (which also
-  // stops the reader from spinning on a lock it cannot win).
-  if (!credentials.ok && cached?.credentials.ok === true) {
-    cached = { at: now, credentials: cached.credentials }
-    return cached.credentials
-  }
-
-  // Disk fallback: the app holds the jar exclusively whenever it is running, so
-  // a cold start with the app open can ONLY be served from the sealed cache.
-  if (!credentials.ok) {
-    const sealed = loadCredentialCache()
-    if (sealed !== undefined) {
-      cached = { at: now, credentials: sealed }
-      return sealed
-    }
-  }
-
-  if (credentials.ok) saveCredentialCache(credentials)
 
   cached = { at: now, credentials }
   return credentials
-}
-
-function decryptFromProfile(userDataDir: string): DoubaoCredentials {
-  if (process.platform !== 'win32') {
-    return { ok: false, reason: 'Doubao credential extraction is only supported on Windows.', header: '', pairs: new Map() }
-  }
-
-  const localState = JSON.parse(readFileSync(join(userDataDir, 'Local State'), 'utf8')) as {
-    os_crypt?: { encrypted_key?: string }
-  }
-  const encodedKey = localState.os_crypt?.encrypted_key
-  if (!encodedKey) {
-    return { ok: false, reason: 'Local State has no os_crypt.encrypted_key.', header: '', pairs: new Map() }
-  }
-  const keyBlob = Buffer.from(encodedKey, 'base64')
-  if (keyBlob.subarray(0, 5).toString('latin1') !== DPAPI_MAGIC.toString('latin1')) {
-    return { ok: false, reason: 'encrypted_key is missing the DPAPI prefix.', header: '', pairs: new Map() }
-  }
-  const masterKey = dpapiUnprotect(keyBlob.subarray(5))
-  if (masterKey.length !== 32) {
-    return { ok: false, reason: `master key has unexpected length ${masterKey.length}.`, header: '', pairs: new Map() }
-  }
-
-  try {
-    const rows = readCookieRows(userDataDir)
-    const pairs = new Map<string, string>()
-    for (const row of rows) {
-      const host = row.host.toLowerCase()
-      if (!COOKIE_HOST_SUFFIXES.some((suffix) => host === `.${suffix}` || host.endsWith(`.${suffix}`))) continue
-      try {
-        pairs.set(row.name, decryptCookieValue(masterKey, row.encrypted, row.host))
-      } catch {
-        // A single unreadable cookie (e.g. a v20 App-Bound one) must not sink
-        // the whole session.
-      }
-    }
-
-    const missing = REQUIRED_COOKIE_NAMES.filter((name) => !pairs.get(name))
-    if (missing.length > 0) {
-      return {
-        ok: false,
-        reason: `Doubao session cookies missing (${missing.join(', ')}). Sign in to the Doubao app and retry.`,
-        header: '',
-        pairs,
-      }
-    }
-
-    const header = [...pairs.entries()]
-      .map(([name, value]) => `${name}=${value}`)
-      .join('; ')
-    return { ok: true, header, pairs }
-  } finally {
-    masterKey.fill(0)
-  }
 }
 
 /** Drop the in-memory cache. Used by tests and by explicit user refresh. */
@@ -645,21 +348,15 @@ export function invalidateCredentialCache(): void {
 }
 
 /**
- * Revoke the sealed copy on disk as well.
+ * Revoke the sealed session on disk as well.
  *
- * The sealed cache exists because the Doubao client holds its cookie database
- * exclusively while it runs, so a cold start can only be served from disk. The
- * cost is that a session the server has already rejected would otherwise be
- * handed back for up to twelve hours — every request failing for a reason the
- * user cannot see or fix. A rejected session is therefore deleted, not merely
- * expired.
+ * Called when the server refuses the session. Replacing it needs a fresh QR
+ * scan, so keeping the file would only make every later request fail the same
+ * way while the card still showed a signed-in account — the user's fix
+ * (「重新登录」) would then look like it had no effect. Deleting it makes the
+ * next request say "log in", which is the truth.
  */
 export function clearCredentialCache(): void {
   cached = undefined
-  try {
-    rmSync(credentialCachePath(), { force: true })
-  } catch {
-    // Nothing to revoke, or the file is locked: the in-memory drop above still
-    // applies, and the TTL bounds the rest.
-  }
+  clearBrowserCredentials()
 }

@@ -5,17 +5,12 @@
  * path is closed to this plugin), so the security guards and the read-back
  * contract are pinned here rather than left to a manual probe.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import {
-  DOUBAO_PROFILE_PATH,
-  DOUBAO_SAVE_PATH,
-  registerDoubaoProfileRoute,
-  registerDoubaoSaveRoute,
-} from '../src/doubao-status.ts'
+import { DOUBAO_AUTH_PATH, DOUBAO_SAVE_PATH, registerDoubaoAuthRoute, registerDoubaoSaveRoute } from '../src/doubao-status.ts'
 import { readStoredSettings, writeStoredSetting } from '../src/doubao-store.ts'
 
 interface Captured {
@@ -191,36 +186,15 @@ describe('registerDoubaoSaveRoute', () => {
     expect(written).toBe(false)
   })
 
-  it('accepts a profile directory that really contains Doubao data', async () => {
-    // The route validates against the filesystem, so the fake has to be real:
-    // a `Default/Network/Cookies` file is the one thing `looksLikeProfile` checks.
-    const profile = join(dir, 'User Data')
-    mkdirSync(join(profile, 'Default', 'Network'), { recursive: true })
-    writeFileSync(join(profile, 'Default', 'Network', 'Cookies'), '')
-    const h = harness({ write: () => {}, read: () => ({}) })
-    const res = await h.call('POST', { field: 'profileDir', value: profile })
-    expect(res.status).toBe(200)
-  })
-
-  it('accepts an empty profile directory as "go back to auto-detect"', async () => {
-    const h = harness({ write: () => {}, read: () => ({}) })
-    const res = await h.call('POST', { field: 'profileDir', value: '' })
-    expect(res.status).toBe(200)
-  })
-
-  it('rejects a profile directory holding no Doubao data and does not write', async () => {
+  it('rejects the profile directory now that the picker is gone', async () => {
+    // The card used to choose a client profile here. With the client-cookie path
+    // removed the field has no writer, so accepting it would only store a value
+    // nothing reads until the next restart.
     let written = false
     const h = harness({ write: () => { written = true }, read: () => ({}) })
-    const res = await h.call('POST', { field: 'profileDir', value: join(dir, 'empty') })
+    const res = await h.call('POST', { field: 'profileDir', value: 'D:/Doubao/User Data' })
     expect(res.status).toBe(400)
-    expect(String(res.body.error)).toContain('no Doubao profile at')
     expect(written).toBe(false)
-  })
-
-  it('rejects a non-string profile directory', async () => {
-    const h = harness({ write: () => {}, read: () => ({}) })
-    const res = await h.call('POST', { field: 'profileDir', value: 42 })
-    expect(res.status).toBe(400)
   })
 
   it('reports a write failure as 500 with the error name', async () => {
@@ -235,9 +209,9 @@ describe('registerDoubaoSaveRoute', () => {
   })
 })
 
-describe('registerDoubaoProfileRoute', () => {
-  /** Same capture trick as above, but this route takes a candidate provider. */
-  function harness(deps: Parameters<typeof registerDoubaoProfileRoute>[1]) {
+describe('registerDoubaoAuthRoute', () => {
+  /** Capture the auth handler; POST is only exercised for its rejected shapes. */
+  function harness() {
     let handler: ((req: IncomingMessage, res: ServerResponse) => void | Promise<void>) | undefined
     let path: string | undefined
     const ctx = {
@@ -249,12 +223,15 @@ describe('registerDoubaoProfileRoute', () => {
         },
       },
     }
-    registerDoubaoProfileRoute(ctx as never, deps)
-    const call = async (method: string): Promise<Captured> => {
+    registerDoubaoAuthRoute(ctx as never)
+    const call = async (method: string, body?: unknown, writeHeader = true): Promise<Captured> => {
+      const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]
+      const headers: Record<string, string> = { host: '127.0.0.1:63052', 'content-type': 'application/json' }
+      if (method === 'POST' && writeHeader) headers['x-dsh-doubao-write'] = '1'
       const req = {
         method,
-        headers: { host: '127.0.0.1:63052' },
-        async *[Symbol.asyncIterator]() { /* no body */ },
+        headers,
+        async *[Symbol.asyncIterator]() { for (const chunk of chunks) yield chunk },
       } as unknown as IncomingMessage
       const captured: Captured = { status: 0, body: {} }
       const res = {
@@ -268,39 +245,22 @@ describe('registerDoubaoProfileRoute', () => {
   }
 
   it('registers on the documented path', () => {
-    expect(harness({ candidates: () => [] }).pathOf()).toBe(DOUBAO_PROFILE_PATH)
+    expect(harness().pathOf()).toBe(DOUBAO_AUTH_PATH)
   })
 
-  it('reports the first candidate as the detected directory', async () => {
-    const h = harness({
-      candidates: () => [
-        { dir: 'D:/Doubao/User Data', source: 'manual' },
-        { dir: 'C:/Users/x/AppData/Local/Doubao/User Data', source: 'appdata' },
-      ],
-    })
-    const res = await h.call('GET')
-    expect(res.status).toBe(200)
-    expect(res.body.detected).toBe('D:/Doubao/User Data')
-    expect(res.body.candidates).toHaveLength(2)
-    expect(res.body.env).toBe('DSH_DOUBAO_PROFILE')
+  it('rejects a POST body that is not the login action', async () => {
+    // A typo must not open a sign-in window; only the one documented body runs it.
+    const missing = await harness().call('POST', {})
+    const wrong = await harness().call('POST', { action: 'switch', mode: 'client' })
+    expect(missing.status).toBe(400)
+    expect(wrong.status).toBe(400)
   })
 
-  it('reports null when nothing was found rather than an empty string', async () => {
-    // The card branches on null (`profile?.detected != null`) to decide between
-    // "auto-detected" and "not found", so an empty string would read as a hit.
-    const res = await harness({ candidates: () => [] }).call('GET')
-    expect(res.body.detected).toBeNull()
+  it('requires the write marker on POST, like every other write route', async () => {
+    expect((await harness().call('POST', { action: 'login' }, false)).status).toBe(403)
   })
 
-  it('is read-only', async () => {
-    const h = harness({ candidates: () => [] })
-    expect((await h.call('POST')).status).toBe(405)
-  })
-
-  it('reports a probe failure as 500', async () => {
-    const h = harness({ candidates: () => { throw new Error('probe broke') } })
-    const res = await h.call('GET')
-    expect(res.status).toBe(500)
-    expect(String(res.body.error)).toContain('probe broke')
+  it('rejects methods other than GET and POST', async () => {
+    expect((await harness().call('DELETE')).status).toBe(405)
   })
 })

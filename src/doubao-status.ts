@@ -14,7 +14,13 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { fetchQuota, findWindow, millisUntilReset, invalidateQuotaCache, type QuotaWindow } from './doubao-quota.ts'
-import { describeProfileLocation, resolveUserProvided, PROFILE_ENV, type DoubaoProfileLocation } from './doubao-auth.ts'
+import {
+  describeProfileLocation,
+  invalidateCredentialCache,
+  loadDoubaoCredentials,
+  saveBrowserCredentials,
+} from './doubao-auth.ts'
+import { browserLogin } from './doubao-auth-browser.ts'
 import { doubaoCatalogEntries, type DoubaoModelInfo } from './doubao-catalog.ts'
 import { invalidateDiscovery } from './doubao-discovery.ts'
 import type { DoubaoCatalogEntry } from './doubao-catalog.ts'
@@ -54,7 +60,7 @@ function loopbackOrigin(req: IncomingMessage): boolean {
  * Not a secret — a marker whose only job is to make the request non-simple.
  * A cross-origin page cannot attach a custom header without a CORS preflight,
  * and these routes never approve one, so a hostile tab can no longer flip
- * `profileDir` or the model switches even though it can reach the port.
+ * the model switches or start a sign-in window even though it can reach the port.
  */
 export const WRITE_HEADER = 'x-dsh-doubao-write'
 
@@ -209,9 +215,6 @@ export interface WebServerLike {
 /** Route the card writes settings through. */
 export const DOUBAO_SAVE_PATH = '/plugins/dsh-connect-doubao/__save'
 
-/** Route the card asks for the detected profile candidates. */
-export const DOUBAO_PROFILE_PATH = '/plugins/dsh-connect-doubao/profile'
-
 /**
  * Minimal shape of the `settings` service the presentation claim needs.
  *
@@ -234,8 +237,12 @@ export interface SettingsLike {
  * A closed allow-list, not a schema derivation: deriving it would let a future
  * schema addition quietly widen what the browser can write. Both entries are
  * switches the user could already set by hand in `cordis.patch.yml`.
+ *
+ * `profileDir` used to be here for the card's folder picker. That picker is gone
+ * with the client-cookie path, and a field with no writer only invites a
+ * half-applied change: it would land on disk but reach nothing until a restart.
  */
-const WRITABLE_FIELDS = new Set(['enabledModelIds', 'toolEmulation', 'profileDir'])
+const WRITABLE_FIELDS = new Set(['enabledModelIds', 'toolEmulation'])
 
 /** Read and parse a JSON request body, bounded. */
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -314,22 +321,9 @@ export function registerDoubaoSaveRoute(
         const value = body?.value
         const valid = field === 'enabledModelIds'
           ? Array.isArray(value) && value.every(entry => typeof entry === 'string')
-          : field === 'profileDir'
-            ? typeof value === 'string'
-            : typeof value === 'boolean'
+          : typeof value === 'boolean'
         if (!valid) {
           json(res, 400, { error: `invalid value for ${field}` })
-          return
-        }
-        // A profile path is the one value that can point the plugin at the
-        // wrong place, so it is checked BEFORE it is stored: an empty string
-        // means "detect automatically", anything else must really contain a
-        // Chromium profile. Rejecting here keeps the card honest — the same
-        // check the resolver applies, so a save that succeeds also works.
-        if (field === 'profileDir' && typeof value === 'string' && value !== '' && resolveUserProvided(value) === undefined) {
-          json(res, 400, {
-            error: `no Doubao profile at ${String(value)} (expected a folder containing Default\Network\Cookies)`,
-          })
           return
         }
         deps.write(field, value)
@@ -345,42 +339,6 @@ export function registerDoubaoSaveRoute(
           errorName: (error as Error)?.name ?? 'unknown',
           error: safeMessage(error),
         })
-      }
-    },
-  })
-}
-
-/**
- * Register the profile-discovery route.
- *
- * The card needs two things the settings file cannot give it: what the plugin
- * DETECTED (so the user can see whether automatic discovery already worked),
- * and why a manual path was rejected. Both are read-only and contain paths
- * only — never a cookie.
- */
-export function registerDoubaoProfileRoute(
-  ctx: { webServer: WebServerLike },
-  deps: { candidates: () => Array<{ dir: string; source: string }> },
-): () => void {
-  return ctx.webServer.register({
-    kind: 'exact',
-    path: DOUBAO_PROFILE_PATH,
-    handler: (req, res) => {
-      if (req.method !== 'GET') {
-        json(res, 405, { error: 'method not allowed' })
-        return
-      }
-      if (!guard(req, res, { write: false })) return
-      try {
-        const candidates = deps.candidates()
-        json(res, 200, {
-          ok: true,
-          detected: candidates[0]?.dir ?? null,
-          candidates,
-          env: PROFILE_ENV,
-        })
-      } catch (error: unknown) {
-        json(res, 500, { ok: false, error: safeMessage(error) })
       }
     },
   })
@@ -453,6 +411,153 @@ export function registerDoubaoCatalogRoute(
       const models = deps.modelsProvider === undefined ? undefined : deps.modelsProvider()
       const payload: DoubaoCatalogView = { ok: true, models: doubaoCatalogEntries(models), error: null }
       json(res, 200, payload)
+    },
+  })
+}
+
+/* ------------------------------------------------------------------ *
+ * Login route
+ * ------------------------------------------------------------------ */
+
+/** Route the card reads the session state through, and starts a sign-in on. */
+export const DOUBAO_AUTH_PATH = '/plugins/dsh-connect-doubao/auth'
+
+/**
+ * The session payload.
+ *
+ * SECURITY: counts and instants only. No cookie, no token, no account id — the
+ * card renders "signed in, expires in N days", which needs nothing else.
+ *
+ * There is no `mode` field: the plugin has exactly one way in, so a field
+ * describing the choice could only ever be one constant for the card to
+ * branch on.
+ */
+export interface DoubaoAuthView {
+  ok: boolean
+  /** True when a usable session exists. */
+  signedIn: boolean
+  /** Epoch ms of the server-side session expiry, parsed from `sid_guard`. */
+  expiresAt: number | null
+  /** Whole days until `expiresAt`, or null when unknown. */
+  daysLeft: number | null
+  /** Non-secret explanation when `signedIn` is false. */
+  detail: string | null
+}
+
+/**
+ * Read the expiry out of `sid_guard`.
+ *
+ * Format: `sessionid|issued_epoch|ttl_seconds|"Mon, 07 Dec 2026 ..."`. The
+ * 30-day TTL is absolute, not sliding — verified 2026-11-07: hitting the
+ * account endpoint leaves this cookie byte-identical, so this instant is the
+ * real deadline and the card can count on it.
+ */
+function authExpiryOf(pairs: Map<string, string>): number | null {
+  const raw = pairs.get('sid_guard')
+  if (raw === undefined) return null
+  // The value can arrive percent-encoded (`%7C` for the separators) depending on
+  // who wrote it last, so both forms are normalised — otherwise the card would
+  // report "expiry unknown" for a perfectly readable session.
+  const guard = raw.replace(/%7C/gi, '|').replace(/%2C/gi, ',').replace(/%3A/gi, ':')
+  const parts = guard.split('|')
+  if (parts.length < 3) return null
+  const issued = Number(parts[1])
+  const ttl = Number(parts[2])
+  if (!Number.isFinite(issued) || !Number.isFinite(ttl) || issued <= 0) return null
+  return (issued + ttl) * 1000
+}
+
+/** Build the session view for the card. */
+function authView(): DoubaoAuthView {
+  const credentials = loadDoubaoCredentials()
+  const expiresAt = credentials.ok ? authExpiryOf(credentials.pairs) : null
+  return {
+    ok: true,
+    signedIn: credentials.ok,
+    expiresAt,
+    daysLeft: expiresAt === null ? null : Math.max(0, Math.round((expiresAt - Date.now()) / 86_400_000)),
+    detail: credentials.ok ? null : (credentials.reason ?? null),
+  }
+}
+
+/**
+ * Register the session route.
+ *
+ * GET reads the state. POST accepts exactly `{"action":"login"}` and runs the
+ * browser sign-in — nothing else, because a body that merely fails to parse
+ * must not be read as "log in": a typo would open a sign-in window.
+ *
+ * POST is a WRITE (it replaces the sealed session), so it requires the same
+ * `x-dsh-doubao-write` header as every other write on this plugin — a hostile
+ * tab must not be able to make the user's browser open a sign-in window.
+ *
+ * The login is long-running on purpose: a Chromium window stays open until the
+ * user finishes the scan. The request is held open rather than polled so a
+ * failure has exactly one place to be reported.
+ */
+export function registerDoubaoAuthRoute(ctx: { webServer: WebServerLike }): () => void {
+  return ctx.webServer.register({
+    kind: 'exact',
+    path: DOUBAO_AUTH_PATH,
+    handler: async (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        json(res, 405, { error: 'method not allowed' })
+        return
+      }
+      if (!guard(req, res, { write: req.method === 'POST' })) return
+
+      if (req.method === 'GET') {
+        try {
+          json(res, 200, authView())
+        } catch (error: unknown) {
+          json(res, 200, {
+            ok: false, signedIn: false, expiresAt: null,
+            daysLeft: null, detail: safeMessage(error),
+          } satisfies DoubaoAuthView)
+        }
+        return
+      }
+
+      let body: unknown
+      try {
+        body = await readJsonBody(req)
+      } catch (error: unknown) {
+        json(res, 400, { error: safeMessage(error) })
+        return
+      }
+      const payload = (body ?? {}) as { action?: unknown }
+      if (payload.action !== 'login') {
+        json(res, 400, { error: 'action must be "login"' })
+        return
+      }
+
+      let result
+      try {
+        result = await browserLogin()
+      } catch (error: unknown) {
+        json(res, 200, { ...authView(), signedIn: false, detail: safeMessage(error) } satisfies DoubaoAuthView)
+        return
+      }
+      if (result.ok !== true || result.pairs === undefined) {
+        json(res, 200, {
+          ...authView(), signedIn: false,
+          detail: result.reason ?? '浏览器登录未完成',
+        } satisfies DoubaoAuthView)
+        return
+      }
+      try {
+        saveBrowserCredentials(result.pairs)
+        // The scan may have landed on a different account than the rejected
+        // session it replaces, so every derived read is stale the moment it lands.
+        invalidateCredentialCache()
+        invalidateQuotaCache()
+        json(res, 200, authView())
+      } catch (error: unknown) {
+        json(res, 200, {
+          ...authView(), signedIn: false,
+          detail: `登录成功但凭据保存失败：${safeMessage(error)}`,
+        } satisfies DoubaoAuthView)
+      }
     },
   })
 }

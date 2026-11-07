@@ -11,7 +11,8 @@
  */
 import { describe, expect, it } from 'vitest'
 import { collectBlocks } from '../src/doubao-upstream.ts'
-import { DEEP_THINK_OFF, DEEP_THINK_ON, needDeepThinkValue } from '../src/doubao-catalog.ts'
+import { DEEP_THINK_OFF, DEEP_THINK_ON, needDeepThinkValue, supportsReasoning } from '../src/doubao-catalog.ts'
+import { buildChatBody } from '../src/doubao-upstream.ts'
 
 const THINKING_ID = '10519372686251266'
 const ANSWER_ID = '10519372686251299'
@@ -96,5 +97,47 @@ describe('the deep-think switch value', () => {
     expect(needDeepThinkValue(true)).toBe(DEEP_THINK_ON)
     expect(DEEP_THINK_OFF).toBe(0)
     expect(DEEP_THINK_ON).toBe(3)
+  })
+})
+
+/**
+ * The switch that makes the picker mean something.
+ *
+ * Measured 2026-11-07: `reasoning_effort` alone never produced a thinking turn —
+ * the reply came back `thinking: false` with effort already at 5, because the
+ * request still carried `need_deep_think: 0`. Only `need_deep_think: 3` did.
+ * These cases pin the two shapes apart so a refactor cannot silently send the
+ * chat shape for a task turn (which needs 10001) or drop the switch entirely.
+ */
+describe('深度思考 switch on the wire', () => {
+  it('sends 3 when the switch is on', () => {
+    const body = buildChatBody('hi', { deepThink: true }) as {
+      option?: { need_deep_think?: number }
+      ext?: { use_deep_think?: string }
+    }
+    expect(body.option?.need_deep_think).toBe(DEEP_THINK_ON)
+    expect(body.ext?.use_deep_think).toBe(String(DEEP_THINK_ON))
+  })
+
+  it('sends 0 when the switch is off', () => {
+    const body = buildChatBody('hi', { deepThink: false }) as {
+      option?: { need_deep_think?: number }
+    }
+    expect(body.option?.need_deep_think).toBe(DEEP_THINK_OFF)
+  })
+
+  it('keeps the 工作任务 shape when the switch is left unset', () => {
+    // `5` is a 工作任务 model: unset must mean the captured 10001, not 0 and not 3.
+    const body = buildChatBody('hi', { modelKey: '5' }) as {
+      option?: { need_deep_think?: number }
+    }
+    expect(body.option?.need_deep_think).toBe(10001)
+  })
+
+  it('refuses to advertise thinking on a no-CoT model', () => {
+    // 豆包 快速 answered `thinking: false` even with the switch on, so the picker
+    // must not offer 低/中/高 for it.
+    expect(supportsReasoning('0')).toBe(false)
+    expect(supportsReasoning('5')).toBe(true)
   })
 })

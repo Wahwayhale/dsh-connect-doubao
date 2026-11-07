@@ -18,10 +18,8 @@
  */
 import { createDoubaoAdapter } from './doubao-adapter.ts'
 import { createDoubaoShim } from './doubao-shim.ts'
-import { registerDoubaoQuotaRoute, registerDoubaoCatalogRoute, registerDoubaoSaveRoute, registerDoubaoProfileRoute } from './doubao-status.ts'
-import { setProfileOverride, listDoubaoProfiles } from './doubao-profile.ts'
-import { invalidateCredentialCache } from './doubao-auth.ts'
-import { invalidateQuotaCache } from './doubao-quota.ts'
+import { registerDoubaoQuotaRoute, registerDoubaoCatalogRoute, registerDoubaoSaveRoute, registerDoubaoAuthRoute } from './doubao-status.ts'
+import { setProfileOverride } from './doubao-profile.ts'
 import type { WebServerLike } from './doubao-status.ts'
 import {
   DOUBAO_CONTEXT_WINDOW,
@@ -99,9 +97,11 @@ export {
   registerDoubaoQuotaRoute,
   registerDoubaoCatalogRoute,
   registerDoubaoSaveRoute,
+  registerDoubaoAuthRoute,
   DOUBAO_QUOTA_PATH,
   DOUBAO_CATALOG_PATH,
   DOUBAO_SAVE_PATH,
+  DOUBAO_AUTH_PATH,
 } from './doubao-status.ts'
 // `Config` is re-exported (not redefined) from './doubao-config.ts' above: the
 // Loader needs it as a real schemastery schema on this entry module.
@@ -402,9 +402,6 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
       try {
         const disposeQuota = registerDoubaoQuotaRoute(webCtx)
         const disposeCatalog = registerDoubaoCatalogRoute(webCtx, { modelsProvider: liveModels })
-        const disposeProfile = registerDoubaoProfileRoute(webCtx, {
-          candidates: () => listDoubaoProfiles().map(entry => ({ dir: entry.dir, source: entry.source })),
-        })
         const disposeSave = registerDoubaoSaveRoute(
           {
             webServer: (webCtx as unknown as { webServer: WebServerLike }).webServer,
@@ -426,24 +423,17 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
                 next.enabledModelIds = value.filter((id): id is string => typeof id === 'string')
               } else if (field === 'toolEmulation' && typeof value === 'boolean') {
                 next.toolEmulation = value
-              } else if (field === 'profileDir' && typeof value === 'string') {
-                next.profileDir = value
-                // A different profile means different cookies: drop both the
-                // resolved credentials and the cached quota, or the card would
-                // keep showing the old account's numbers after the switch.
-                setProfileOverride(value)
-                invalidateCredentialCache()
-                invalidateQuotaCache()
               }
               onSettingsChanged(next)
             },
           },
         )
+        const disposeAuth = registerDoubaoAuthRoute(webCtx)
         ctx.effect(() => () => {
           disposeQuota()
           disposeCatalog()
-          disposeProfile()
           disposeSave()
+          disposeAuth()
         })
       } catch (error: unknown) {
         ctx.logger.error('dsh-connect-doubao: web route registration failed', error)

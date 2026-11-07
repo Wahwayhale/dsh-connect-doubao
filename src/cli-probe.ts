@@ -13,7 +13,7 @@
  *
  * Credentials are read into memory only and are never printed.
  */
-import { loadDoubaoCredentials, describeProfileLocation } from './doubao-auth.ts'
+import { loadDoubaoCredentials } from './doubao-auth.ts'
 import { streamChat, probeAccount, DoubaoUpstreamError } from './doubao-upstream.ts'
 import { fetchQuota, findWindow, millisUntilReset, formatDuration } from './doubao-quota.ts'
 import { DOUBAO_MODELS, findDoubaoModel, findReasoningLevel } from './doubao-catalog.ts'
@@ -75,10 +75,13 @@ async function main(): Promise<number> {
       : `FAIL credentials: ${credentials.reason}`)
     return 2
   }
-  // Only counts and names are ever surfaced — never values.
+  // Only counts and names are ever surfaced — never values. The source is the
+  // sealed browser session, so there is no profile path to report: printing one
+  // here used to imply the cookies came from the desktop app and sent anyone
+  // debugging this down the wrong path.
   out(options.json
-    ? { event: 'credentials', ok: true, cookieCount: credentials.pairs.size, profile: describeProfileLocation() }
-    : `credentials: ${credentials.pairs.size} cookies from ${describeProfileLocation()}`)
+    ? { event: 'credentials', ok: true, cookieCount: credentials.pairs.size, source: 'browser' }
+    : `credentials: ${credentials.pairs.size} cookies in the sealed browser session`)
 
   const account = await probeAccount(credentials)
   out(options.json ? { event: 'account', ...account } : `account: ${account.ok ? 'signed in' : account.detail}`)

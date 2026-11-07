@@ -74,34 +74,28 @@ export async function runDoctor(): Promise<DoctorReport> {
   const checks: DoctorCheck[] = []
 
   // ---- 1. credentials -------------------------------------------------
-  // `listDoubaoProfiles` rather than `findDoubaoUserDataDir`: when a stale copy
-  // and the live profile both exist, "which one got used" is the first question
-  // anyone asks, and it is only answerable if the whole list is kept.
+  // The session comes from the browser sign-in, so a missing Doubao profile is
+  // NOT a credential failure — it only means the desktop app is not installed,
+  // which this source does not need. Reporting it as a failure would tell a
+  // perfectly working browser-only install to go fix something unrelated.
+  //
+  // The profile list is still collected: model discovery reads it, so "which
+  // copy did it find" stays the first question a bug report has to answer.
   const profiles = listDoubaoProfiles()
-  const profileDir = profiles[0]?.dir
-  let credentials = loadDoubaoCredentials()
-  if (profileDir === undefined) {
-    checks.push({
-      name: 'credentials',
-      status: 'fail',
-      detail:
-        'Doubao user profile not found. Looked in %LOCALAPPDATA%, %APPDATA%, every user profile, ' +
-        `the running client's --user-data-dir, and every drive. Set ${PROFILE_ENV} to the folder ` +
-        'containing "Default" if the app keeps its data elsewhere.',
-    })
-  } else if (!credentials.ok) {
+  const credentials = loadDoubaoCredentials()
+  if (!credentials.ok) {
     checks.push({ name: 'credentials', status: 'fail', detail: credentials.reason ?? 'unavailable' })
   } else {
     const present = REQUIRED_COOKIE_NAMES.filter((name) => credentials.pairs.get(name))
     checks.push({
       name: 'credentials',
       status: present.length === REQUIRED_COOKIE_NAMES.length ? 'ok' : 'fail',
-      detail: `${credentials.pairs.size} cookies decrypted; ${present.length}/${REQUIRED_COOKIE_NAMES.length} required session cookies present`,
+      detail: `${credentials.pairs.size} cookies in the sealed browser session; ${present.length}/${REQUIRED_COOKIE_NAMES.length} required session cookies present`,
       // Names and counts only — never values.
       data: {
-        profile: describeProfileLocation(),
-        // Every candidate, best first. More than one means the loader had to
-        // choose between them, which is exactly what a bug report needs to see.
+        source: 'browser (sealed DPAPI file)',
+        // Absent here is informational, not a fault: see the comment above.
+        profile: profiles.length > 0 ? describeProfileLocation() : 'no Doubao app profile (not needed)',
         candidates: profiles.map((entry) => `${entry.dir} (via ${entry.source})`),
         cookieCount: credentials.pairs.size,
       },

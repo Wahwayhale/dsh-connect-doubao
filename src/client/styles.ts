@@ -60,11 +60,6 @@ export const DOUBAO_CARD_CSS = `
 .dbq-figure-sub { color: #9aa0a6; font-size: 12px; font-weight: 400; }
 .dbq-row-foot { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .dbq-meta { color: #9aa0a6; font-size: 11.5px; white-space: nowrap; }
-/* Candidate list: one path per line, and a long path must wrap instead of
-   pushing the card wider than the settings panel. */
-.dbq-candidates { color: #8b929b; font-size: 11.5px; white-space: pre-wrap; word-break: break-all;
-  background: #12151a; border: 1px solid #1e222a; border-radius: 8px; padding: 8px 10px; }
-
 .dbq-bar { height: 8px; border-radius: 999px; background: #1c2027; overflow: hidden;
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .03); }
 .dbq-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #3b82f6, #60a5fa);
