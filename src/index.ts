@@ -232,7 +232,7 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
     })
     const { adapter, invalidate, setEnabledModelIds } = createDoubaoAdapter({
       shim,
-      enabledModelIds: effectiveIds(config),
+      enabledModelIds: effectiveIds(current),
       modelsProvider: liveModels,
     })
 
