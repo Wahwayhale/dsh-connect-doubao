@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 /**
  * Doubao model catalog.
  *
@@ -212,7 +213,22 @@ export const CREATION_BLOCK_TYPE = 2074
  * DSH's model picker without inventing a second UI.
  */
 export const DOUBAO_IMAGE_MODEL_ID = 'image-gen'
-export const DOUBAO_IMAGE_MODEL_NAME = '豆包 生图（Seedream 5.0）'
+/**
+ * IMAGEGEN_LABEL_OVERLAY: 生图版本名以插件根目录的 image-models.json 为准，
+ * 该文件由 doubao_imagemodels.py --sync 从服务端 get_item_conf 生成。
+ */
+function imageModelLabelFromOverlay(): string | undefined {
+  try {
+    const url = new URL('../image-models.json', import.meta.url)
+    const parsed = JSON.parse(readFileSync(url, 'utf8')) as { label?: unknown }
+    return typeof parsed.label === 'string' && parsed.label !== '' ? parsed.label : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export const DOUBAO_IMAGE_MODEL_NAME =
+  imageModelLabelFromOverlay() ?? '豆包 生图（Seedream 5.5）'
 
 /** The chat model a skill turn rides on: the app's own default. */
 export const SKILL_CARRIER_MODEL_ID = '0'

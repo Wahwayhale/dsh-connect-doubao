@@ -32,6 +32,7 @@ import {
   TASK_AGENT_MODE,
   CREATION_BLOCK_TYPE,
   DOUBAO_CONTEXT_WINDOW,
+  DOUBAO_IMAGE_MODEL_ID,
   type DoubaoSkillName,
   findDoubaoModel,
   findReasoningLevel,
@@ -407,7 +408,27 @@ export function buildGeneralTaskParam(
  * local sandbox and workspace paths, none of which apply to an external client,
  * and the endpoint has been observed answering correctly without it.
  */
+/**
+ * Add the 「生成图片：」 prefix that Doubao's image skill requires.
+ *
+ * The desktop app gets this for free: its `chat_ability.ability_param` carries
+ * `reply_message_format: "生成图片：%s"`, which rewrites the outgoing text before
+ * the request leaves. An external client has no such hook, so the same rewrite
+ * happens here. Without it the server treats the turn as ordinary chat and
+ * answers with prose instead of drawing.
+ *
+ * Deliberately ONLY the prefix: appending extra instructions makes Doubao read
+ * them as part of the subject and drop the picture entirely (measured).
+ */
+export function withImagePrefix(prompt: string, options: ChatRequestOptions = {}): string {
+  const isImageTurn = options.skill === 'imageGen' || options.modelKey === DOUBAO_IMAGE_MODEL_ID
+  if (!isImageTurn) return prompt
+  if (/^\s*(生成图片|生成一张|画一张|画个|绘制)/.test(prompt)) return prompt
+  return `生成图片：${prompt}`
+}
+
 export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) {
+  prompt = withImagePrefix(prompt, options)
   const model = findDoubaoModel(options.modelKey)
   const level = findReasoningLevel(options.reasoningLevel)
   const task = taskModeEnabled(options)
@@ -758,7 +779,8 @@ function toDoubaoImage(raw: unknown): DoubaoImage | undefined {
     const value = image[key]
     return typeof value === 'object' && value !== null ? value as never : undefined
   }
-  const best = pick('image_ori') ?? pick('image_preview') ?? pick('image_thumb')
+  // IMAGEGEN_RAW_PATCH: image_ori 带 logo 水印；image_ori_raw 才是原图。
+  const best = pick('image_ori_raw') ?? pick('image_ori') ?? pick('image_preview') ?? pick('image_thumb')
   if (best === undefined || typeof best.url !== 'string' || best.url === '') return undefined
   const taskId = typeof creation.id === 'string' ? creation.id
     : typeof creation.id === 'number' ? String(creation.id) : undefined

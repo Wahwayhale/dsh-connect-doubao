@@ -13,7 +13,7 @@ import {
   SKILL_CARRIER_MODEL_ID,
   inputSkillOf,
 } from '../src/doubao-catalog.ts'
-import { collectBlocks } from '../src/doubao-upstream.ts'
+import { collectBlocks, withImagePrefix } from '../src/doubao-upstream.ts'
 
 /** A creation block exactly as the stream delivered it (URLs shortened). */
 const creationFrame = {
@@ -102,5 +102,44 @@ describe('the image model alias', () => {
     expect(DOUBAO_IMAGE_MODEL_ID).toBe('image-gen')
     expect(DOUBAO_SKILLS[DOUBAO_IMAGE_MODEL_ID as keyof typeof DOUBAO_SKILLS]).toBeUndefined()
     expect(SKILL_CARRIER_MODEL_ID).toBe('0')
+  })
+})
+
+describe('watermark-free variant', () => {
+  it('prefers image_ori_raw over the watermarked image_ori', () => {
+    // Same creation block, now carrying the raw variant Doubao ships alongside
+    // the logo-stamped one. Picking image_ori drew 「豆包AI生成」 into the corner.
+    const withRaw = structuredClone(creationFrame)
+    const image = withRaw.patch_op[0].patch_value.content_block[0]
+      .content.creation_block.creations[0].image as Record<string, unknown>
+    const original = image.image_ori as { url: string; width: number; height: number }
+    image.image_ori_raw = {
+      url: 'https://example.invalid/raw.png~tplv-a9rns2rl98-image_raw.png',
+      width: original.width,
+      height: original.height,
+    }
+    const result = run(withRaw)
+    expect(result.images).toHaveLength(1)
+    expect(result.images[0]?.url).toContain('image_raw')
+  })
+})
+
+describe('the 「生成图片：」 prefix', () => {
+  it('is added for an image turn so the server draws instead of chatting', () => {
+    expect(withImagePrefix('一只白猫在旧木桌上打盹', { skill: 'imageGen' }))
+      .toBe('生成图片：一只白猫在旧木桌上打盹')
+    expect(withImagePrefix('一只白猫', { modelKey: DOUBAO_IMAGE_MODEL_ID }))
+      .toBe('生成图片：一只白猫')
+  })
+
+  it('is never doubled', () => {
+    for (const already of ['生成图片：猫', '画一张猫', '绘制一只猫']) {
+      expect(withImagePrefix(already, { skill: 'imageGen' })).toBe(already)
+    }
+  })
+
+  it('leaves ordinary chat untouched', () => {
+    expect(withImagePrefix('帮我写个函数', { modelKey: '0' })).toBe('帮我写个函数')
+    expect(withImagePrefix('你好')).toBe('你好')
   })
 })

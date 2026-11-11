@@ -1,3 +1,6 @@
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 /**
  * Loopback shim for the Doubao route.
  *
@@ -294,8 +297,62 @@ function requestOptions(parsed: InboundChatRequest): {
 export function imageMarkdown(images: readonly DoubaoImage[]): string {
   if (images.length === 0) return ''
   return images
-    .map((image, i) => `![豆包生图 ${i + 1}](${image.url})`)
+    .map((image, i) => `![豆包生图 ${i + 1}](${markdownSafeUrl(image.url)})`)
     .join('\n\n')
+}
+
+/**
+ * IMAGEGEN_LOCAL_FILE: download the picture and reference it locally.
+ *
+ * The Harness renders local files reliably; a signed CDN URL in Markdown shows
+ * up as 「图片无法预览」 (the `~tplv-…` segment breaks link parsing and the
+ * origin may be blocked). Saving the bytes next to the session sidesteps both.
+ *
+ * Returns Markdown with the local path, or the remote URL when the download
+ * fails — a broken preview is better than a missing picture.
+ */
+export async function imageMarkdownLocal(images: readonly DoubaoImage[]): Promise<string> {
+  if (images.length === 0) return ''
+  const dir = join(homedir(), '.dsh', 'doubao-images')
+  const parts: string[] = []
+  for (const [i, image] of images.entries()) {
+    const fallback = `![豆包生图 ${i + 1}](${markdownSafeUrl(image.url)})`
+    try {
+      const res = await fetch(image.url)
+      if (!res.ok) {
+        parts.push(fallback)
+        continue
+      }
+      const buf = Buffer.from(await res.arrayBuffer())
+      mkdirSync(dir, { recursive: true })
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      const file = join(dir, `doubao-${stamp}-${i + 1}.png`)
+      writeFileSync(file, buf)
+      parts.push(`![豆包生图 ${i + 1}](${file.replace(/\\/g, '/')})`)
+    } catch {
+      parts.push(fallback)
+    }
+  }
+  return parts.join('\n\n')
+}
+
+/**
+ * IMAGEGEN_URL_SAFE: make a CDN URL survive Markdown link parsing.
+ *
+ * Doubao's signed URLs carry `~tplv-…` and `x-signature=…%3D`. A bare `~` is the
+ * strikethrough marker, so the link breaks and the Harness renders
+ * 「图片无法预览：*」 instead of the picture. Percent-encoding the path segment
+ * keeps the bytes identical while removing the ambiguous characters.
+ */
+function markdownSafeUrl(raw: string): string {
+  if (typeof raw !== 'string' || raw === '') return ''
+  // Split query off so its separators are not re-encoded.
+  const q = raw.indexOf('?')
+  const path = q === -1 ? raw : raw.slice(0, q)
+  const query = q === -1 ? '' : raw.slice(q)
+  const safePath = path.replace(/~/g, '%7E').replace(/\(/g, '%28').replace(/\)/g, '%29')
+  const safeQuery = query.replace(/\(/g, '%28').replace(/\)/g, '%29')
+  return safePath + safeQuery
 }
 
 /**
@@ -331,6 +388,74 @@ function flattenContent(content: unknown): string {
  * shape the tool contract promises — the model is asked to recognise that prefix,
  * so the two sides must not drift apart.
  */
+
+/**
+ * Whether this turn targets the image alias.
+ *
+ * DSH may spell the model id with a provider prefix (`doubao/image-gen`) or in
+ * another case; a missed match silently falls back to the full agent prompt,
+ * which is how framework text ended up drawn into the picture.
+ */
+function isImageModel(model: string | undefined): boolean {
+  if (typeof model !== 'string' || model === '') return false
+  const tail = model.includes('/') ? model.slice(model.lastIndexOf('/') + 1) : model
+  return tail.trim().toLowerCase() === DOUBAO_IMAGE_MODEL_ID
+}
+
+/**
+ * IMAGEGEN_PROMPT: pick the sentence the user actually typed.
+ *
+ * The transcript DSH hands us is not just that sentence: it carries the
+ * developer prompt, a runtime snapshot, the skill catalog, the MCP listing and
+ * memory pages, each as its own `user` message. Taking the last user message
+ * therefore picked up a `<system-reminder>` block, and Doubao drew that text
+ * into the picture — the reported "turn 1 step 1 / tup / tun" artefacts.
+ *
+ * A picture description is short and plain, so a message qualifies only when it
+ * is bounded in length and carries no known marker or XML-ish wrapper.
+ */
+const FRAMEWORK_MARKERS = [
+  'Current runtime context',
+  'Time sampled while preparing',
+  'Elapsed since the preceding',
+  '<system-reminder>',
+  '<available_skills>',
+  '<mcp_catalog>',
+  '<hindsight_pages>',
+  '<hindsight_knowledge',
+  'A skill is a reusable set of task-specific instructions',
+  'The following MCP servers are available',
+  'You are an AI agent powered by',
+]
+
+/** Anything longer than this is machine context, not a picture request. */
+const MAX_IMAGE_PROMPT_CHARS = 600
+
+function looksLikeFramework(text: string): boolean {
+  const head = text.slice(0, 400)
+  if (head.startsWith('<')) return true
+  if (/^[<\[]/.test(head) && head.includes('>')) return true
+  return FRAMEWORK_MARKERS.some((marker) => head.includes(marker))
+}
+
+function buildImagePrompt(
+  all: ReadonlyArray<{ role?: string; content?: unknown; name?: string }>,
+  outgoing: ReadonlyArray<{ role?: string; content?: unknown; name?: string }>,
+): string {
+  const source = all.length > 0 ? all : outgoing
+  let fallback = ''
+  for (let i = source.length - 1; i >= 0; i -= 1) {
+    const message = source[i]
+    if (message === undefined) continue
+    if ((message.role ?? 'user') !== 'user') continue
+    const text = flattenContent(message.content).trim()
+    if (text === '' || looksLikeFramework(text)) continue
+    if (text.length <= MAX_IMAGE_PROMPT_CHARS) return text
+    if (fallback === '') fallback = text.slice(0, MAX_IMAGE_PROMPT_CHARS)
+  }
+  return fallback
+}
+
 function buildPrompt(messages: Array<{ role?: string; content?: unknown; name?: string }> | undefined): string {
   if (!Array.isArray(messages) || messages.length === 0) return ''
   const turns: string[] = []
@@ -640,7 +765,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       // Generated images have no place on the OpenAI assistant side, so they are
       // appended to the text as Markdown — which is both what the user sees and
       // what lets the Harness fetch the file afterwards.
-      const markdown = imageMarkdown(result.images)
+      const markdown = await imageMarkdownLocal(result.images)
       if (markdown !== '') {
         send({ choices: [{ index: 0, delta: { content: `\n\n${markdown}` }, finish_reason: null }] })
       }
@@ -794,7 +919,12 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       const useDelta = delta.length > 0
       const isContinuationTurn = continuing && useDelta
       const outgoing = useDelta ? delta : (parsed.messages ?? [])
-      const promptBody = buildPrompt(outgoing)
+      // IMAGEGEN_SLIM_PROMPT: 生图模型只该看到用户那句描述。
+      // 完整上下文（系统提示、工具清单、MCP、技能、历史）会让它先分析"该用哪个工具"，
+      // 实测白等 1 分 54 秒才出图。这里只取最后一条 user 消息。
+      const promptBody = isImageModel(parsed.model)
+        ? buildImagePrompt(parsed.messages ?? [], outgoing)
+        : buildPrompt(outgoing)
       if (!promptBody) {
         writeOpenAIError(res, 400, 'invalid_request', 'no usable message content')
         return
@@ -812,10 +942,19 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       // only thing we control, so being able to see exactly what went upstream is
       // the difference between debugging and guessing.
       if (process.env.DSH_DOUBAO_DEBUG_PROMPT === '1') {
-        process.stderr.write(
-          `[prompt] chars=${prompt.length} tools=${parsed.tools?.length ?? 0} emulate=${emulate}\n` +
-          `${prompt.slice(0, 1200)}\n---\n`,
-        )
+        const raw = JSON.stringify((parsed.messages ?? []).map((m) => ({
+          r: m.role,
+          t: flattenContent(m.content).slice(0, 200),
+        })))
+        const line = `[prompt] model=${String(parsed.model)} chars=${prompt.length} `
+          + `tools=${parsed.tools?.length ?? 0} emulate=${emulate} msgs=${(parsed.messages ?? []).length}\n`
+          + `RAW=${raw}\n${prompt.slice(0, 2000)}\n---\n`
+        process.stderr.write(line)
+        try {
+          appendFileSync(join(homedir(), '.dsh', 'doubao-prompt.log'), line)
+        } catch {
+          /* diagnostics must never break the request */
+        }
       }
       // ---- cancellation & liveness -------------------------------------
       //
@@ -855,7 +994,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         const emulated = emulate ? parseToolCalls(result.text) : { calls: [], text: result.text }
         const content = [
           emulated.text,
-          result.images.length > 0 ? imageMarkdown(result.images) : '',
+          result.images.length > 0 ? await imageMarkdownLocal(result.images) : '',
         ].filter((part) => part !== '').join('\n\n')
         // What we actually sent upstream: the inbound id run through the
         // catalog, so an unknown id degrades to the default instead of being

@@ -20,3 +20,9 @@ coverage/
 # marketplace images without anyone noticing.
 !docs/assets/
 !docs/assets/*.png
+
+# 本机运行时由 doubao_imagemodels.py --sync 生成，不入库
+image-models.json
+
+# 本地调试脚本
+exp_task.js
