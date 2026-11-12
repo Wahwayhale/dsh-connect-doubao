@@ -29,3 +29,6 @@ exp_task.js
 
 # 提交市场 PR 时的临时工作目录
 .pr/
+
+# 提市场 PR 时克隆的上游仓库，不入库
+awesome-dsh-plugin/
