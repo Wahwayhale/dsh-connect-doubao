@@ -4,6 +4,34 @@
 
 ---
 
+## 0.7.0 — 2026-11-13
+
+> 这一版把登录与凭据密封从「仅 Windows」扩到 macOS / Linux：同一个扫码流程、同一个密封
+> 文件路径，只是密封算法按平台选择。起因是一台装了 Chrome 的 Mac 上，登录在第一步就被
+> 「没找到 Chrome 或 Edge」拦下，修完又暴露出第二步的 DPAPI 依赖。
+
+### 修复
+
+- **macOS / Linux 找不到浏览器** —— `findBrowser` 的候选路径只有 `C:\Program Files\...`
+  四条 Windows 路径，Mac 上装了 Chrome 也永远返回 undefined，扫码登录在开窗之前就失败。
+  现在按 `process.platform` 分别维护候选表（macOS：Chrome / Canary / Chromium / Edge；
+  Linux：google-chrome / chromium 系），并新增 `DSH_DOUBAO_BROWSER` 环境变量指向任意
+  Chromium 内核二进制。
+- **凭据保存依赖 Windows DPAPI** —— 扫码成功后落盘走 PowerShell 调 crypt32，macOS 上
+  报「Windows DPAPI helper produced no output (status=null…)」。现在 Windows 仍走 DPAPI
+  （行为完全不变，旧密封文件兼容读取）；macOS / Linux 改用 AES-256-GCM（每用户密钥
+  `~/.dsh/doubao-credential-key`，0600，salt+nonce 每次密封随机），密封文件加
+  `DSHDPAPI` + 版本字节魔术头，两种格式按头部自动识别。
+- **登录后浏览器进程残留** —— `terminate` 的 `spawnSync('taskkill', …)` 在非 Windows 上
+  报 ENOENT，而 spawnSync 不抛异常，`child.kill()` 兜底永远走不到，Chrome 窗口留在后台。
+  现在 taskkill 只在 win32 走，其他平台直接 SIGTERM。
+
+### 变更
+
+- **平台声明** —— README / README.en 的「平台支持」从「仅 Windows x64」改为
+  Windows（实测）+ macOS（登录实测可用）+ Linux（未实测）；CLI doctor 的凭据来源文案
+  去掉 DPAPI 限定词。
+
 ## 0.6.1 — 2026-11-12
 
 > 这一版把「模型清单」从一张硬编码表，改成照抄豆包客户端菜单：有什么模型、各自多少倍率、

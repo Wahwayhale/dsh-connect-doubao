@@ -24,7 +24,8 @@
  * session still valid and needs no scan at all.
  *
  * SECURITY: the returned pairs are the user's live session. They are handed to
- * `doubao-auth.ts`, which seals them with DPAPI before anything touches disk.
+ * `doubao-auth.ts`, which seals them before anything touches disk (DPAPI on
+ * Windows, AES-256-GCM elsewhere — see that module).
  * Nothing here logs a value.
  *
  * @module dsh-connect-doubao/auth-browser
@@ -45,7 +46,27 @@ export function browserProfileDir(): string {
   return join(homedir(), '.dsh', 'doubao-browser-profile')
 }
 
-const CANDIDATES = [
+/**
+ * Per-platform Chromium binaries, most likely first.
+ *
+ * Windows paths were the only entries for the whole 0.6.x line, which made the
+ * QR sign-in impossible on macOS even with Chrome installed — the failure was
+ * 「没找到 Chrome 或 Edge」 before a browser window ever opened. Each platform
+ * gets its own list, and every binary here is Chromium-based (shares the
+ * `--remote-debugging-port` CDP surface this module drives).
+ */
+const CANDIDATES = process.platform === 'darwin' ? [
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+] : process.platform === 'linux' ? [
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/snap/bin/chromium',
+] : [
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -80,8 +101,16 @@ interface CdpCookie {
   expires?: unknown
 }
 
-/** Find an installed Chromium binary, or undefined. */
+/**
+ * Find an installed Chromium binary, or undefined.
+ *
+ * `DSH_DOUBAO_BROWSER` wins when set and existing: it lets a user point the
+ * sign-in at any Chromium/Chrome/Edge binary, including non-default or
+ * portable installs no candidate list can know about.
+ */
 export function findBrowser(): string | undefined {
+  const override = process.env.DSH_DOUBAO_BROWSER
+  if (typeof override === 'string' && override !== '' && existsSync(override)) return override
   for (const candidate of CANDIDATES) {
     if (existsSync(candidate)) return candidate
   }
@@ -186,13 +215,15 @@ function pickPairs(cookies: readonly CdpCookie[]): Map<string, string> {
 /** Kill a spawned browser including its renderer children. */
 function terminate(child: ChildProcess): void {
   if (child.pid === undefined) return
-  try {
-    // Windows: `child.kill()` leaves the renderer/gpu children behind, which
-    // keeps the user-data-dir locked and the next login fails to start.
+  // Windows: `child.kill()` leaves the renderer/gpu children behind, which
+  // keeps the user-data-dir locked and the next login fails to start.
+  // Everywhere else the signal reaches the whole process group, and browsers
+  // shut their children down on their own.
+  if (process.platform === 'win32') {
     spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
-  } catch {
-    try { child.kill() } catch { /* gone already */ }
+    return
   }
+  try { child.kill('SIGTERM') } catch { /* gone already */ }
 }
 
 /**
