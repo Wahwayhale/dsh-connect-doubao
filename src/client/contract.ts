@@ -68,7 +68,7 @@ export type DoubaoAccountState =
   | 'ok'
   /** Doubao holds no usable session cookie. Re-login in the app fixes this. */
   | 'signed_out'
-  /** Credentials exist but could not be read (DPAPI / profile missing). */
+  /** Credentials exist but could not be read (seal / profile missing). */
   | 'unreadable'
   /** Upstream refused the session as dead. Re-login fixes this. */
   | 'session_dead'

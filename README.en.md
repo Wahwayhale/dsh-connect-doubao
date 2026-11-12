@@ -4,8 +4,8 @@
 > **「工作任务」 (task-mode) models** (2.1 Lite / 2.1 Pro / Auto, which spend the paid
 > membership quota), **Seedream image generation**, plus a **read-only** quota panel
 > (5-hour window / weekly window / activity grant, each with a reset countdown).
-> There is exactly one way in: **one browser QR sign-in**. Windows x64 only — the
-> session is sealed locally with Windows DPAPI.
+> There is exactly one way in: **one browser QR sign-in**. The session is sealed
+> locally: Windows DPAPI on Windows, per-user-key AES-256-GCM on macOS / Linux.
 
 [![npm version](https://img.shields.io/npm/v/dsh-connect-doubao.svg)](https://www.npmjs.com/package/dsh-connect-doubao)
 [![license](https://img.shields.io/npm/l/dsh-connect-doubao.svg)](./LICENSE)
@@ -22,15 +22,16 @@ neither required nor read.**
 
 Pressing 「重新登录」 in the card opens a dedicated Chromium window on Doubao's login
 page. Once you scan the code (or finish the phone-verification flow) the plugin
-pulls the session cookies over CDP and seals them with Windows DPAPI into
-`%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`. Only that one moment needs a
+pulls the session cookies over CDP and seals them into
+`~/.dsh/doubao-credentials-browser.dpapi` (Windows DPAPI on Windows, AES-256-GCM on
+macOS / Linux — see "Platform support"). Only that one moment needs a
 human; everything after it is plain HTTP.
 
 | Requirement | Notes |
 | --- | --- |
 | **One QR sign-in** | Otherwise the card reports "not signed in" and the provider is unavailable |
-| **Windows** | Sealing relies on Windows DPAPI. **macOS / Linux are not supported** |
-| Chrome or Edge installed | That window IS the sign-in surface; the default install path is enough |
+| **Windows / macOS / Linux** | Windows seals with DPAPI; macOS / Linux seal with AES-256-GCM keyed by `~/.dsh/doubao-credential-key` (0600) |
+| Chrome or Edge installed | That window IS the sign-in surface; the default install path is enough, or point `DSH_DOUBAO_BROWSER` at any Chromium binary |
 | Some subscription quota | A free account connects too, but the quota is small |
 
 With no session the plugin fails loudly ("还没有浏览器登录态…") rather than silently.
@@ -229,9 +230,9 @@ plugin marketplace and what keeps runtime types consistent.
 
 | Platform | Status |
 | --- | --- |
-| **Windows x64** | ✅ **verified on real hardware** |
-| macOS | ❌ unsupported (DPAPI is Windows-only) |
-| Linux | ❌ unsupported (same) |
+| **Windows x64** | ✅ verified on real hardware (DPAPI seal) |
+| macOS | ⚠️ newly supported (AES-256-GCM seal; sign-in verified on a real Mac) |
+| Linux | ⚠️ newly supported (same seal as macOS, untested) |
 
 **Session** — one source only (`src/doubao-auth.ts` + `src/doubao-auth-browser.ts`):
 
@@ -240,9 +241,10 @@ plugin marketplace and what keeps runtime types consistent.
 2. you scan the code, and the plugin collects every cookie with one CDP
    `Storage.getCookies` call;
 3. only the Doubao/Bytedance cookies are kept, and only if all 9 required session
-   cookies are there; the result is sealed with Windows DPAPI into
-   `%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi` (current-user scope — another
-   account or machine cannot open it);
+   cookies are there; the result is sealed into
+   `~/.dsh/doubao-credentials-browser.dpapi` — Windows DPAPI (current-user scope) on
+   Windows, AES-256-GCM keyed by `~/.dsh/doubao-credential-key` (0600) elsewhere.
+   Another account or machine cannot open it;
 4. every later request reads that file, cached in-process for 10 minutes.
 
 **Why the client's cookie jar is no longer decrypted.** While the Doubao client runs it
@@ -335,7 +337,8 @@ npm run check       # all of the above
    own business — sending an invented key still returns HTTP 200, so the field is not
    validated. What 0.4.1 offers is **the whole task-mode request shape for a given
    key** (verified to answer), not a guarantee that Pro rather than Lite did the work.
-5. **Windows only** — the session is sealed with DPAPI. The Doubao app does **not**
+5. **Per-platform sealing** — Windows DPAPI, or AES-256-GCM on macOS / Linux
+   (sign-in verified on a real Mac). The Doubao app does **not**
    have to be installed: the session comes from the browser sign-in. `User Data` is only
    read for model discovery and the task-mode workspace (see the lookup above); when it
    is missing the workspace falls back to a temp directory and the session is unaffected.

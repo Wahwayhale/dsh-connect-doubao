@@ -24,9 +24,10 @@
  * signed in somewhere on this machine.
  *
  * SECURITY: cookie values live in this process's memory and in one file sealed
- * with Windows DPAPI (current-user scope), which no other Windows account and no
- * other machine can open. Nothing here is logged, and nothing leaves except the
- * outbound request's `Cookie:` header.
+ * to this machine's account — Windows DPAPI (current-user scope) on Windows, a
+ * per-user-key AES-256-GCM seal elsewhere. No other account on the machine and
+ * no other machine can open it. Nothing here is logged, and nothing leaves
+ * except the outbound request's `Cookie:` header.
  *
  * @module dsh-connect-doubao/auth
  */
@@ -34,6 +35,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync,
 import { tmpdir, homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto'
 
 export interface DoubaoCredentials {
   /** Cookie pairs ready for a `Cookie:` header. */
@@ -49,10 +51,11 @@ export interface DoubaoCredentials {
 /**
  * How long a loaded session stays in the process cache.
  *
- * Not a security boundary: DPAPI unprotect costs a PowerShell child process, and
- * every upstream call wants the header, so the cache is what keeps a chat turn
- * from spawning one process per request. Doubao rotates its own cookies
- * server-side; the first rejected request is the accurate expiry signal.
+ * Not a security boundary: unsealing costs work on every platform (a PowerShell
+ * child process on Windows, an scrypt derivation elsewhere), and every upstream
+ * call wants the header, so the cache is what keeps a chat turn from paying
+ * that on each request. Doubao rotates its own cookies server-side; the first
+ * rejected request is the accurate expiry signal.
  */
 export const CREDENTIAL_TTL_MS = 10 * 60 * 1000
 
@@ -213,6 +216,99 @@ function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
 }
 
 /* ------------------------------------------------------------------ *
+ * Cross-platform seal (macOS / Linux)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Where the cross-platform key lives.
+ *
+ * DPAPI is Windows-only, so everywhere else the seal falls back to
+ * AES-256-GCM keyed by a per-user secret at `~/.dsh/doubao-credential-key`
+ * (0600, generated on first use). That is the closest portable equivalent of
+ * DPAPI's current-user scope: the ciphertext is bound to this account on this
+ * machine and is unreadable by other local users. It is a weaker boundary than
+ * DPAPI — an attacker running as this user can read the key — but the same is
+ * true of DPAPI against the user's own account; the threat being modelled is
+ * other users and other machines, and a session cookie is revocable server-side.
+ */
+const CREDENTIAL_KEY_FILENAME = 'doubao-credential-key'
+
+function credentialKeyPath(): string {
+  return join(homedir(), '.dsh', CREDENTIAL_KEY_FILENAME)
+}
+
+/** Read the per-user seal key, generating a 32-byte one on first use. */
+function loadCredentialKey(): Buffer {
+  try {
+    return readFileSync(credentialKeyPath())
+  } catch {
+    const key = randomBytes(32)
+    mkdirSync(dirname(credentialKeyPath()), { recursive: true })
+    writeFileSync(credentialKeyPath(), key, { mode: 0o600 })
+    return key
+  }
+}
+
+/** Magic prefix distinguishing a versioned cross-platform blob from raw DPAPI. */
+const SEAL_MAGIC = Buffer.from('DSHDPAPI', 'utf8')
+/** Bump when the layout below ever changes; unseal rejects unknown versions. */
+const SEAL_VERSION = 1
+
+/**
+ * AES-256-GCM seal: magic(7) + version(1) + salt(16) + nonce(12) + ct(16 tag).
+ *
+ * The salt is fresh per seal so scrypt re-derives the key from the stored
+ * secret; the nonce is fresh per seal because GCM forbids nonce reuse under a
+ * fixed key — with a random salt every seal effectively has a fresh key.
+ */
+function sealAes(plain: Buffer): Buffer {
+  const key = loadCredentialKey()
+  const salt = randomBytes(16)
+  const nonce = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', scryptSync(key, salt, 32), nonce)
+  const body = Buffer.concat([cipher.update(plain), cipher.final(), cipher.getAuthTag()])
+  return Buffer.concat([SEAL_MAGIC, Buffer.from([SEAL_VERSION]), salt, nonce, body])
+}
+
+/** Reverse of `sealAes`; throws on tamper, wrong key, or truncated input. */
+function unsealAes(blob: Buffer): Buffer {
+  const key = loadCredentialKey()
+  const salt = blob.subarray(8, 24)
+  const nonce = blob.subarray(24, 36)
+  const tagAndData = blob.subarray(36)
+  if (salt.length !== 16 || nonce.length !== 12 || tagAndData.length <= 16) {
+    throw new Error('credential blob is truncated or corrupt')
+  }
+  const tag = tagAndData.subarray(tagAndData.length - 16)
+  const data = tagAndData.subarray(0, tagAndData.length - 16)
+  const decipher = createDecipheriv('aes-256-gcm', scryptSync(key, salt, 32), nonce)
+  decipher.setAuthTag(tag)
+  return Buffer.concat([decipher.update(data), decipher.final()])
+}
+
+/**
+ * Unseal a stored credential blob, whatever platform sealed it.
+ *
+ * A `DSHDPAPI`-prefixed blob is the cross-platform format above. Anything else
+ * is a legacy raw DPAPI blob from a pre-0.7 Windows install, which only a
+ * Windows machine can open — there the PowerShell helper runs as before, and
+ * the result still authenticates because DPAPI sealed it on this same machine.
+ */
+function unsealBlob(blob: Buffer): Buffer {
+  if (blob.subarray(0, SEAL_MAGIC.length).equals(SEAL_MAGIC)) {
+    const version = blob[SEAL_MAGIC.length]
+    if (version !== SEAL_VERSION) {
+      throw new Error(`unsupported credential blob version: ${String(version)}`)
+    }
+    return unsealAes(blob)
+  }
+  if (process.platform !== 'win32') {
+    throw new Error('legacy DPAPI credential blob cannot be read on non-Windows platforms')
+  }
+  return dpapiCall('unprotect', blob)
+}
+
+/* ------------------------------------------------------------------ *
  * The sealed browser session
  * ------------------------------------------------------------------ */
 
@@ -232,7 +328,13 @@ function browserCachePath(): string {
   return join(homedir(), '.dsh', BROWSER_CACHE_FILENAME)
 }
 
-/** Seal browser-harvested cookies to disk. Throws on a DPAPI failure. */
+/**
+ * Seal browser-harvested cookies to disk. Throws on a seal failure.
+ *
+ * Windows keeps DPAPI (current-user scope); macOS / Linux use the per-user-key
+ * AES-256-GCM seal above. Either way the file lands at the same path, so the
+ * rest of the plugin never learns the difference.
+ */
 export function saveBrowserCredentials(pairs: Map<string, string>): void {
   const header = [...pairs.entries()].map(([name, value]) => `${name}=${value}`).join('; ')
   const payload = JSON.stringify({
@@ -241,7 +343,10 @@ export function saveBrowserCredentials(pairs: Map<string, string>): void {
     header,
     pairs: [...pairs.entries()],
   })
-  const sealed = dpapiCall('protect', Buffer.from(payload, 'utf8'))
+  const plain = Buffer.from(payload, 'utf8')
+  const sealed = process.platform === 'win32'
+    ? dpapiCall('protect', plain)
+    : sealAes(plain)
   mkdirSync(dirname(browserCachePath()), { recursive: true })
   writeFileSync(browserCachePath(), sealed, { mode: 0o600 })
 }
@@ -250,7 +355,7 @@ export function saveBrowserCredentials(pairs: Map<string, string>): void {
 export function loadBrowserCredentials(): DoubaoCredentials | undefined {
   try {
     const sealed = readFileSync(browserCachePath())
-    const json = dpapiCall('unprotect', sealed).toString('utf8')
+    const json = unsealBlob(sealed).toString('utf8')
     const parsed = JSON.parse(json) as { header?: unknown; pairs?: unknown }
     if (typeof parsed.header !== 'string' || !Array.isArray(parsed.pairs)) return undefined
     const pairs = new Map<string, string>()
