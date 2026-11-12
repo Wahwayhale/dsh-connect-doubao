@@ -31,7 +31,9 @@ import {
   DOUBAO_MODELS,
   DOUBAO_PROVIDER,
   DOUBAO_PROVIDER_DISPLAY_NAME,
+  DOUBAO_REASONING_LEVELS,
   enabledModelsOf,
+  levelIdOf,
   type DoubaoModelInfo,
 } from './doubao-catalog.ts'
 
@@ -84,17 +86,58 @@ const REQUEST_IMAGE_BUDGETS = {
  * so the picker cannot request thinking from a route that will not honour it.
  */
 function thinkingLevelMap(info: DoubaoModelInfo): Record<string, string | null> {
-  const levels = ['minimal', 'low', 'medium', 'high'] as const
+  const levels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
   if (!info.reasoning) {
     return Object.fromEntries([...levels, 'off'].map((level) => [level, null]))
   }
-  return {
-    minimal: 'low',
-    low: 'low',
-    medium: 'mid',
-    high: 'high',
-    off: 'low',
+  // pi-ai only offers a level whose map entry is a string, and `xhigh`/`max` are
+  // offered ONLY when mapped — that pair is how an unsupported rung disappears
+  // from the picker instead of being silently clamped.
+  //
+  // The rungs are the MODEL's own, from the client menu: GLM publishes 低/高/最高
+  // (3/5/7) and would answer 中 with whatever it likes, so a shared ladder either
+  // offers levels a model cannot honour or hides ones it can. `minimal` and `off`
+  // collapse onto the model's weakest rung, because Doubao has no "off".
+  const rungs = ladderOf(info)
+  const weakest = levelIdOf(rungs[0]!)
+  const pick = (index: number): string | null => {
+    const rung = rungs[Math.min(index, rungs.length - 1)]
+    return rung === undefined ? weakest : levelIdOf(rung)
   }
+  return {
+    minimal: weakest,
+    low: pick(0),
+    medium: rungs.length >= 2 ? pick(1) : null,
+    high: pick(rungs.length - 1),
+    // Only declared when the model actually has the top rungs; pi-ai reads a
+    // `null` as "not offered" and an absent key as "not offered" too, so
+    // omitting them is what keeps a 3-rung model a 3-rung model.
+    ...(rungs.length >= 4 ? { xhigh: pick(3) } : { xhigh: null }),
+    ...(rungs.length >= 5 ? { max: pick(4) } : { max: null }),
+    off: weakest,
+  }
+}
+
+/**
+ * The wire ordinals a model offers, weakest first.
+ *
+ * Falls back to the catalog-wide ladder for models whose source does not state
+ * one (the IndexedDB cache, and the static catalog itself).
+ */
+function ladderOf(info: DoubaoModelInfo): number[] {
+  const declared = (info.reasoningOptions ?? [])
+    .map((option) => option.level)
+    .filter((level) => Number.isFinite(level))
+  // The fallback is the VERIFIED rungs, not the whole catalog: a model whose source
+  // states no ladder (static catalog, IndexedDB cache) must not be offered 极高/最高
+  // on the strength of another model's menu entry.
+  const rungs = declared.length > 0
+    ? declared
+    : DOUBAO_REASONING_LEVELS.filter((level) => level.verified).map((level) => level.level)
+  // MENU ORDER, not numeric order: 自动 declares 低(3) / 中(8) / 高(5), so sorting
+  // would advertise 高 as the middle rung and 8 as the strongest — exactly
+  // backwards. De-duplicating keeps a repeated ordinal from drawing twice.
+  return [...new Set(rungs)]
 }
 
 /** Build one pi-ai model descriptor pointing at the loopback shim. */

@@ -19,7 +19,7 @@
  */
 import { afterEach, describe, expect, it } from 'vitest'
 import { assembleReplyText, buildChatBody } from '../src/doubao-upstream.ts'
-import { DOUBAO_MODELS } from '../src/doubao-catalog.ts'
+import { DOUBAO_MODELS, doubaoCatalogEntries, findReasoningLevel, levelIdOf } from '../src/doubao-catalog.ts'
 
 /** A body for the default chat turn. */
 function body(overrides: Record<string, unknown> = {}) {
@@ -130,6 +130,41 @@ describe('a reply is notify opening + chunk deltas, never only one of them', () 
 
   it('is empty when nothing arrived', () => {
     expect(assembleReplyText('', '')).toBe('')
+  })
+})
+
+describe('thinking levels', () => {
+  it('carries the two rungs the client menu declares beyond 高', () => {
+    // 6 (极高) and 7 (最高) used to be clamped to 高 in the shim, so the top half
+    // of DeepSeek / Kimi / 2.1 Max was unreachable from DSH.
+    expect(findReasoningLevel('xhigh').level).toBe(6)
+    expect(findReasoningLevel('max').level).toBe(7)
+    expect(levelIdOf(6)).toBe('xhigh')
+    expect(levelIdOf(7)).toBe('max')
+    // An ordinal the catalog has never seen still reaches the wire as itself.
+    expect(levelIdOf(9)).toBe('9')
+  })
+
+  it('reports a per-model ladder instead of the catalog-wide one', () => {
+    const [glm] = doubaoCatalogEntries([
+      {
+        id: 'person-glm-5-3-261111',
+        name: 'GLM 5.3',
+        reasoning: true,
+        reasoningOptions: [{ level: 3, name: '低' }, { level: 5, name: '高' }, { level: 7, name: '最高' }],
+      },
+    ])
+    expect(glm?.reasoningLevels.map((level) => level.level)).toEqual([3, 5, 7])
+    expect(glm?.reasoningLevels.map((level) => level.name)).toEqual(['低', '高', '最高'])
+    // 最高 is declared by the menu but never observed, so it stays provisional.
+    expect(glm?.reasoningLevels.at(-1)?.verified).toBe(false)
+  })
+
+  it('keeps a rate tag verbatim and exposes it on the catalog entry', () => {
+    const [pro] = doubaoCatalogEntries([
+      { id: '5', name: '豆包 2.1 Pro', reasoning: true, rate: { text: '0.65x', kind: 'ratio' } },
+    ])
+    expect(pro?.rate).toEqual({ text: '0.65x', kind: 'ratio' })
   })
 })
 

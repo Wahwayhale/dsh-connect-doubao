@@ -57,6 +57,7 @@ import {
   SKILL_CARRIER_MODEL_ID,
   type DoubaoSkillName,
 } from './doubao-catalog.ts'
+import { liveModels } from './doubao-discovery.ts'
 import {
   buildToolContract,
   parseToolCalls,
@@ -193,17 +194,24 @@ interface InboundChatRequest {
 /**
  * Translate the adapter's thinking-level spelling into a Doubao level id.
  *
- * pi-ai speaks OpenAI's names — including `medium` and `minimal`, which Doubao
- * has no equivalent for. Doubao only publishes 低 / 中 / 高, so the nearest
- * Doubao level wins: `minimal` and `low` both mean 低, `medium` means 中.
+ * The adapter already speaks catalog ids, and those are the same five the client
+ * menu offers (低 / 中 / 高 / 极高 / 最高), so this is mostly a passthrough — but
+ * pi-ai's own spellings can still arrive from a hand-written request, and those
+ * collapse onto the nearest Doubao rung: `minimal` means 低, `medium` means 中.
  * An unrecognised or absent value leaves the default in place.
  */
-function toDoubaoLevel(spelling: string | null | undefined): 'low' | 'mid' | 'high' | undefined {
+function toDoubaoLevel(
+  spelling: string | null | undefined,
+): 'low' | 'mid' | 'high' | 'xhigh' | 'max' | undefined {
   switch (spelling) {
     case 'minimal':
     case 'low':    return 'low'
     case 'medium': return 'mid'
     case 'high':   return 'high'
+    // Declared by the client menu for DeepSeek / Kimi / 2.1 Max. They used to be
+    // clamped to 高 here, which made the top two rungs of those models unreachable.
+    case 'xhigh':  return 'xhigh'
+    case 'max':    return 'max'
     default:       return undefined
   }
 }
@@ -227,6 +235,11 @@ function describeRequestedModel(key: string | undefined): {
     const fallback = findDoubaoModel(undefined)
     return { name: fallback.name, item_key: fallback.id }
   }
+  // `known` means "this release has a display name for it", which is a narrower
+  // question than "the key is real": a model the client menu discovered after this
+  // build shipped is forwarded correctly but can only be echoed by its key.
+  const discovered = liveModels().find((model) => model.id === key)
+  if (discovered !== undefined) return { name: discovered.name, item_key: key }
   const known = DOUBAO_MODELS.some((model) => model.id === key)
   return known
     ? { name: findDoubaoModel(key).name, item_key: key }
@@ -242,7 +255,7 @@ function describeRequestedModel(key: string | undefined): {
  */
 function requestOptions(parsed: InboundChatRequest): {
   modelKey?: string
-  reasoningLevel?: 'low' | 'mid' | 'high'
+  reasoningLevel?: 'low' | 'mid' | 'high' | 'xhigh' | 'max'
   skill?: DoubaoSkillName
   deepThink?: boolean
 } {
@@ -265,7 +278,12 @@ function requestOptions(parsed: InboundChatRequest): {
    * emits it while `deepThink` is `undefined`. Passing a boolean here would
    * silently downgrade every task turn to the chat shape.
    */
-  const think = isTaskModel(parsed.model)
+  // A model the client menu discovered but this release's static catalog does not
+  // name is still a real key, and its mode comes with it: the third-party models
+  // are filed under 工作任务 (mode_id "3") with no 「工作任务」 prefix to spot them.
+  const discovered = liveModels().find((model) => model.id === parsed.model)
+  const taskModel = isTaskModel(parsed.model) || discovered?.taskMode === true
+  const think = taskModel
     ? {}
     : { deepThink: process.env.DSH_DOUBAO_DEEP_THINK !== '0' }
   // 「豆包 生图」 is a DSH-side alias, not a Doubao model_item_key: Doubao has no
@@ -284,6 +302,9 @@ function requestOptions(parsed: InboundChatRequest): {
     ...think,
     ...parsed.model === undefined ? {} : { modelKey: parsed.model },
     ...level === undefined ? {} : { reasoningLevel: level },
+    // Explicit, so a discovered task model keeps 工作任务 shape (conversation_mode 2,
+    // mode_id 3, 256k token limit) instead of silently becoming an ordinary chat.
+    ...taskModel ? { taskMode: true } : {},
   }
 }
 

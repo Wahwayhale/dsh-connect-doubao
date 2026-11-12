@@ -141,13 +141,20 @@ async function refreshQuota(signal?: AbortSignal): Promise<DoubaoQuotaView | und
   return (await response.json()) as DoubaoQuotaView
 }
 
-/** Read the catalog for the checklist. Never throws. */
+/**
+ * Read the catalog for the checklist. Never throws.
+ *
+ * POST, not GET: the host drops its discovery memo on a write request, so the
+ * list is re-read from the client's own caches instead of answered from a
+ * memo up to ten minutes old. The refresh button therefore has to POST — a GET
+ * would faithfully re-render a catalog it never re-read.
+ */
 async function fetchCatalog(signal: AbortSignal): Promise<DoubaoCatalogView | undefined> {
   const response = await fetch(DOUBAO_CATALOG_PATH, {
-    method: 'GET',
+    method: 'POST',
     credentials: 'same-origin',
     signal,
-    headers: { accept: 'application/json' },
+    headers: { accept: 'application/json', ...WRITE_HEADERS },
   })
   if (!response.ok) return undefined
   return (await response.json()) as DoubaoCatalogView
@@ -757,6 +764,11 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
         {!canWrite && <div className="dbq-note">{t('models.readOnly')}</div>}
         {catalog === undefined && <div className="dbq-note">{t('models.loadFailed')}</div>}
         {catalog?.ok === true && models.length === 0 && <div className="dbq-note">{t('models.empty')}</div>}
+        {/* Only worth saying when a multiplier is actually on screen: the claim is
+            the client's, and a user who acts on it needs to know who made it. */}
+        {models.some(model => model.rate !== null) && (
+          <div className="dbq-note">{t('models.rateNote')}</div>
+        )}
 
         <div className="dbq-models">
           {models.map(model => (
@@ -771,7 +783,31 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
                 <span className="dbq-model-name">
                   <span>{model.name}</span>
                   {model.badge !== null && <span className="dbq-badge">{model.badge}</span>}
+                  {/* The client's own multiplier, unchanged. A campaign tag
+                      ("限时优惠 0.01x") is styled apart so a temporary promo
+                      cannot be read as the standing price. */}
+                  {model.rate !== null && (
+                    <span className={model.rate.kind === 'promo' ? 'dbq-rate dbq-rate-promo' : 'dbq-rate'}>
+                      {model.rate.text}
+                    </span>
+                  )}
                 </span>
+                {/* The thinking levels this model actually offers, weakest first.
+                    Selecting one is the session's job (the model picker), so this
+                    is a statement of capability, not a control. */}
+                {model.reasoningLevels.length > 0 && (
+                  <span className="dbq-levels">
+                    {model.reasoningLevels.map(level => (
+                      <span
+                        key={level.id}
+                        className={level.verified ? 'dbq-level' : 'dbq-level dbq-level-unverified'}
+                        title={level.verified ? t('models.levelVerified') : t('models.levelUnverified')}
+                      >
+                        {level.name}
+                      </span>
+                    ))}
+                  </span>
+                )}
               </span>
             </label>
           ))}

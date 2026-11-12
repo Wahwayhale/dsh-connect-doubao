@@ -109,4 +109,26 @@ describe('parseCacheBuffer', () => {
     expect(parseCacheBuffer(entry('7', 'https://example.com/x'))).toEqual([])
     expect(parseCacheBuffer(entry('7', '12345'))).toEqual([])
   })
+
+  it('accepts the long person-* slugs Doubao added for third-party models', () => {
+    // Regression: the key bound used to be 24 characters, which silently dropped
+    // every `person-*` entry — the picker kept showing five legacy models while the
+    // client already listed a dozen. Measured lengths: 21, 27, 32, 33, 37.
+    const slugs = [
+      'person-kimi-k3-261111',
+      'person-kimi-k3-1-pro-261111',
+      'person-glm-5-3-flash-261111',
+      'person-deepseek-v4-pro-ga-260813',
+      'person-deepseek-v4-1-flash-261017',
+      'person-kimi-k3-1-pro-highspeed-261111',
+    ]
+    for (const slug of slugs) {
+      expect(parseCacheBuffer(entry(slug, 'GLM 5.3'))[0]?.key).toBe(slug)
+    }
+  })
+
+  it('still rejects a key that is not slug-shaped at all', () => {
+    expect(parseCacheBuffer(entry('has space here', '豆包 快速'))).toEqual([])
+    expect(parseCacheBuffer(entry('a'.repeat(65), '豆包 快速'))).toEqual([])
+  })
 })

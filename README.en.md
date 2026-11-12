@@ -39,12 +39,19 @@ With no session the plugin fails loudly ("还没有浏览器登录态…") rathe
 
 ## Features
 
-- **Two groups of Doubao models** — two 对话-mode entries (快速 / 2.1 Turbo·专家) and
-  three 「工作任务」-mode entries (2.1 Lite `seed-lite-7b`, 2.1 Pro `5`, Auto `9`).
-  The task models spend the **paid membership quota**; selecting one switches the
-  request into the full task-mode shape automatically.
-- **Three reasoning-effort levels** — low / mid / high, mapped to the measured upstream
-  `reasoning_effort` values **3 / 4 / 5**.
+- **The model list is the client's own menu, not a hardcoded table** — the plugin reads
+  `Default/Preferences` → `saman.local_storage_for_web['frontend-request-cache']`, so new
+  models, new prices and new level ladders appear without a plugin release. Measured
+  2026-11-12: 12 models (2 对话-mode, 9 「工作任务」-mode, 1 alias) plus the image alias.
+- **Billing multipliers, verbatim** — the menu's `tag_list` is shown unchanged: `0.65x`,
+  `0.46x` etc. as plain multipliers, `限时优惠 0.01x` / `小额免费` as campaign tags (outlined
+  so a promo cannot read as the standing price). Display only: the plugin does not bill
+  and cannot verify the actual charge.
+- **Per-model thinking ladders** — `reasoning_effort_config.option_list` is per model and
+  not uniform: GLM publishes 低/高/最高 (3/5/7), 2.1 Lite 低/中/高 (3/4/5), and Auto even puts
+  「中」 on ordinal **8**. The picker and `thinkingLevelMap` are built from that ladder, so
+  no level is offered that a model has no answer for. Solid chip = measured on a real
+  request (3/4/5); dotted = declared by the menu only (6 极高 / 7 最高).
 - **Deep thinking on by default** — no extra switch: non-task models send
   `need_deep_think: 3` on every turn, task models keep the captured `10001`. Set
   `DSH_DOUBAO_DEEP_THINK=0` to turn it back off.

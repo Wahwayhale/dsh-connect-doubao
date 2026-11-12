@@ -38,6 +38,7 @@ import {
   findReasoningLevel,
   inputSkillOf,
   isTaskModel,
+  levelIdOf,
   needDeepThinkValue,
   TASK_RUNTIME_LOCAL_PC,
   TASK_SANDBOX_AUTH_ALLOW_ALL,
@@ -255,7 +256,7 @@ export interface ChatRequestOptions {
    * Defaults to 高 (5), the level the desktop app itself starts on. All three
    * values were read off the running client — see {@link DOUBAO_REASONING_LEVELS}.
    */
-  reasoningLevel?: 'low' | 'mid' | 'high'
+  reasoningLevel?: 'low' | 'mid' | 'high' | 'xhigh' | 'max'
   /**
    * `option.agent_mode` / `ext.agent_mode`.
    *
@@ -432,7 +433,10 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
   const model = findDoubaoModel(options.modelKey)
   const level = findReasoningLevel(options.reasoningLevel)
   const task = taskModeEnabled(options)
-  const taskModelSelected = isTaskModel(model.id)
+  // A DISCOVERED 「工作任务」 model (a third-party `person-*` slug, say) is not in
+  // the static catalog, so `isTaskModel` cannot recognise it; the shim resolves
+  // that case from the live catalog and passes it down as `taskMode`.
+  const taskModelSelected = isTaskModel(model.id) || options.taskMode === true
   /**
    * Deep-thinking toggle, for probing only.
    *
@@ -464,7 +468,9 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
    * BOTH `conversation_init_ext` and `aggregate_params`, whereas 「工作任务」
    * models (`seed-lite-7b`, `5`, `9`) carry "3".
    */
-  const modeId = (process.env.DSH_DOUBAO_MODE_ID ?? '').trim() || (taskModelSelected ? '3' : '1')
+  // Grouped by whether this turn is a 工作任务, not by whether the id is a catalog
+  // entry: a discovered task model needs mode_id "3" exactly like 2.1 Pro does.
+  const modeId = (process.env.DSH_DOUBAO_MODE_ID ?? '').trim() || (task ? '3' : '1')
   /**
    * The client's own default for `general_task_param` on an ordinary turn.
    *
@@ -482,7 +488,7 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
   const modelExtraParams: Record<string, string> = taskModelSelected
     ? {
         input_token_limit: '256k',
-        ...(model.id === 'seed-lite-7b' ? { reasoning_effort: level.id } : {}),
+        ...(model.id === 'seed-lite-7b' ? { reasoning_effort: levelIdOf(level.level) } : {}),
       }
     : {}
 

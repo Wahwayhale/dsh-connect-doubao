@@ -7,7 +7,17 @@
  * its IndexedDB (`menuConfV2`), so the honest source of truth is right there on
  * disk — read it instead of guessing.
  *
- * WHAT THE CACHE ACTUALLY CONTAINS. Values are V8 structured clones, not JSON:
+ * WHERE THE LIST COMES FROM, in priority order:
+ *
+ *   1. `Default/Preferences` -> `saman.local_storage_for_web['frontend-request-cache']`
+ *      -> `_DesktopActionBarBriefListRequestCacheDataV1.data.modeSelectData`
+ *      -> `menuConfV2.model_list.item_list[]`. Plain JSON, rewritten every time
+ *      the app refreshes its menu. This is the PRIMARY source.
+ *   2. The launcher / chat IndexedDB stores below, for installs whose
+ *      Preferences has not been written yet. Older and usually stale, so it
+ *      only fills gaps the Preferences list does not cover.
+ *
+ * WHAT THE INDEXEDDB CACHE CONTAINS. Values are V8 structured clones, not JSON:
  *
  *   string = tag + LEB128 length + payload
  *     0x22  Latin-1 payload, length is the byte count
@@ -55,14 +65,47 @@ export const DISCOVERY_TTL_MS = 10 * 60 * 1000
  */
 export const TASK_MODE_PREFIX = '工作任务'
 
-/** IndexedDB store that holds the app's server-pushed config. */
-const CACHE_DB_DIRS = ['chrome_doubao-launcher_0.indexeddb.leveldb']
+/**
+ * IndexedDB stores that may hold the app's server-pushed config.
+ *
+ * `launcher` is the historical source and stops being written once the app has
+ * completed a few launches (measured: its last write was 2026-09-17 while the
+ * menu already listed a dozen models). `chat` is the store the running window
+ * keeps current. Both are scanned and merged per key, so listing both can only
+ * ever add models, never change an existing one.
+ */
+const CACHE_DB_DIRS = [
+  'chrome_doubao-chat_0.indexeddb.leveldb',
+  'chrome_doubao-launcher_0.indexeddb.leveldb',
+]
 
 export interface DiscoveredEntry {
   key: string
   name: string
   /** True when the client's own name marks it as a 工作任务-only model. */
   taskOnly: boolean
+  /**
+   * The mode the app files this model under: '1' = 对话, '3' = 工作任务.
+   *
+   * Only the Preferences source carries it, so it is optional. It matters: the
+   * third-party models (DeepSeek / Kimi / GLM) arrive with a plain product name
+   * and no 「工作任务」 prefix, so `taskOnly` alone would route them as ordinary
+   * chat turns when the app itself runs them in task mode.
+   */
+  mode?: string
+  /**
+   * The menu's status tag: either a billing multiplier ("0.65x") or a campaign
+   * label ("限时优惠 0.01x"). Only the Preferences source carries it.
+   */
+  rate?: { text: string; kind: 'ratio' | 'promo' }
+  /**
+   * The thinking levels this model offers, in the menu's own order.
+   *
+   * Only the Preferences source carries it, and it is PER MODEL: GLM publishes
+   * 低/高/最高 while 2.1 Lite publishes 低/中/高, so a shared list is wrong for at
+   * least one of them.
+   */
+  reasoningOptions?: Array<{ level: number; name: string }>
 }
 
 /** Read a LEB128 varint. Returns [value, nextOffset] or undefined. */
@@ -114,8 +157,17 @@ function readNameAfter(buf: Buffer, from: number, to: number): string | undefine
   return undefined
 }
 
+/**
+ * A Doubao `model_item_key`: `0`/`3`/`5`/`9`, `seed-lite-7b`, or a third-party
+ * slug such as `person-kimi-k3-1-pro-highspeed-261111` (37 characters).
+ *
+ * The bound used to be 24, which silently dropped every `person-*` model Doubao
+ * added later: the picker kept showing five legacy entries while the client
+ * already listed twelve. Keys are validated for SHAPE, not for length — the
+ * server is the only authority on which keys exist.
+ */
 function looksLikeModelKey(value: string): boolean {
-  return /^[\w-]{1,24}$/.test(value)
+  return /^[\w.-]{1,64}$/.test(value)
 }
 
 function looksLikeModelName(value: string): boolean {
@@ -176,6 +228,117 @@ export function discoveryCacheDirs(): string[] {
 }
 
 /**
+ * The model menu as the app last persisted it in its own Preferences file.
+ *
+ * This is the source that stays current: the IndexedDB stores are written by
+ * whichever app window happens to be running and go stale, while Preferences is
+ * rewritten every time the menu is refreshed. Shape, verbatim:
+ *
+ *   { saman: { local_storage_for_web: { 'frontend-request-cache': '<json>' } } }
+ *     -> { _DesktopActionBarBriefListRequestCacheDataV1: { data: { modeSelectData:
+ *          { menuConfV2: { model_list: { item_list: [ { model_item_key, name, … } ] } } } } } }
+ *
+ * Never throws: a missing/partial/rewritten Preferences just yields no entries
+ * and the IndexedDB path (then the static catalog) takes over.
+ */
+/**
+ * The menu tag as a rate, or undefined when there is none.
+ *
+ * Two shapes arrive in the same field: a plain multiplier ("0.65x", "1.44x") and
+ * a campaign label that CONTAINS one ("限时优惠 0.01x"). Both are shown verbatim;
+ * `kind` only decides how the card styles it, never what it claims.
+ */
+function rateOf(tagList: unknown): { text: string; kind: 'ratio' | 'promo' } | undefined {
+  if (!Array.isArray(tagList)) return undefined
+  for (const tag of tagList as Array<{ text?: unknown }>) {
+    const text = typeof tag?.text === 'string' ? tag.text.trim() : ''
+    if (text === '') continue
+    return { text, kind: /^[\d.]+x$/i.test(text) ? 'ratio' : 'promo' }
+  }
+  return undefined
+}
+
+/**
+ * A model's own thinking levels, or undefined when the menu declares none.
+ *
+ * `option_list` is the client's per-model ladder and it is NOT uniform: GLM ships
+ * 低/高/最高 (3/5/7) while 2.1 Lite ships 低/中/高 (3/4/5). Reading it here is what
+ * stops the picker from offering a level that model has no answer for.
+ */
+function reasoningOptionsOf(config: unknown): Array<{ level: number; name: string }> | undefined {
+  const options = (config as { option_list?: unknown } | null | undefined)?.option_list
+  if (!Array.isArray(options)) return undefined
+  const out: Array<{ level: number; name: string }> = []
+  for (const option of options as Array<{ level?: unknown; name?: unknown }>) {
+    const level = typeof option?.level === 'number' ? option.level : undefined
+    const name = typeof option?.name === 'string' ? option.name : undefined
+    if (level === undefined || name === undefined || name === '') continue
+    if (out.some((known) => known.level === level)) continue
+    out.push({ level, name })
+  }
+  return out.length === 0 ? undefined : out
+}
+
+export function readPreferencesEntries(): DiscoveredEntry[] {
+  const userData = findDoubaoUserDataDir()
+  if (userData === undefined) return []
+  let raw: string
+  try {
+    raw = readFileSync(join(userData, 'Default', 'Preferences'), 'utf8')
+  } catch {
+    return []
+  }
+  let cache: unknown
+  try {
+    const prefs = JSON.parse(raw) as {
+      saman?: { local_storage_for_web?: Record<string, unknown> }
+    }
+    const bucket = prefs.saman?.local_storage_for_web?.['frontend-request-cache']
+    if (typeof bucket !== 'string') return []
+    cache = JSON.parse(bucket)
+  } catch {
+    return []
+  }
+  // The cache key carries a schema version in its name; matching on the stable
+  // stem keeps this working across a bump instead of silently reading nothing.
+  const root = cache as Record<string, unknown> | null
+  if (root === null || typeof root !== 'object') return []
+  const cacheKey = Object.keys(root).find((key) => key.includes('BriefListRequestCache'))
+  if (cacheKey === undefined) return []
+  const entry = root[cacheKey] as
+    | { data?: { modeSelectData?: { menuConfV2?: { model_list?: { item_list?: unknown } } } } }
+    | undefined
+  const items = entry?.data?.modeSelectData?.menuConfV2?.model_list?.item_list
+  if (!Array.isArray(items)) return []
+  const out: DiscoveredEntry[] = []
+  for (const item of items as Array<{
+    model_item_key?: unknown
+    name?: unknown
+    default_mode?: unknown
+    tag_list?: unknown
+    reasoning_effort_config?: unknown
+  }>) {
+    const key = typeof item?.model_item_key === 'string' ? item.model_item_key : undefined
+    const name = typeof item?.name === 'string' ? item.name : undefined
+    if (key === undefined || name === undefined) continue
+    if (!looksLikeModelKey(key) || !looksLikeModelName(name)) continue
+    if (out.some((known) => known.key === key)) continue
+    const mode = typeof item.default_mode === 'string' ? item.default_mode : undefined
+    const rate = rateOf(item.tag_list)
+    const reasoningOptions = reasoningOptionsOf(item.reasoning_effort_config)
+    out.push({
+      key,
+      name,
+      taskOnly: name.startsWith(TASK_MODE_PREFIX) || mode === '3',
+      ...(mode === undefined ? {} : { mode }),
+      ...(rate === undefined ? {} : { rate }),
+      ...(reasoningOptions === undefined ? {} : { reasoningOptions }),
+    })
+  }
+  return out
+}
+
+/**
  * All (key, name) pairs the client currently knows, task-only ones included.
  *
  * Exported for the diagnostics path — it is the raw view, useful when a model
@@ -184,6 +347,10 @@ export function discoveryCacheDirs(): string[] {
  */
 export function discoverAllCachedModels(): DiscoveredEntry[] {
   const merged = new Map<string, DiscoveredEntry>()
+  // Preferences first: when both sources know a key, its entry is the newer one.
+  for (const entry of readPreferencesEntries()) {
+    if (!merged.has(entry.key)) merged.set(entry.key, entry)
+  }
   for (const dir of discoveryCacheDirs()) {
     for (const [key, entry] of scanDir(dir)) {
       if (!merged.has(key)) merged.set(key, entry)
@@ -223,14 +390,22 @@ export function discoverModels(now = Date.now()): DoubaoModelInfo[] | undefined 
     .map((entry) => {
       const staticMatch = DOUBAO_MODELS.find((m) => m.id === entry.key)
       const taskMode = entry.taskOnly || isTaskModel(entry.key)
+      // A discovered task model has no static badge to inherit, and its name is a
+      // plain product name (「GLM 5.3」, not 「工作任务 GLM 5.3」) — without this the
+      // card would render it as an ordinary chat entry while it runs in task mode.
+      const badge = staticMatch?.badge ?? (taskMode ? TASK_MODE_PREFIX : undefined)
       return {
         id: entry.key,
         name: staticMatch?.name ?? entry.name,
-        ...(staticMatch?.badge !== undefined ? { badge: staticMatch.badge } : {}),
+        ...(badge !== undefined ? { badge } : {}),
         // The menu dump flags every entry as reasoning-capable; whether it can
         // actually think is a measurement, not a menu property.
         reasoning: supportsReasoning(entry.key),
         ...(taskMode ? { taskMode: true } : {}),
+        // Both come from the menu, and both are per-model: the multiplier the app
+        // shows beside the name, and the ladder it offers for THIS model.
+        ...(entry.rate !== undefined ? { rate: entry.rate } : {}),
+        ...(entry.reasoningOptions !== undefined ? { reasoningOptions: entry.reasoningOptions } : {}),
       }
     })
   // Ensure static task-mode models (seed-lite-7b, 5, 9) are always present even

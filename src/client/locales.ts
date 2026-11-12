@@ -46,7 +46,7 @@ export const zh = {
 
   'models.title': '模型',
   'models.enabledCount': '已启用 {count} ↑',
-  'models.routingNote': '清单直接读自豆包客户端的缓存，豆包上线新模型时会自动出现，不需要等插件更新。带「工作任务」徽章的条目（2.1 Lite / 2.1 Pro / 自动）走任务模式与会员付费额度，插件会自动完成本地指令应答',
+  'models.routingNote': '清单、倍率、思考档位都直接读自豆包客户端菜单，豆包上新或调价会自动出现，不需要等插件更新。带「工作任务」徽章的条目走任务模式与会员付费额度，插件会自动完成本地指令应答。缓存的档位是蓝图，实线=已在真实请求中验证，虚线=仅菜单声明',
   'models.refresh': '刷新',
   'models.refreshing': '刷新中…',
   'models.save': '保存',
@@ -64,6 +64,9 @@ export const zh = {
   'models.readOnly': '当前宿主未提供设置写入通道，勾选不会生效',
   'models.loadFailed': '模型目录读取失败',
   'models.empty': '没有可用的模型条目',
+  'models.levelVerified': '已在真实请求中验证',
+  'models.levelUnverified': '客户端菜单声明，尚未在真实请求中验证',
+  'models.rateNote': '倍率来自豆包客户端菜单，仅作展示；本插件不参与计费，也无法核对实际扣费',
 
   'tools.title': '实验性：工具调用',
   'tools.toggle': '让豆包驱动本地工具（读写文件、执行命令）',
@@ -122,7 +125,7 @@ export const en: Record<DoubaoCardKey, string> = {
 
   'models.title': 'Models',
   'models.enabledCount': '{count} enabled ↑',
-  'models.routingNote': 'The list is read from the Doubao client cache, so new models appear without a plugin update. Entries badged 「工作任务」 (2.1 Lite / 2.1 Pro / Auto) run in task mode against the paid membership quota; the plugin answers the local workspace commands for you',
+  'models.routingNote': 'The list, the multipliers and the thinking levels all come from the Doubao client menu, so new models or prices appear without a plugin update. Entries badged 「工作任务」 run in task mode against the paid membership quota; the plugin answers the local workspace commands for you. Solid chip = verified on a real request, dotted = declared by the menu only',
   'models.refresh': 'Refresh',
   'models.refreshing': 'Refreshing…',
   'models.save': 'Save',
@@ -140,6 +143,9 @@ export const en: Record<DoubaoCardKey, string> = {
   'models.readOnly': 'This host provides no settings write path; ticking has no effect',
   'models.loadFailed': 'Could not read the model catalog',
   'models.empty': 'No model entries available',
+  'models.levelVerified': 'Verified on a real request',
+  'models.levelUnverified': 'Declared by the client menu, not yet verified on a request',
+  'models.rateNote': 'Multipliers come from the Doubao client menu and are display-only; this plugin does not bill and cannot verify the actual charge',
 
   'tools.title': 'Experimental: tool calling',
   'tools.toggle': 'Let Doubao drive local tools (read/write files, run commands)',

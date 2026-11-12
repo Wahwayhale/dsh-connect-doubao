@@ -101,6 +101,18 @@ export const DOUBAO_CARD_CSS = `
 .dbq-model-name { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .dbq-badge { font-size: 11px; color: #9fb2c8; background: #1e242c; border: 1px solid #2f3641;
   border-radius: 999px; padding: 0 7px; }
+/* The multiplier the client menu prints next to a model. Monospace-ish and
+   narrow so a column of them lines up; a campaign tag is outlined instead of
+   filled so a temporary promo cannot read as the standing price. */
+.dbq-rate { font-size: 11px; color: #ffcf7a; background: #2a2418; border: 1px solid #4a3c22;
+  border-radius: 999px; padding: 0 7px; font-variant-numeric: tabular-nums; }
+.dbq-rate-promo { color: #ffb4a8; background: transparent; border-style: dashed; }
+/* The thinking ladder a model offers. A level the client declares but no real
+   request has exercised yet is dimmed and dotted, never silently dropped. */
+.dbq-levels { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.dbq-level { font-size: 11px; color: #8fa6bd; border: 1px solid #2f3641; border-radius: 6px;
+  padding: 0 5px; }
+.dbq-level-unverified { color: #7b8a99; border-style: dotted; }
 .dbq-model-desc { color: #9aa0a6; font-size: 11px; }
 .dbq-saved { color: #7fd18a; font-size: 12px; }
 .dbq-error { color: #ff9d99; font-size: 12px; }

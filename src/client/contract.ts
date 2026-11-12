@@ -137,12 +137,26 @@ export interface DoubaoReasoningLevelEntry {
   verified: boolean
 }
 
+/**
+ * A billing-multiplier or campaign tag, verbatim from the client menu.
+ *
+ * DISPLAY ONLY: the plugin has no billing relationship and cannot verify what
+ * the server charges. Showing the client's own claim, attributed, is honest;
+ * computing or rounding it would not be.
+ */
+export interface DoubaoRateTag {
+  text: string
+  kind: 'ratio' | 'promo'
+}
+
 export interface DoubaoModelEntry {
   /** The real `model_item_key`, verbatim. */
   id: string
   name: string
   /** Status badge from the desktop app ("0921 新版", "即将下线"), else null. */
   badge: string | null
+  /** Billing-multiplier / campaign tag from the client menu, else null. */
+  rate: DoubaoRateTag | null
   reasoningLevels: DoubaoReasoningLevelEntry[]
 }
 

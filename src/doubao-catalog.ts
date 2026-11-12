@@ -100,8 +100,12 @@ export const TASK_SANDBOX_AUTH_ALLOW_ALL = 2
  * and not extrapolated from a pattern.
  */
 export interface DoubaoReasoningLevel {
-  /** DSH-facing label, matching the desktop app's picker. */
-  id: 'low' | 'mid' | 'high'
+  /**
+   * DSH-facing label. The five this catalog names are `low|mid|high|xhigh|max`,
+   * but the client menu is not limited to them (自动 publishes 中 at ordinal 8), so
+   * an unnamed ordinal carries its own decimal spelling instead of being dropped.
+   */
+  id: 'low' | 'mid' | 'high' | 'xhigh' | 'max' | (string & {})
   name: string
   /** The value sent as `reasoning_effort`; also `need_deep_think - 10000`. */
   level: number
@@ -113,6 +117,11 @@ export const DOUBAO_REASONING_LEVELS: readonly DoubaoReasoningLevel[] = [
   { id: 'low',  name: '低', level: 3, verified: true },
   { id: 'mid',  name: '中', level: 4, verified: true },
   { id: 'high', name: '高', level: 5, verified: true },
+  // 6 and 7 are declared by the client's own menu for the newer models
+  // (DeepSeek / Kimi / 2.1 Max all publish 极高 / 最高). Not yet observed on a
+  // completed request, so `verified` stays false and the probe reports it.
+  { id: 'xhigh', name: '极高', level: 6, verified: false },
+  { id: 'max',   name: '最高', level: 7, verified: false },
 ]
 
 /** The level used when a request names none. Verified on the wire. */
@@ -120,8 +129,36 @@ export const DEFAULT_REASONING_LEVEL_ID = 'high'
 
 /** Reasoning level for an id, falling back to the default. */
 export function findReasoningLevel(id: string | undefined): DoubaoReasoningLevel {
-  return DOUBAO_REASONING_LEVELS.find((level) => level.id === id)
-    ?? DOUBAO_REASONING_LEVELS.find((level) => level.id === DEFAULT_REASONING_LEVEL_ID)!
+  const known = DOUBAO_REASONING_LEVELS.find((level) => level.id === id)
+  if (known !== undefined) return known
+  // A bare ordinal. The client menu is not limited to the rungs this catalog
+  // names: 自动 publishes 中 at 8, and collapsing that to the default would send
+  // 高 instead of the level the user actually picked.
+  if (id !== undefined && /^\d{1,3}$/.test(id)) {
+    const ordinal = Number(id)
+    const named = DOUBAO_REASONING_LEVELS.find((level) => level.level === ordinal)
+    if (named !== undefined) return named
+    return { id, name: String(ordinal), level: ordinal, verified: false }
+  }
+  return DOUBAO_REASONING_LEVELS.find((level) => level.id === DEFAULT_REASONING_LEVEL_ID)!
+}
+
+/** The catalog entry for a wire ordinal, or undefined for one it does not know. */
+export function reasoningLevelOf(ordinal: number | undefined): DoubaoReasoningLevel | undefined {
+  if (ordinal === undefined) return undefined
+  return DOUBAO_REASONING_LEVELS.find((level) => level.level === ordinal)
+}
+
+/**
+ * The wire spelling of an ordinal.
+ *
+ * `model_extra_params.reasoning_effort` for 2.1 Lite is a STRING in the captured
+ * request, and that string is the level's name-id, not its number. An ordinal
+ * with no catalog entry falls back to its own decimal form, so a level Doubao
+ * adds later still travels instead of snapping back to 高.
+ */
+export function levelIdOf(ordinal: number): string {
+  return reasoningLevelOf(ordinal)?.id ?? String(ordinal)
 }
 
 /**
@@ -261,6 +298,39 @@ export interface DoubaoModelInfo {
   reasoning: boolean
   /** True when the model runs in 「工作任务」 (`mode_id: "3"`, `agent_mode: 1`) mode. */
   taskMode?: boolean
+  /**
+   * Billing-multiplier tag exactly as the client menu renders it ("0.65x"), or
+   * a campaign label ("限时优惠 0.01x").
+   *
+   * DISPLAY ONLY. The plugin bills nothing and cannot verify what the server will
+   * charge, so this is the client's own claim, shown unchanged and attributed.
+   */
+  rate?: DoubaoModelRate
+  /**
+   * The thinking levels THIS model offers, in the client menu's own order.
+   *
+   * Absent on entries read from the IndexedDB cache (that source carries no
+   * config) and on the static catalog, where the catalog-wide list applies. It
+   * matters because the menu is per-model: GLM publishes 低/高/最高 while 2.1 Lite
+   * publishes 低/中/高, so one shared list is wrong for at least one of them.
+   */
+  reasoningOptions?: readonly DoubaoReasoningOption[]
+}
+
+/** A menu tag that states a price multiplier or a campaign. */
+export interface DoubaoModelRate {
+  /** The tag text verbatim, e.g. "0.65x" or "限时优惠 0.01x". */
+  text: string
+  /** `ratio` is a plain multiplier; `promo` is a campaign label. */
+  kind: 'ratio' | 'promo'
+}
+
+/** One selectable thinking level, as the client declares it for ONE model. */
+export interface DoubaoReasoningOption {
+  /** Doubao's ordinal, sent as `reasoning_effort`. */
+  level: number
+  /** The client's own label for it (低 / 中 / 高 / 极高 / 最高). */
+  name: string
 }
 
 /**
@@ -339,8 +409,19 @@ export const DOUBAO_DEFAULT_MODEL_ID = '0'
  * the request. `describeRequestedModel` in the shim is what surfaces the miss.
  */
 export function findDoubaoModel(id: string | undefined): DoubaoModelInfo {
-  return DOUBAO_MODELS.find((model) => model.id === id)
-    ?? DOUBAO_MODELS.find((model) => model.id === DOUBAO_DEFAULT_MODEL_ID)!
+  if (id === undefined) return DOUBAO_MODELS.find((model) => model.id === DOUBAO_DEFAULT_MODEL_ID)!
+  const known = DOUBAO_MODELS.find((model) => model.id === id)
+  if (known !== undefined) return known
+  // A DISCOVERED model: the client menu listed it after this release shipped, so
+  // this catalog has no name or badge for it — but the key is real, and forwarding
+  // it verbatim is the only honest option. Falling back to the default would send
+  // 豆包 快速 instead and make the picker entry a lie.
+  return { id, name: id, reasoning: true }
+}
+
+/** True when the key is a catalog entry this release knows by name. */
+export function isKnownModelId(id: string | undefined): boolean {
+  return id !== undefined && DOUBAO_MODELS.some((model) => model.id === id)
 }
 
 /** Entries as pi-ai-shaped descriptors, for model discovery. */
@@ -424,6 +505,8 @@ export interface DoubaoCatalogEntry {
   name: string
   /** Status badge, or null when the app shows none. */
   badge: string | null
+  /** Billing-multiplier / campaign tag from the client, or null. Display only. */
+  rate: DoubaoModelRate | null
   /** Reasoning-effort levels this model offers. */
   reasoningLevels: Array<{ id: string; name: string; level: number; verified: boolean }>
 }
@@ -435,16 +518,31 @@ export function doubaoCatalogEntries(
     id: model.id,
     name: model.name,
     badge: model.badge ?? null,
+    rate: model.rate ?? null,
     // Empty for a no-CoT route. Advertising 低/中/高 here while the DSH picker
     // hides them would make the card and the picker disagree about the same
     // model, and the card is the one a user checks first.
+    //
+    // A discovered model states its OWN list, so the card shows that instead of
+    // the catalog-wide default — the two disagree exactly where a user looks.
     reasoningLevels: model.reasoning
-      ? DOUBAO_REASONING_LEVELS.map((level) => ({
-        id: level.id,
-        name: level.name,
-        level: level.level,
-        verified: level.verified,
-      }))
+      ? model.reasoningOptions !== undefined && model.reasoningOptions.length > 0
+        ? model.reasoningOptions.map((option) => ({
+          id: levelIdOf(option.level),
+          name: option.name,
+          level: option.level,
+          verified: reasoningLevelOf(option.level)?.verified ?? false,
+        }))
+        // No per-model list (the static catalog, the IndexedDB source, and the image
+        // alias): offer only the levels MEASURED on a real request. Advertising 极高 /
+        // 最高 here would promise a rung nothing has exercised — the image alias in
+        // particular rides 豆包快速, which cannot think at all.
+        : DOUBAO_REASONING_LEVELS.filter((level) => level.verified).map((level) => ({
+          id: level.id,
+          name: level.name,
+          level: level.level,
+          verified: level.verified,
+        }))
       : [],
   }))
 }
