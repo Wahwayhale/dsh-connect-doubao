@@ -187,6 +187,11 @@ export interface DoubaoAdapterOptions {
    * it must be cheap — `liveModels()` memoises it.
    */
   modelsProvider?: () => readonly DoubaoModelInfo[]
+  /**
+   * Fires once after an initially-unbound loopback shim settles on its port,
+   * so callers can re-emit adapter availability (`adapterRelease.replace`).
+   */
+  onBaseUrlReady?: () => void
 }
 
 /**
@@ -213,7 +218,11 @@ export function createDoubaoAdapter(options: DoubaoAdapterOptions): DoubaoAdapte
   // than publishing a model pointed at `undefined`.
   let syncBaseUrl: string | undefined = shim.baseUrlSync()
   if (syncBaseUrl === undefined) {
-    void shim.baseUrl().then((resolved) => { syncBaseUrl = resolved }).catch(() => {})
+    void shim.baseUrl().then((resolved) => {
+      syncBaseUrl = resolved
+      profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, profile]])
+      options.onBaseUrlReady?.()
+    }).catch(() => {})
   }
 
   const buildModels = (): Model<Api>[] => {

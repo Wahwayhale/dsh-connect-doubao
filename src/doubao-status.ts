@@ -24,12 +24,16 @@ import { browserLogin } from './doubao-auth-browser.ts'
 import { doubaoCatalogEntries, type DoubaoModelInfo } from './doubao-catalog.ts'
 import { invalidateDiscovery } from './doubao-discovery.ts'
 import type { DoubaoCatalogEntry } from './doubao-catalog.ts'
+import type { DoubaoStatsView } from './doubao-stats.ts'
 
 /** Route path, relative to the plugin mount point. */
 export const DOUBAO_QUOTA_PATH = '/plugins/dsh-connect-doubao/quota'
 
 /** Route serving the model checklist's catalog. */
 export const DOUBAO_CATALOG_PATH = '/plugins/dsh-connect-doubao/catalog'
+
+/** Route serving live runtime session & token usage statistics. */
+export const DOUBAO_STATS_PATH = '/plugins/dsh-connect-doubao/stats'
 
 /** Hostnames an inbound browser request may come from. */
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]'])
@@ -394,7 +398,11 @@ export interface DoubaoCatalogView {
  */
 export function registerDoubaoCatalogRoute(
   ctx: { webServer: WebServerLike },
-  deps: { modelsProvider?: () => readonly DoubaoModelInfo[] } = {},
+  deps: {
+    modelsProvider?: () => readonly DoubaoModelInfo[]
+    refreshModels?: () => Promise<void> | void
+    onRefreshed?: () => void
+  } = {},
 ): () => void {
   return ctx.webServer.register({
     kind: 'exact',
@@ -405,9 +413,13 @@ export function registerDoubaoCatalogRoute(
         return
       }
       if (!guard(req, res, { write: req.method === 'POST' })) return
-      // A POST drops the discovery memo, so the card's 刷新 re-reads the client
-      // cache and a model Doubao just shipped can appear without restarting DSH.
-      if (req.method === 'POST') invalidateDiscovery()
+      // A POST drops the discovery memo and triggers a live refresh, so the card's
+      // 刷新 shows models fetched over HTTP or from updated client caches immediately.
+      if (req.method === 'POST') {
+        invalidateDiscovery()
+        await deps.refreshModels?.()
+        deps.onRefreshed?.()
+      }
       const models = deps.modelsProvider === undefined ? undefined : deps.modelsProvider()
       const payload: DoubaoCatalogView = { ok: true, models: doubaoCatalogEntries(models), error: null }
       json(res, 200, payload)
@@ -495,7 +507,10 @@ function authView(): DoubaoAuthView {
  * user finishes the scan. The request is held open rather than polled so a
  * failure has exactly one place to be reported.
  */
-export function registerDoubaoAuthRoute(ctx: { webServer: WebServerLike }): () => void {
+export function registerDoubaoAuthRoute(
+  ctx: { webServer: WebServerLike },
+  deps: { onSignedIn?: () => void } = {},
+): () => void {
   return ctx.webServer.register({
     kind: 'exact',
     path: DOUBAO_AUTH_PATH,
@@ -551,12 +566,69 @@ export function registerDoubaoAuthRoute(ctx: { webServer: WebServerLike }): () =
         // session it replaces, so every derived read is stale the moment it lands.
         invalidateCredentialCache()
         invalidateQuotaCache()
+        invalidateDiscovery()
+        deps.onSignedIn?.()
         json(res, 200, authView())
       } catch (error: unknown) {
         json(res, 200, {
           ...authView(), signedIn: false,
           detail: `登录成功但凭据保存失败：${safeMessage(error)}`,
         } satisfies DoubaoAuthView)
+      }
+    },
+  })
+}
+
+/**
+ * Register the runtime session & token usage statistics route.
+ *
+ * GET returns aggregate counts, per-model breakdown, opaque session summaries,
+ * and last-turn telemetry (including upstream `context_window_usage` when
+ * reported). POST `{"action":"reset"}` clears accumulated counters.
+ */
+export function registerDoubaoStatsRoute(
+  ctx: { webServer: WebServerLike },
+  deps: {
+    read: () => DoubaoStatsView
+    reset?: () => void
+  },
+): () => void {
+  return ctx.webServer.register({
+    kind: 'exact',
+    path: DOUBAO_STATS_PATH,
+    handler: async (req, res) => {
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        json(res, 405, { error: 'method not allowed' })
+        return
+      }
+      if (!guard(req, res, { write: req.method === 'POST' })) return
+
+      if (req.method === 'GET') {
+        try {
+          json(res, 200, deps.read())
+        } catch (error: unknown) {
+          json(res, 500, { ok: false, error: safeMessage(error) })
+        }
+        return
+      }
+
+      let body: unknown
+      try {
+        body = await readJsonBody(req)
+      } catch (error: unknown) {
+        json(res, 400, { error: safeMessage(error) })
+        return
+      }
+      const payload = (body ?? {}) as { action?: unknown }
+      if (payload.action !== 'reset') {
+        json(res, 400, { error: 'action must be "reset"' })
+        return
+      }
+      try {
+        deps.reset?.()
+        json(res, 200, deps.read())
+      } catch (error: unknown) {
+        json(res, 500, { ok: false, error: safeMessage(error) })
       }
     },
   })

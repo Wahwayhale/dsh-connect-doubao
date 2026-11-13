@@ -1,8 +1,8 @@
 {
   "name": "dsh-connect-doubao",
   "displayName": "DSH Connect Doubao",
-  "description": "把豆包（Doubao）账号接入 DeepSeek Harness：对话模型与「工作任务」模型（2.1 Lite / 2.1 Pro / 自动，走会员付费额度）、Seedream 生图、以及默认开启的深度思考，外加一块只读额度看板（5 小时 / 周 / 活动赠送）。只需浏览器扫码登录一次；仅 Windows x64，会话用 DPAPI 密封在本机。",
-  "version": "0.6.0",
+  "description": "把豆包（Doubao）账号接入 DeepSeek Harness：实时发现线上菜单模型、对话框直接展示计费倍率与对比、完整思考链（CoT）推理透传、「工作任务」模型（走会员付费额度）、Seedream 生图，以及原生 Token 用量/会话统计与实时额度看板。只需浏览器扫码登录一次；仅 Windows x64，会话用 DPAPI 密封在本机。",
+  "version": "0.7.0",
   "license": "MIT",
   "keywords": [
     "dsh-plugin",

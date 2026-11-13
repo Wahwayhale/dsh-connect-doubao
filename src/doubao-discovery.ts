@@ -38,7 +38,14 @@
  */
 import { readFileSync, readdirSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { findDoubaoUserDataDir } from './doubao-auth.ts'
+import { findDoubaoUserDataDir, loadDoubaoCredentials } from './doubao-auth.ts'
+import { listDoubaoProfiles } from './doubao-profile.ts'
+import {
+  ACTION_BAR_BRIEF_LIST_ENDPOINT,
+  buildHeaders,
+  buildQueryUrl,
+  DEFAULT_BOT_ID,
+} from './doubao-upstream.ts'
 import {
   DOUBAO_MODELS,
   DOUBAO_UNAVAILABLE_MODELS,
@@ -218,13 +225,36 @@ function scanDir(dir: string): Map<string, DiscoveredEntry> {
   return found
 }
 
-/** Locate the launcher cache directory inside the Doubao profile. */
+function candidateProfileDirs(): string[] {
+  const dirs: string[] = []
+  const seen = new Set<string>()
+  const add = (dir: string | undefined): void => {
+    if (dir === undefined || dir === '') return
+    const key = dir.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    dirs.push(dir)
+  }
+  for (const profile of listDoubaoProfiles()) add(profile.dir)
+  if (dirs.length === 0) add(findDoubaoUserDataDir())
+  return dirs
+}
+
+/** Locate the launcher cache directory inside the Doubao profiles. */
 export function discoveryCacheDirs(): string[] {
-  const userData = findDoubaoUserDataDir()
-  if (userData === undefined) return []
-  return CACHE_DB_DIRS
-    .map((dir) => join(userData, 'Default', 'IndexedDB', dir))
-    .filter((dir) => existsSync(dir))
+  const dirs: string[] = []
+  const seen = new Set<string>()
+  for (const userData of candidateProfileDirs()) {
+    for (const dbDir of CACHE_DB_DIRS) {
+      const full = join(userData, 'Default', 'IndexedDB', dbDir)
+      const key = full.toLowerCase()
+      if (!seen.has(key) && existsSync(full)) {
+        seen.add(key)
+        dirs.push(full)
+      }
+    }
+  }
+  return dirs
 }
 
 /**
@@ -279,36 +309,8 @@ function reasoningOptionsOf(config: unknown): Array<{ level: number; name: strin
   return out.length === 0 ? undefined : out
 }
 
-export function readPreferencesEntries(): DiscoveredEntry[] {
-  const userData = findDoubaoUserDataDir()
-  if (userData === undefined) return []
-  let raw: string
-  try {
-    raw = readFileSync(join(userData, 'Default', 'Preferences'), 'utf8')
-  } catch {
-    return []
-  }
-  let cache: unknown
-  try {
-    const prefs = JSON.parse(raw) as {
-      saman?: { local_storage_for_web?: Record<string, unknown> }
-    }
-    const bucket = prefs.saman?.local_storage_for_web?.['frontend-request-cache']
-    if (typeof bucket !== 'string') return []
-    cache = JSON.parse(bucket)
-  } catch {
-    return []
-  }
-  // The cache key carries a schema version in its name; matching on the stable
-  // stem keeps this working across a bump instead of silently reading nothing.
-  const root = cache as Record<string, unknown> | null
-  if (root === null || typeof root !== 'object') return []
-  const cacheKey = Object.keys(root).find((key) => key.includes('BriefListRequestCache'))
-  if (cacheKey === undefined) return []
-  const entry = root[cacheKey] as
-    | { data?: { modeSelectData?: { menuConfV2?: { model_list?: { item_list?: unknown } } } } }
-    | undefined
-  const items = entry?.data?.modeSelectData?.menuConfV2?.model_list?.item_list
+/** Parse `item_list` entries shared by both Desktop Preferences cache and HTTP `brief_list`. */
+function parseMenuItems(items: unknown): DiscoveredEntry[] {
   if (!Array.isArray(items)) return []
   const out: DiscoveredEntry[] = []
   for (const item of items as Array<{
@@ -338,6 +340,96 @@ export function readPreferencesEntries(): DiscoveredEntry[] {
   return out
 }
 
+/** Parse Doubao's `POST /alice/slot/action_bar_v3/brief_list` JSON response. */
+export function parseBriefListResponse(payload: unknown): DiscoveredEntry[] {
+  const entries = (payload as {
+    data?: {
+      entry_list?: Array<{
+        action_bar_key?: unknown
+        active_switch_conf?: {
+          menu_conf_v2?: { model_list?: { item_list?: unknown } }
+          menu_conf?: { item_list?: unknown }
+        }
+      }>
+    }
+  } | null | undefined)?.data?.entry_list
+  if (!Array.isArray(entries)) return []
+  const out: DiscoveredEntry[] = []
+  const seen = new Set<string>()
+  const ordered = [
+    ...entries.filter((entry) => entry?.action_bar_key === 'coco_deep_thinking'),
+    ...entries.filter((entry) => entry?.action_bar_key !== 'coco_deep_thinking'),
+  ]
+  for (const entry of ordered) {
+    const items =
+      entry?.active_switch_conf?.menu_conf_v2?.model_list?.item_list ??
+      entry?.active_switch_conf?.menu_conf?.item_list
+    for (const parsed of parseMenuItems(items)) {
+      if (!seen.has(parsed.key)) {
+        seen.add(parsed.key)
+        out.push(parsed)
+      }
+    }
+  }
+  return out
+}
+
+function readPreferencesFromDir(userData: string): DiscoveredEntry[] {
+  let raw: string
+  try {
+    raw = readFileSync(join(userData, 'Default', 'Preferences'), 'utf8')
+  } catch {
+    return []
+  }
+  let cache: unknown
+  try {
+    const prefs = JSON.parse(raw) as {
+      saman?: { local_storage_for_web?: Record<string, unknown> }
+    }
+    const bucket = prefs.saman?.local_storage_for_web?.['frontend-request-cache']
+    if (typeof bucket !== 'string') return []
+    cache = JSON.parse(bucket)
+  } catch {
+    return []
+  }
+  // The cache key carries a schema version in its name; matching on the stable
+  // stem keeps this working across a bump instead of silently reading nothing.
+  const root = cache as Record<string, unknown> | null
+  if (root === null || typeof root !== 'object') return []
+  const out: DiscoveredEntry[] = []
+  const seen = new Set<string>()
+  for (const cacheKey of Object.keys(root).filter((key) => key.includes('BriefListRequestCache'))) {
+    const entry = root[cacheKey] as
+      | {
+          data?: {
+            modeSelectData?: {
+              menuConfV2?: { model_list?: { item_list?: unknown } }
+              menuConf?: { item_list?: unknown }
+            }
+          }
+        }
+      | undefined
+    const items =
+      entry?.data?.modeSelectData?.menuConfV2?.model_list?.item_list ??
+      entry?.data?.modeSelectData?.menuConf?.item_list
+    for (const parsed of parseMenuItems(items)) {
+      if (!seen.has(parsed.key)) {
+        seen.add(parsed.key)
+        out.push(parsed)
+      }
+    }
+  }
+  return out
+}
+
+export function readPreferencesEntries(): DiscoveredEntry[] {
+  for (const dir of candidateProfileDirs()) {
+    const entries = readPreferencesFromDir(dir)
+    if (entries.length > 0) return entries
+  }
+  return []
+}
+
 /**
  * All (key, name) pairs the client currently knows, task-only ones included.
  *
@@ -347,7 +439,10 @@ export function readPreferencesEntries(): DiscoveredEntry[] {
  */
 export function discoverAllCachedModels(): DiscoveredEntry[] {
   const merged = new Map<string, DiscoveredEntry>()
-  // Preferences first: when both sources know a key, its entry is the newer one.
+  // Live HTTP menu first when populated, then Desktop Preferences, then IndexedDB.
+  for (const entry of httpEntries ?? []) {
+    if (!merged.has(entry.key)) merged.set(entry.key, entry)
+  }
   for (const entry of readPreferencesEntries()) {
     if (!merged.has(entry.key)) merged.set(entry.key, entry)
   }
@@ -427,6 +522,9 @@ export function staticModels(): DoubaoModelInfo[] {
 }
 
 let memo: { at: number; models: DoubaoModelInfo[] } | undefined
+let httpEntries: DiscoveredEntry[] | undefined
+let httpFetchedAt = 0
+let inFlightRefresh: Promise<DoubaoModelInfo[]> | undefined
 
 /**
  * The catalog to use right now: discovered models when the cache yields them,
@@ -442,7 +540,58 @@ export function liveModels(now = Date.now()): DoubaoModelInfo[] {
   return models
 }
 
+/**
+ * Refresh the model catalog over HTTP from Doubao's `brief_list` endpoint.
+ *
+ * Pure browser-login installs have no desktop `Preferences` cache at all, so
+ * without this HTTP step they stay stuck on the 6-model static fallback.
+ * Errors fall back quietly to cached / static models and never throw.
+ */
+export async function refreshDiscovery(options: { force?: boolean; now?: number } = {}): Promise<DoubaoModelInfo[]> {
+  const now = options.now ?? Date.now()
+  if (!options.force && httpEntries !== undefined && now - httpFetchedAt < DISCOVERY_TTL_MS) {
+    return liveModels(now)
+  }
+  if (!options.force && inFlightRefresh !== undefined) {
+    return inFlightRefresh
+  }
+  const run = (async (): Promise<DoubaoModelInfo[]> => {
+    const credentials = loadDoubaoCredentials()
+    if (credentials.ok) {
+      try {
+        const response = await fetch(
+          buildQueryUrl(ACTION_BAR_BRIEF_LIST_ENDPOINT, credentials.pairs.get('msToken')),
+          {
+            method: 'POST',
+            headers: buildHeaders(credentials, { 'content-type': 'application/json' }),
+            body: JSON.stringify({ language_code: 'zh', bot_id: DEFAULT_BOT_ID }),
+          },
+        )
+        if (response.ok) {
+          const parsed = parseBriefListResponse(await response.json())
+          if (parsed.length > 0) {
+            httpEntries = parsed
+            httpFetchedAt = options.now ?? Date.now()
+            memo = undefined
+          }
+        }
+      } catch {
+        // Offline / auth failures degrade gracefully to local caches or static list.
+      }
+    }
+    return liveModels(options.now ?? Date.now())
+  })()
+  if (!options.force) inFlightRefresh = run
+  try {
+    return await run
+  } finally {
+    if (inFlightRefresh === run) inFlightRefresh = undefined
+  }
+}
+
 /** Forget the memo — used by the card's refresh and by tests. */
 export function invalidateDiscovery(): void {
   memo = undefined
+  httpEntries = undefined
+  httpFetchedAt = 0
 }
