@@ -1,5 +1,5 @@
 /**
- * Doubao credentials — the sealed browser session, and the DPAPI helper under it.
+ * Doubao credentials — the sealed browser session and its platform sealing helpers.
  *
  * WHY THERE IS ONLY ONE SOURCE
  *
@@ -23,10 +23,10 @@
  * means one account: no fallback can silently serve whoever else happened to be
  * signed in somewhere on this machine.
  *
- * SECURITY: cookie values live in this process's memory and in one file sealed
- * with Windows DPAPI (current-user scope), which no other Windows account and no
- * other machine can open. Nothing here is logged, and nothing leaves except the
- * outbound request's `Cookie:` header.
+ * SECURITY: cookie values live in this process's memory and in one file that is
+ * sealed before it touches disk — Windows DPAPI (current-user scope) on win32,
+ * AES-256-GCM with a local 0600 key file elsewhere. Nothing here is logged, and
+ * nothing leaves except the outbound request's `Cookie:` header.
  *
  * @module dsh-connect-doubao/auth
  */
@@ -34,6 +34,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, rmSync,
 import { tmpdir, homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { spawnSync } from 'node:child_process'
+import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto'
 
 export interface DoubaoCredentials {
   /** Cookie pairs ready for a `Cookie:` header. */
@@ -49,7 +50,7 @@ export interface DoubaoCredentials {
 /**
  * How long a loaded session stays in the process cache.
  *
- * Not a security boundary: DPAPI unprotect costs a PowerShell child process, and
+ * Not a security boundary: unsealing costs a child process on Windows (DPAPI), and
  * every upstream call wants the header, so the cache is what keeps a chat turn
  * from spawning one process per request. Doubao rotates its own cookies
  * server-side; the first rejected request is the accurate expiry signal.
@@ -213,6 +214,71 @@ function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
 }
 
 /* ------------------------------------------------------------------ *
+ * Platform sealing
+ * ------------------------------------------------------------------ */
+
+/**
+ * Sealing backend for non-Windows platforms.
+ *
+ * Windows uses DPAPI (current-user scope, implemented above). Node has no
+ * DPAPI binding on macOS / Linux, so those platforms use AES-256-GCM with a
+ * 32-byte key kept in a 0600 file under ~/.dsh. That is the same trust
+ * boundary: another local account (or another machine) cannot open the
+ * session, and the key never leaves this user's home directory.
+ *
+ * The sealed blob carries a short version magic so a stale DPAPI blob — or a
+ * future format change — is rejected as an unknown-format blob instead of
+ * being misread. loadBrowserCredentials() already turns any decrypt failure
+ * into not-signed-in, which is exactly the right recovery (a fresh QR scan).
+ */
+const SEAL_KEY_FILENAME = 'doubao-credentials.key'
+const SEAL_MAGIC = Buffer.from('DSHD1:', 'latin1')
+const SEAL_IV_BYTES = 12
+const SEAL_TAG_BYTES = 16
+
+function sealKeyPath(): string {
+  return join(homedir(), '.dsh', SEAL_KEY_FILENAME)
+}
+
+/** Read the local key, creating it (0600) on first use. */
+function sealKey(): Buffer {
+  try {
+    const existing = readFileSync(sealKeyPath())
+    if (existing.length === 32) return existing
+  } catch {
+    // Missing, unreadable, or wrong size: create a fresh key below.
+  }
+  const key = randomBytes(32)
+  mkdirSync(dirname(sealKeyPath()), { recursive: true })
+  writeFileSync(sealKeyPath(), key, { mode: 0o600 })
+  return key
+}
+
+/** Seal a plaintext blob for this machine (DPAPI on win32, AES-GCM elsewhere). */
+function sealBlob(plaintext: Buffer): Buffer {
+  if (process.platform === 'win32') return dpapiCall('protect', plaintext)
+  const iv = randomBytes(SEAL_IV_BYTES)
+  const cipher = createCipheriv('aes-256-gcm', sealKey(), iv)
+  const body = Buffer.concat([cipher.update(plaintext), cipher.final()])
+  return Buffer.concat([SEAL_MAGIC, iv, cipher.getAuthTag(), body])
+}
+
+/** Reverse sealBlob; throws on an unknown format or a failed auth tag. */
+function unsealBlob(sealed: Buffer): Buffer {
+  if (process.platform === 'win32') return dpapiCall('unprotect', sealed)
+  const header = SEAL_MAGIC.length + SEAL_IV_BYTES + SEAL_TAG_BYTES
+  if (sealed.length < header || !sealed.subarray(0, SEAL_MAGIC.length).equals(SEAL_MAGIC)) {
+    throw new Error('unknown sealed-session format')
+  }
+  let off = SEAL_MAGIC.length
+  const iv = sealed.subarray(off, off + SEAL_IV_BYTES); off += SEAL_IV_BYTES
+  const tag = sealed.subarray(off, off + SEAL_TAG_BYTES); off += SEAL_TAG_BYTES
+  const decipher = createDecipheriv('aes-256-gcm', sealKey(), iv)
+  decipher.setAuthTag(tag)
+  return Buffer.concat([decipher.update(sealed.subarray(off)), decipher.final()])
+}
+
+/* ------------------------------------------------------------------ *
  * The sealed browser session
  * ------------------------------------------------------------------ */
 
@@ -232,7 +298,7 @@ function browserCachePath(): string {
   return join(homedir(), '.dsh', BROWSER_CACHE_FILENAME)
 }
 
-/** Seal browser-harvested cookies to disk. Throws on a DPAPI failure. */
+/** Seal browser-harvested cookies to disk. Throws if sealing fails. */
 export function saveBrowserCredentials(pairs: Map<string, string>): void {
   const header = [...pairs.entries()].map(([name, value]) => `${name}=${value}`).join('; ')
   const payload = JSON.stringify({
@@ -241,7 +307,7 @@ export function saveBrowserCredentials(pairs: Map<string, string>): void {
     header,
     pairs: [...pairs.entries()],
   })
-  const sealed = dpapiCall('protect', Buffer.from(payload, 'utf8'))
+  const sealed = sealBlob(Buffer.from(payload, 'utf8'))
   mkdirSync(dirname(browserCachePath()), { recursive: true })
   writeFileSync(browserCachePath(), sealed, { mode: 0o600 })
 }
@@ -250,7 +316,7 @@ export function saveBrowserCredentials(pairs: Map<string, string>): void {
 export function loadBrowserCredentials(): DoubaoCredentials | undefined {
   try {
     const sealed = readFileSync(browserCachePath())
-    const json = dpapiCall('unprotect', sealed).toString('utf8')
+    const json = unsealBlob(sealed).toString('utf8')
     const parsed = JSON.parse(json) as { header?: unknown; pairs?: unknown }
     if (typeof parsed.header !== 'string' || !Array.isArray(parsed.pairs)) return undefined
     const pairs = new Map<string, string>()

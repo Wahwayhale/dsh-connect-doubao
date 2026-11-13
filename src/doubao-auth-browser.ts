@@ -24,8 +24,8 @@
  * session still valid and needs no scan at all.
  *
  * SECURITY: the returned pairs are the user's live session. They are handed to
- * `doubao-auth.ts`, which seals them with DPAPI before anything touches disk.
- * Nothing here logs a value.
+ * `doubao-auth.ts`, which seals them (Windows DPAPI / AES-256-GCM elsewhere)
+ * before anything touches disk. Nothing here logs a value.
  *
  * @module dsh-connect-doubao/auth-browser
  */
@@ -80,9 +80,50 @@ interface CdpCookie {
   expires?: unknown
 }
 
-/** Find an installed Chromium binary, or undefined. */
+/**
+ * Chromium locations on macOS and Linux.
+ *
+ * `spawn(exe, args)` runs the binary directly (no shell), so paths with spaces
+ * are fine. `homedir()` is called at lookup time rather than module load so it
+ * reflects the current environment and can be redirected in tests.
+ */
+function posixCandidates(): string[] {
+  const home = homedir()
+  const bundles = [
+    ['Google Chrome.app', 'Google Chrome'],
+    ['Microsoft Edge.app', 'Microsoft Edge'],
+    ['Chromium.app', 'Chromium'],
+    ['Google Chrome Canary.app', 'Google Chrome Canary'],
+  ] as const
+  const candidates: string[] = []
+  for (const [app, binary] of bundles) {
+    const inside = join('Contents', 'MacOS', binary)
+    candidates.push(join('/Applications', app, inside))
+    candidates.push(join(home, 'Applications', app, inside))
+  }
+  candidates.push(
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/microsoft-edge',
+  )
+  return candidates
+}
+
+/**
+ * Find an installed Chromium binary, or `undefined`.
+ *
+ * `DSH_DOUBAO_CHROME` lets a user point at any binary explicitly (a portable
+ * install, a non-default bundle name, etc.); it wins when the file exists.
+ * Otherwise the platform picks a list: win32 keeps its four default install
+ * paths, while macOS / Linux use .app bundles and well-known executables.
+ */
 export function findBrowser(): string | undefined {
-  for (const candidate of CANDIDATES) {
+  const override = process.env.DSH_DOUBAO_CHROME
+  if (override !== undefined && override !== '' && existsSync(override)) return override
+  const candidates = process.platform === 'win32' ? CANDIDATES : posixCandidates()
+  for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate
   }
   return undefined
@@ -183,16 +224,28 @@ function pickPairs(cookies: readonly CdpCookie[]): Map<string, string> {
   return pairs
 }
 
-/** Kill a spawned browser including its renderer children. */
+/**
+ * Kill a spawned browser including its renderer children.
+ *
+ * Windows needs `taskkill /T` because `child.kill()` leaves renderer/gpu
+ * children holding the user-data-dir. On POSIX taskkill does not exist:
+ * spawnSync returns a status of null with error ENOENT and does NOT throw,
+ * so the old `catch { child.kill() }` fallback never ran — the sign-in Chrome
+ * (and debug port 9333) leaked after every login and the next re-login failed
+ * with a port-occupied error. Kill the spawned process directly here;
+ * Chromium reaps its own renderers on SIGTERM.
+ */
 function terminate(child: ChildProcess): void {
   if (child.pid === undefined) return
-  try {
-    // Windows: `child.kill()` leaves the renderer/gpu children behind, which
-    // keeps the user-data-dir locked and the next login fails to start.
-    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
-  } catch {
-    try { child.kill() } catch { /* gone already */ }
+  if (process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+    } catch {
+      try { child.kill() } catch { /* gone already */ }
+    }
+    return
   }
+  try { child.kill('SIGTERM') } catch { /* gone already */ }
 }
 
 /**

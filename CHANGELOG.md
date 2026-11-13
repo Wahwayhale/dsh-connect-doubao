@@ -4,6 +4,30 @@
 
 ---
 
+## Unreleased
+
+> 支持 macOS / Linux 浏览器扫码登录（社区贡献，关联 issue #10）。
+
+### 新增
+
+- **跨平台会话密封**（`doubao-auth`）：Windows 继续用 DPAPI；macOS / Linux 改用 AES-256-GCM，
+  密钥存于 `~/.dsh/doubao-credentials.key`（0600），密封文件带 `DSHD1:` 版本标记。
+- **跨平台浏览器查找**（`doubao-auth-browser`）：`findBrowser()` 按 `process.platform` 选择候选
+  （macOS `.app` 包 / Linux 可执行文件），并支持 `DSH_DOUBAO_CHROME` 显式指定任意 Chromium 二进制。
+
+### 修复
+
+- **POSIX 上登录浏览器残留**（`doubao-auth-browser`）：原 `terminate()` 用 `taskkill`，而
+  `spawnSync` 在 ENOENT 时不抛异常，导致 `child.kill()` 兜底从不执行、调试端口 9333 被占用。
+  现按平台分支，非 Windows 直接 `SIGTERM`。
+
+### 测试
+
+- 新增 `tests/macos-compat.test.ts`：覆盖 `DSH_DOUBAO_CHROME` 覆盖、`terminate()` 平台分支，
+  以及隔离 HOME 下的 AES-256-GCM 密封往返与篡改拒绝。
+
+---
+
 ## 0.7.0 — 2026-11-13
 
 > 这一版补齐了在线模型发现链路，把思考链（CoT）、对话框模型倍率展示、以及 DSH 原生 Token 用量与会话统计全部接了进来。
