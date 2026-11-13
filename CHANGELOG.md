@@ -140,6 +140,13 @@
 - 新增 `DSH_DOUBAO_DEBUG_PROMPT=1`：把实际发出的 prompt 与原始 messages 结构打到 stderr，
   并追加到 `~/.dsh/doubao-prompt.log`。默认关闭。
 - 新增测试：无水印变体选择、前缀注入（含幂等与普通对话不受影响）。
+- **重启后勾选的模型不生效，模型选择器依旧全部显示** —— `apply()` 把 adapter 的初始
+  `enabledModelIds` 传成了 Loader 的原始 `config`，而勾选唯一保存在插件自己的设置文件里
+  （`~/.dsh/dsh-connect-doubao.settings.json`）。`config` 不含该字段时 `effectiveIds()`
+  归一成 `undefined`（「从未配置 → 全量」），于是重启后 adapter 的 `getModels()` 无视勾选
+  返回全部模型；模型发现（discovery）读的却是合并后的 `current`，两条路径给出不同的目录。
+  现在两处都读 `current`，重启后选择器与保存时一致。热更新路径（保存后即时生效）不受影响。
+
 
 ---
 
