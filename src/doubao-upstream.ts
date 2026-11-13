@@ -53,6 +53,8 @@ export const TOOL_LOCAL_UPLOAD_ENDPOINT =
   'https://www.doubao.com/alice/office/tool_local/upload_command_result'
 export const TOOL_LOCAL_COMPLETE_ENDPOINT =
   'https://www.doubao.com/alice/office/tool_local/msg/complete'
+export const ACTION_BAR_BRIEF_LIST_ENDPOINT =
+  'https://www.doubao.com/alice/slot/action_bar_v3/brief_list'
 
 /**
  * Client version strings. These are the desktop app build this was last
@@ -145,6 +147,26 @@ export interface DoubaoUsage {
   completionTokens?: number
 }
 
+/** Server-reported context window breakdown from Doubao's `context_window_usage`. */
+export interface DoubaoContextWindowUsage {
+  systemPrompt: number
+  messages: number
+  skills: number
+  tools: number
+  totalWindowSize: number
+  /** Sum of systemPrompt + messages + skills + tools reported by upstream. */
+  totalUsed: number
+}
+
+/** Optional timing and window telemetry emitted on upstream SSE frames. */
+export interface DoubaoUpstreamTelemetry {
+  contextWindowUsage?: DoubaoContextWindowUsage
+  ackCostMs?: number
+  firstPacketCostMs?: number
+  finishTimeMs?: number
+  finishReasonChat?: string
+}
+
 /** One generated image from a creation block (`block_type: 2074`). */
 export interface DoubaoImage {
   /** Server task id for this creation. */
@@ -183,6 +205,8 @@ export interface DoubaoChatResult {
    * evidence of which one was actually used.
    */
   intentionAgent?: string
+  /** Server-side telemetry parsed from `ext.context_window_usage` and timing tags. */
+  telemetry?: DoubaoUpstreamTelemetry
 }
 
 /**
@@ -586,7 +610,11 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
         // carries "". Without it the 10040 thinking block still appears in the
         // stream but stays empty (`deep_think_intention: "0"`), i.e. the server
         // opens the shell and skips the thinking.
-        conversation_mode: deepThink ? '1' : '',
+        conversation_mode: taskModelSelected && options.continueConversation !== true
+          ? '2'
+          : deepThink
+            ? '1'
+            : '',
         mode_id: modeId,
         model_item_key: model.id,
         agent_mode: String(agentMode),
@@ -710,13 +738,88 @@ function harvestText(node: unknown, into: { out: string[] }): void {
  * Treating every `text` as answer text — what the previous revision did — mixes
  * the model's private reasoning into the reply the user sees.
  */
+const PLACEHOLDER_THINKING_TITLE_RE =
+  /^(?:正在思考(?:中)?|思考中|已(?:完成)?(?:深度)?思考(?:\s*[（(].*[)）])?|深度思考(?:中)?|思考完成|正在(?:生成图片|生图)|已完成(?:图片生成|生图)|thinking|thought)(?:[.。…]+)?$/i
+
+function nonPlaceholderTitle(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const trimmed = raw.trim()
+  if (trimmed === '' || PLACEHOLDER_THINKING_TITLE_RE.test(trimmed)) return undefined
+  return trimmed
+}
+
+function trailingNewlineCount(text: string, fallback = 0): number {
+  if (text === '') return fallback
+  if (/(?:\r?\n){2}$/.test(text)) return 2
+  if (/\r?\n$/.test(text)) return 1
+  return 0
+}
+
+export interface BlockCollectState {
+  thinkingIds: Set<string>
+  /** Active target for id-less `CHUNK_DELTA` frames across SSE events. */
+  activeTarget?: 'thinking' | 'answer'
+  /** Last seen title per thinking block id. */
+  lastTitles?: Map<string, string>
+  /** Normalized thinking titles already emitted in this stream. */
+  seenTitles?: Set<string>
+  /** Last seen cumulative/snapshot `text_block.summary` per block id. */
+  lastSummaries?: Map<string, string>
+  /** True once full CoT `text_block.text` has appeared for a thinking block. */
+  hasFullThinkingText?: boolean
+  /** True when a `10040` thinking container or thinking content appeared. */
+  sawThinkingBlock?: boolean
+  hasEmittedThinking?: boolean
+  trailingNewlines?: number
+}
+
+export function createBlockCollectState(): BlockCollectState {
+  return {
+    thinkingIds: new Set<string>(),
+    lastTitles: new Map<string, string>(),
+    seenTitles: new Set<string>(),
+    lastSummaries: new Map<string, string>(),
+    hasFullThinkingText: false,
+    sawThinkingBlock: false,
+    hasEmittedThinking: false,
+    trailingNewlines: 2,
+  }
+}
+
+function pushThinkingPiece(
+  state: BlockCollectState,
+  into: { thinking: string[] },
+  piece: string,
+  discrete: boolean,
+): void {
+  if (piece === '') return
+  if (!discrete) {
+    into.thinking.push(piece)
+    state.hasEmittedThinking = true
+    state.trailingNewlines = trailingNewlineCount(piece, state.trailingNewlines ?? 0)
+    return
+  }
+  const nl = state.trailingNewlines ?? 0
+  const prefix = !state.hasEmittedThinking ? '' : nl >= 2 ? '' : nl === 1 ? '\n' : '\n\n'
+  const out = `${prefix}${piece}`
+  into.thinking.push(out)
+  state.hasEmittedThinking = true
+  state.trailingNewlines = trailingNewlineCount(out, nl)
+}
+
 export function collectBlocks(
   node: unknown,
   into: { answer: string[]; thinking: string[]; images?: DoubaoImage[] },
-  thinkingIds: Set<string>,
+  thinkingIdsOrState: Set<string> | BlockCollectState,
+  depth = 0,
 ): void {
+  const state: BlockCollectState = thinkingIdsOrState instanceof Set
+    ? { thinkingIds: thinkingIdsOrState }
+    : thinkingIdsOrState
+  const thinkingIds = state.thinkingIds
+
   if (Array.isArray(node)) {
-    for (const item of node) collectBlocks(item, into, thinkingIds)
+    for (const item of node) collectBlocks(item, into, state, depth)
     return
   }
   if (node === null || typeof node !== 'object') return
@@ -724,48 +827,140 @@ export function collectBlocks(
 
   const blockType = record.block_type
   if (typeof blockType === 'number') {
-    const blockId = typeof record.block_id === 'string' ? record.block_id : undefined
-    if (blockType === THINKING_BLOCK_TYPE && blockId !== undefined) thinkingIds.add(blockId)
+    const blockId = typeof record.block_id === 'string' && record.block_id !== ''
+      ? record.block_id
+      : undefined
+    const parentId = typeof record.parent_id === 'string' ? record.parent_id : ''
+    const isThinking = blockType === THINKING_BLOCK_TYPE ||
+      (parentId !== '' && thinkingIds.has(parentId))
+
+    if (blockType === THINKING_BLOCK_TYPE) {
+      if (blockId !== undefined) thinkingIds.add(blockId)
+    }
 
     // A creation block: `content.creation_block.creations[]`. Each creation
     // streams in pieces (first a placeholder with no URL, later the finished
     // one), so the same task id can arrive several times — the caller dedupes
     // by keeping the entries that actually carry a URL.
-    if (blockType === CREATION_BLOCK_TYPE && into.images !== undefined) {
-      const content = record.content as { creation_block?: { creations?: unknown } } | undefined
-      const creations = content?.creation_block?.creations
-      if (Array.isArray(creations)) {
-        for (const raw of creations) {
-          const image = toDoubaoImage(raw)
-          if (image !== undefined) into.images.push(image)
+    if (blockType === CREATION_BLOCK_TYPE) {
+      state.activeTarget = 'answer'
+      if (into.images !== undefined) {
+        const content = record.content as { creation_block?: { creations?: unknown } } | undefined
+        const creations = content?.creation_block?.creations
+        if (Array.isArray(creations)) {
+          for (const raw of creations) {
+            const image = toDoubaoImage(raw)
+            if (image !== undefined) into.images.push(image)
+          }
         }
       }
     }
 
-    const content = record.content as { text_block?: { text?: unknown } } | undefined
+    const content = record.content as {
+      text_block?: { text?: unknown; summary?: unknown }
+      thinking_block?: {
+        streaming_title?: unknown
+        finish_title?: unknown
+        unfold_streaming_title?: unknown
+        cot_ui_style?: unknown
+        empty_disable_click?: unknown
+      }
+    } | undefined
+
+    const thinkingBlock = content?.thinking_block
     const text = content?.text_block?.text
-    if (typeof text === 'string' && text !== '') {
-      const parentId = typeof record.parent_id === 'string' ? record.parent_id : ''
-      const isThinking = blockType === THINKING_BLOCK_TYPE ||
-        (parentId !== '' && thinkingIds.has(parentId))
-      if (isThinking) into.thinking.push(text)
-      else into.answer.push(text)
+    const summary = content?.text_block?.summary
+
+    if (isThinking) {
+      if (
+        thinkingBlock !== undefined &&
+        typeof thinkingBlock === 'object' &&
+        thinkingBlock !== null &&
+        thinkingBlock.empty_disable_click !== true
+      ) {
+        const isSummaryStyle = thinkingBlock.cot_ui_style === 'summary'
+        if (!state.hasFullThinkingText || isSummaryStyle) {
+          const title = nonPlaceholderTitle(thinkingBlock.finish_title) ??
+            nonPlaceholderTitle(thinkingBlock.unfold_streaming_title) ??
+            nonPlaceholderTitle(thinkingBlock.streaming_title)
+          if (title !== undefined) {
+            state.sawThinkingBlock = true
+            state.seenTitles ??= new Set<string>()
+            state.lastTitles ??= new Map<string, string>()
+            const titleKey = blockId ?? '__thinking_title__'
+            if (!state.seenTitles.has(title) && state.lastTitles.get(titleKey) !== title) {
+              state.seenTitles.add(title)
+              state.lastTitles.set(titleKey, title)
+              pushThinkingPiece(state, into, `${title}\n\n`, true)
+            }
+          }
+        }
+      }
+
+      if (typeof text === 'string' && text !== '') {
+        state.hasFullThinkingText = true
+        state.sawThinkingBlock = true
+        pushThinkingPiece(state, into, text, false)
+      } else if (typeof summary === 'string' && summary.trim() !== '') {
+        const trimmedSummary = summary.trim()
+        if (!PLACEHOLDER_THINKING_TITLE_RE.test(trimmedSummary)) {
+          state.sawThinkingBlock = true
+          state.seenTitles ??= new Set<string>()
+          state.lastSummaries ??= new Map<string, string>()
+          const summaryKey = blockId ?? (parentId !== '' ? `${parentId}:summary` : '__thinking_summary__')
+          const prev = state.lastSummaries.get(summaryKey) ?? ''
+          if (prev === '' && state.seenTitles.has(trimmedSummary)) {
+            state.lastSummaries.set(summaryKey, summary)
+          } else if (summary !== prev) {
+            state.lastSummaries.set(summaryKey, summary)
+            if (prev !== '' && summary.startsWith(prev)) {
+              const delta = summary.slice(prev.length)
+              pushThinkingPiece(state, into, delta, false)
+            } else {
+              state.seenTitles.add(trimmedSummary)
+              pushThinkingPiece(state, into, summary, true)
+            }
+          }
+        }
+      }
+
+      if (typeof text === 'string' && text !== '' && record.is_finish !== true) {
+        state.activeTarget = 'thinking'
+      } else if (blockType !== THINKING_BLOCK_TYPE && record.is_finish !== true) {
+        state.activeTarget = 'thinking'
+      } else if (blockType === THINKING_BLOCK_TYPE && state.activeTarget === undefined && record.is_finish !== true) {
+        state.activeTarget = 'thinking'
+      }
+    } else {
+      if (typeof text === 'string' && text !== '') {
+        into.answer.push(text)
+      }
+      if (content?.text_block !== undefined) {
+        state.activeTarget = 'answer'
+      }
     }
   } else if (
     typeof record.text === 'string' &&
     record.text !== '' &&
-    typeof record.id === 'string' &&
     !('content_block' in record) &&
-    !('message' in record)
+    !('message' in record) &&
+    (typeof record.id === 'string' || (depth === 0 && !('block_type' in record) && !('icon_url' in record)))
   ) {
     // `event: CHUNK_DELTA` frames carry incremental text as `{ text: "...", id: "<block_id>" }`
-    // without a `block_type` wrapper — particularly in 「工作任务」 (`Agent-GeneralTask`) turns.
-    if (thinkingIds.has(record.id)) into.thinking.push(record.text)
-    else into.answer.push(record.text)
+    // or `{ text: "..." }` without `id` (routed to the active block target).
+    const isThinkingDelta = typeof record.id === 'string'
+      ? thinkingIds.has(record.id)
+      : state.activeTarget === 'thinking'
+    if (isThinkingDelta) {
+      state.sawThinkingBlock = true
+      pushThinkingPiece(state, into, record.text, false)
+    } else {
+      into.answer.push(record.text)
+    }
     return
   }
 
-  for (const value of Object.values(record)) collectBlocks(value, into, thinkingIds)
+  for (const value of Object.values(record)) collectBlocks(value, into, state, depth + 1)
 }
 
 /**
@@ -781,13 +976,16 @@ function toDoubaoImage(raw: unknown): DoubaoImage | undefined {
   const creation = raw as Record<string, unknown>
   const image = creation.image as Record<string, unknown> | undefined
   if (image === undefined) return undefined
-  const pick = (key: string): { url?: unknown; width?: unknown; height?: unknown } | undefined => {
+  const pick = (key: string): { url: string; width?: unknown; height?: unknown } | undefined => {
     const value = image[key]
-    return typeof value === 'object' && value !== null ? value as never : undefined
+    if (typeof value !== 'object' || value === null) return undefined
+    const url = (value as { url?: unknown }).url
+    if (typeof url !== 'string' || url === '') return undefined
+    return value as { url: string; width?: unknown; height?: unknown }
   }
   // IMAGEGEN_RAW_PATCH: image_ori 带 logo 水印；image_ori_raw 才是原图。
   const best = pick('image_ori_raw') ?? pick('image_ori') ?? pick('image_preview') ?? pick('image_thumb')
-  if (best === undefined || typeof best.url !== 'string' || best.url === '') return undefined
+  if (best === undefined) return undefined
   const taskId = typeof creation.id === 'string' ? creation.id
     : typeof creation.id === 'number' ? String(creation.id) : undefined
   const out: DoubaoImage = { url: best.url }
@@ -838,7 +1036,7 @@ function extractThinking(payload: unknown): boolean {
   if (ext && typeof ext === 'object') {
     const useDeepThink = (ext as Record<string, unknown>).use_deep_think
     if (useDeepThink === '1' || useDeepThink === 1) return true
-    if (typeof useDeepThink === 'string' && useDeepThink !== '0') return true
+    if (typeof useDeepThink === 'string' && useDeepThink !== '' && useDeepThink !== '0') return true
   }
   return false
 }
@@ -1156,8 +1354,8 @@ async function consumeStream(
   const images: DoubaoImage[] = []
   /** Private reasoning (deep-think turns), kept out of the answer. */
   const reasoningParts: string[] = []
-  /** block_ids of the `block_type: 10040` thinking containers seen so far. */
-  const thinkingBlockIds = new Set<string>()
+  /** Shared per-stream state across `10040` / `10000` / `CHUNK_DELTA` frames. */
+  const blockState = createBlockCollectState()
   let conversationId: string | undefined
   let messageId: string | undefined
   let model: string | undefined
@@ -1173,9 +1371,107 @@ async function consumeStream(
    * rather than "the server said nothing". Naming the events turns an opaque
    * failure into a next step.
    */
+function toFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  return undefined
+}
+
+function parseJsonObject(value: unknown): Record<string, unknown> | undefined {
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>
+  }
+  if (typeof value !== 'string' || value.trim() === '') return undefined
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>
+    }
+  } catch {
+    /* best-effort telemetry parse */
+  }
+  return undefined
+}
+
+function parseContextWindowUsage(raw: unknown): DoubaoContextWindowUsage | undefined {
+  const obj = parseJsonObject(raw)
+  if (obj === undefined) return undefined
+  const systemPrompt = toFiniteNumber(obj.system_prompt)
+  const messages = toFiniteNumber(obj.messages)
+  const skills = toFiniteNumber(obj.skills)
+  const tools = toFiniteNumber(obj.tools)
+  const totalWindowSize = toFiniteNumber(obj.total_window_size)
+  if (
+    systemPrompt === undefined &&
+    messages === undefined &&
+    skills === undefined &&
+    tools === undefined &&
+    totalWindowSize === undefined
+  ) {
+    return undefined
+  }
+  const s = Math.max(0, systemPrompt ?? 0)
+  const m = Math.max(0, messages ?? 0)
+  const k = Math.max(0, skills ?? 0)
+  const t = Math.max(0, tools ?? 0)
+  const w = Math.max(0, totalWindowSize ?? 0)
+  return {
+    systemPrompt: s,
+    messages: m,
+    skills: k,
+    tools: t,
+    totalWindowSize: w,
+    totalUsed: s + m + k + t,
+  }
+}
+
+function collectTelemetryFromExt(ext: unknown, target: DoubaoUpstreamTelemetry): void {
+  const record = parseJsonObject(ext)
+  if (record === undefined) return
+  const contextWindow = parseContextWindowUsage(record.context_window_usage)
+  if (contextWindow !== undefined) {
+    target.contextWindowUsage = contextWindow
+  }
+  const teaCost = parseJsonObject(record.tea_tags_time_cost)
+  if (teaCost !== undefined) {
+    const ack = toFiniteNumber(teaCost.ack_cost_time)
+    if (ack !== undefined && ack >= 0) target.ackCostMs = ack
+    const firstPacket = toFiniteNumber(teaCost.first_packet_cost_time)
+    if (firstPacket !== undefined && firstPacket >= 0) target.firstPacketCostMs = firstPacket
+  }
+  const finishTime = toFiniteNumber(record.finish_time_ms)
+  if (finishTime !== undefined && finishTime >= 0) target.finishTimeMs = finishTime
+  if (typeof record.finish_reason_chat === 'string' && record.finish_reason_chat !== '') {
+    target.finishReasonChat = record.finish_reason_chat
+  }
+}
+
+function collectTelemetry(payload: unknown, target: DoubaoUpstreamTelemetry): void {
+  if (payload === null || typeof payload !== 'object') return
+  const record = payload as {
+    ext?: unknown
+    content?: { ext?: unknown }
+    message?: { ext?: unknown }
+    patch_op?: Array<{ patch_value?: { ext?: unknown } }>
+  }
+  collectTelemetryFromExt(record.ext, target)
+  collectTelemetryFromExt(record.content?.ext, target)
+  collectTelemetryFromExt(record.message?.ext, target)
+  if (Array.isArray(record.patch_op)) {
+    for (const op of record.patch_op) {
+      collectTelemetryFromExt(op?.patch_value?.ext, target)
+    }
+  }
+}
+
   const events = new Set<string>()
   /** The agent that served this turn, when the server names one. */
   let intentionAgent: string | undefined
+  /** Server-side timing & context window telemetry harvested across SSE frames. */
+  const telemetry: DoubaoUpstreamTelemetry = {}
   /**
    * `expose_reason` of a task turn whose runtime was unreachable.
    *
@@ -1202,6 +1498,7 @@ async function consumeStream(
     } catch {
       return
     }
+    collectTelemetry(payload, telemetry)
 
     if (name === 'STREAM_ERROR') {
       const record = payload as { error_code?: number; error_msg?: string }
@@ -1255,12 +1552,18 @@ async function consumeStream(
       // FULL_MSG_NOTIFY stays excluded: it carries the USER's own message, so
       // harvesting it would replay the prompt into the answer.
       if (name === 'STREAM_MSG_NOTIFY') {
+        thinking = thinking || extractThinking(payload)
         const acc = { answer: [] as string[], thinking: [] as string[], images }
-        collectBlocks(record.content?.content_block, acc, thinkingBlockIds)
-        for (const piece of acc.thinking) {
-          if (!piece) continue
-          reasoningParts.push(piece)
-          if (callbacks?.onThinking) callbacks.onThinking(piece)
+        collectBlocks(record.content?.content_block, acc, blockState)
+        const joinedAccThinking = acc.thinking.join('')
+        const priorThinking = reasoningParts.join('')
+        const isDuplicateThinkingReplay = joinedAccThinking !== '' && priorThinking !== '' && joinedAccThinking === priorThinking
+        if (!isDuplicateThinkingReplay) {
+          for (const piece of acc.thinking) {
+            if (!piece) continue
+            reasoningParts.push(piece)
+            if (callbacks?.onThinking) callbacks.onThinking(piece)
+          }
         }
         for (const piece of acc.answer) {
           if (!piece) continue
@@ -1277,7 +1580,7 @@ async function consumeStream(
       model = model ?? extractModel(payload)
       thinking = thinking || extractThinking(payload)
       const acc = { answer: [] as string[], thinking: [] as string[], images }
-      collectBlocks(payload, acc, thinkingBlockIds)
+      collectBlocks(payload, acc, blockState)
       for (const piece of acc.thinking) {
         if (!piece) continue
         reasoningParts.push(piece)
@@ -1373,8 +1676,9 @@ async function consumeStream(
     ...(messageId !== undefined ? { messageId } : {}),
     ...(reasoningParts.length > 0 ? { reasoningText: reasoningParts.join('') } : {}),
     ...(intentionAgent !== undefined ? { intentionAgent } : {}),
+    ...(Object.keys(telemetry).length > 0 ? { telemetry } : {}),
     images: uniqueImages,
-    thinking,
+    thinking: thinking || blockState.sawThinkingBlock === true || reasoningParts.length > 0,
   }
 }
 

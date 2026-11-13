@@ -4,6 +4,36 @@
 
 ---
 
+## 0.7.0 — 2026-11-13
+
+> 这一版补齐了在线模型发现链路，把思考链（CoT）、对话框模型倍率展示、以及 DSH 原生 Token 用量与会话统计全部接了进来。
+
+### 新增
+
+- **对话框模型选择倍率与对比弹窗**（`DoubaoRateControls` / `DoubaoCatalogStore`）
+  - 接入 DSH 对话框插槽 `conversation.input.model.label` 与 `conversation.input.right`，在模型下拉选项中直接显示豆包模型计费倍率与活动优惠标签，在输入框右侧提供当前倍率胶囊控件。
+  - 点击输入框右侧倍率控件可弹出所有已发现豆包模型的倍率对比面板，并支持手动强制刷新目录；非 Doubao 供应商保持宿主原有徽标与渲染样式不变。
+- **思考链（深度思考 CoT）完整接入**（`doubao-upstream` / `doubao-shim`）
+  - 完善 `block_type: 10040` 思考容器、`parent_id` 思考子块、`text_block.summary` 摘要式推理、无 `id` 的 `CHUNK_DELTA` 状态追踪路由（`BlockCollectState`），以及占位标题过滤与 `STREAM_MSG_NOTIFY` 回放去重，确保思考过程完整输出到 OpenAI `reasoning_content` 与 DSH `reasoning-delta`。
+  - 支持普通对话模型传入 `reasoning_effort: "off"` 显式关闭深度思考；「工作任务」模型首轮默认携带 `conversation_mode: "2"`。
+- **DSH 原生 Token 用量与会话统计**（`doubao-tokens` / `doubao-stats` / `DoubaoQuotaCard`）
+  - 为 `/v1/chat/completions` 流式（含 `stream_options.include_usage: false` 控制）与非流式响应生成确定性 OpenAI `usage`（满足 DSH `TokenMeter` 4 字符/token 下限要求，多轮 `conversation_id` 续接前缀记入 `prompt_tokens_details.cached_tokens`，思考过程记入 `completion_tokens_details.reasoning_tokens`，兼容模拟工具调用词元统计），直接驱动 DSH 顶部/状态栏 Token 用量与会话统计。
+  - 在 `doubao-upstream` 解析任务轮次上游上报的 `context_window_usage`、`tea_tags_time_cost`（`ack_cost_time` / `first_packet_cost_time`）、`finish_time_ms` 与 `finish_reason_chat`。
+  - 新增内存统计收集器 `DoubaoStatsTracker`（最多保留 64 个不透明会话键，不记录提示词/凭据原文）与路由 `GET|POST /plugins/dsh-connect-doubao/stats`（支持带 `x-dsh-doubao-write` 校验头的清零操作），并在插件设置页新增「会话统计与 Token 用量」面板展示请求数、续接数、Token 细分、缓存命中率、平均 TTFT、生成速率（tok/s）及最近一轮上游窗口拆解。
+
+### 修复
+
+- **在线模型发现与刷新联动**（`doubao-discovery` / `doubao-status`）：新增 `POST /alice/slot/action_bar_v3/brief_list` 在线菜单解析（支持 `menu_conf_v2` 与 `menu_conf` 回退）、多 Profile 目录候选扫描及遍历所有 `BriefListRequestCache` 键；点击「刷新」或完成浏览器扫码重登录后自动触发在线刷新并重建适配器模型列表。
+- **端口绑定通知与勾选列表初始化**（`doubao-adapter` / `index`）：新增 `onBaseUrlReady` 回调在 shim 端口就绪后通知宿主刷新可用路由，并使用合并后的 `current`（而非 Loader 原始配置）初始化 `enabledModelIds`。
+- **额度耗尽判定误拦截**（`doubao-quota`）：通过 `evaluateQuotaExhausted` 仅在所有有效额度分组都耗尽时才判定账号额度用完，避免活动赠送额度用尽误拦常规 5 小时/周额度请求。
+- **生图路由隔离与提示词清理**（`doubao-shim` / `doubao-upstream`）：`image-gen`（兼容大小写与 `doubao/` 前缀）强制关闭深度思考、跳过工具模拟与多轮上下文续接；`buildImagePrompt` 放宽描述上限至 2000 字符并清理 `<system-reminder>`、`<hindsight_page_refresh>` 及框架上下文注入文本；无水印原图缺失时支持回退 `image_ori`。
+
+### 测试与校验
+
+- 新增思维链、倍率控件、Token 估算、会话统计路由与设置页卡片、以及通过 `@deepseek-ai/dsh-llm-pi-ai`（`PiAiAdapter`）真实串联 loopback shim 的端到端集成测试，覆盖流式/非流式、多轮缓存增长与模拟工具调用。
+
+---
+
 ## 0.6.1 — 2026-11-12
 
 > 这一版把「模型清单」从一张硬编码表，改成照抄豆包客户端菜单：有什么模型、各自多少倍率、

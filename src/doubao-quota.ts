@@ -190,6 +190,52 @@ function rememberFailure(quota: DoubaoQuota): DoubaoQuota {
  * Never throws: an unreachable endpoint yields a `DoubaoQuota` carrying an
  * `error`, because a quota panel failure must not take down a chat request.
  */
+export interface RawQuotaData {
+  window_limit_section?: {
+    usage_exhausted?: boolean
+    window_limit_groups?: Array<{ feature_group_name?: string; window_limits?: RawWindowLimit[] }>
+  }
+  enterprise_window_limit_section?: {
+    usage_exhausted?: boolean
+    window_limit_groups?: Array<{ feature_group_name?: string; window_limits?: RawWindowLimit[] }>
+  }
+  incentive_quota_section?: {
+    usage_exhausted?: boolean
+    window_limit_groups?: Array<{ feature_group_name?: string; window_limits?: RawWindowLimit[] }>
+  }
+  current_subscription?: { display?: { short_name?: string; product_name?: string } }
+  member_info?: { hasActiveSubscription?: boolean }
+}
+
+/**
+ * Only report the account as exhausted when all active quota entitlements say
+ * so: an exhausted promotional bonus must not block turns while the main
+ * window still has headroom.
+ */
+export function evaluateQuotaExhausted(data: RawQuotaData | undefined): boolean {
+  const hasActiveGroups = (section?: {
+    window_limit_groups?: Array<{ window_limits?: RawWindowLimit[] }>
+  }): boolean => Boolean(section?.window_limit_groups?.some((g) => (g.window_limits?.length ?? 0) > 0))
+
+  const windowExhausted = data?.window_limit_section?.usage_exhausted
+  const enterpriseExhausted = data?.enterprise_window_limit_section?.usage_exhausted
+  const incentiveExhausted = data?.incentive_quota_section?.usage_exhausted
+
+  const activeFlags: boolean[] = []
+  if (typeof windowExhausted === 'boolean') activeFlags.push(windowExhausted)
+  if (typeof enterpriseExhausted === 'boolean' && hasActiveGroups(data?.enterprise_window_limit_section)) {
+    activeFlags.push(enterpriseExhausted)
+  }
+  if (typeof incentiveExhausted === 'boolean' && hasActiveGroups(data?.incentive_quota_section)) {
+    activeFlags.push(incentiveExhausted)
+  }
+  const fallbackFlags = [windowExhausted, enterpriseExhausted, incentiveExhausted].filter(
+    (flag): flag is boolean => typeof flag === 'boolean',
+  )
+  const flags = activeFlags.length > 0 ? activeFlags : fallbackFlags
+  return flags.length > 0 && flags.every(Boolean)
+}
+
 export async function fetchQuota(options: { force?: boolean } = {}): Promise<DoubaoQuota> {
   const now = Date.now()
   if (!options.force && cached && now - cached.fetchedAt < QUOTA_TTL_MS) {
@@ -218,21 +264,7 @@ export async function fetchQuota(options: { force?: boolean } = {}): Promise<Dou
     if (!response.ok) {
       return rememberFailure({ exhausted: false, windows: [], fetchedAt: now, error: `HTTP ${response.status}` })
     }
-    const payload = (await response.json()) as {
-      data?: {
-        window_limit_section?: {
-          usage_exhausted?: boolean
-          window_limit_groups?: Array<{ feature_group_name?: string; window_limits?: RawWindowLimit[] }>
-        }
-        enterprise_window_limit_section?: { usage_exhausted?: boolean }
-        incentive_quota_section?: {
-          usage_exhausted?: boolean
-          window_limit_groups?: Array<{ feature_group_name?: string; window_limits?: RawWindowLimit[] }>
-        }
-        current_subscription?: { display?: { short_name?: string; product_name?: string } }
-        member_info?: { hasActiveSubscription?: boolean }
-      }
-    }
+    const payload = (await response.json()) as { data?: RawQuotaData }
 
     // Two sections, one list: the regular windows and the promotional grants
     // that Doubao shows above them ("活动赠送额度"). Reading only the first
@@ -252,10 +284,7 @@ export async function fetchQuota(options: { force?: boolean } = {}): Promise<Dou
     }
 
     const quota: DoubaoQuota = {
-      exhausted:
-        payload.data?.window_limit_section?.usage_exhausted === true ||
-        payload.data?.enterprise_window_limit_section?.usage_exhausted === true ||
-        payload.data?.incentive_quota_section?.usage_exhausted === true,
+      exhausted: evaluateQuotaExhausted(payload.data),
       windows,
       fetchedAt: now,
     }

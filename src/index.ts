@@ -18,7 +18,14 @@
  */
 import { createDoubaoAdapter } from './doubao-adapter.ts'
 import { createDoubaoShim } from './doubao-shim.ts'
-import { registerDoubaoQuotaRoute, registerDoubaoCatalogRoute, registerDoubaoSaveRoute, registerDoubaoAuthRoute } from './doubao-status.ts'
+import {
+  registerDoubaoQuotaRoute,
+  registerDoubaoCatalogRoute,
+  registerDoubaoSaveRoute,
+  registerDoubaoAuthRoute,
+  registerDoubaoStatsRoute,
+} from './doubao-status.ts'
+import { DoubaoStatsTracker } from './doubao-stats.ts'
 import { setProfileOverride } from './doubao-profile.ts'
 import type { WebServerLike } from './doubao-status.ts'
 import {
@@ -32,7 +39,7 @@ import {
 } from './doubao-catalog.ts'
 import { ENABLED_MODEL_IDS_FIELD, effectiveIds, profileDirOf, toolEmulationOf } from './doubao-config.ts'
 import { writeStoredSetting, readStoredSettings, withStoredSettings } from './doubao-store.ts'
-import { liveModels, invalidateDiscovery, discoverAllCachedModels } from './doubao-discovery.ts'
+import { liveModels, invalidateDiscovery, discoverAllCachedModels, refreshDiscovery } from './doubao-discovery.ts'
 import type { DoubaoSettings } from './doubao-config.ts'
 
 export const PLUGIN_ID = 'dsh-connect-doubao'
@@ -86,22 +93,27 @@ export * from './doubao-config.ts'
 export {
   liveModels,
   invalidateDiscovery,
+  refreshDiscovery,
   discoverModels,
   discoverAllCachedModels,
   DISCOVERY_TTL_MS,
 } from './doubao-discovery.ts'
 export { createDoubaoAdapter, DOUBAO_STREAM_IDLE_TIMEOUT_MS } from './doubao-adapter.ts'
 export { createDoubaoShim, type DoubaoShim } from './doubao-shim.ts'
+export * from './doubao-tokens.ts'
+export * from './doubao-stats.ts'
 export {
   doubaoQuotaView,
   registerDoubaoQuotaRoute,
   registerDoubaoCatalogRoute,
   registerDoubaoSaveRoute,
   registerDoubaoAuthRoute,
+  registerDoubaoStatsRoute,
   DOUBAO_QUOTA_PATH,
   DOUBAO_CATALOG_PATH,
   DOUBAO_SAVE_PATH,
   DOUBAO_AUTH_PATH,
+  DOUBAO_STATS_PATH,
 } from './doubao-status.ts'
 // `Config` is re-exported (not redefined) from './doubao-config.ts' above: the
 // Loader needs it as a real schemastery schema on this entry module.
@@ -123,9 +135,11 @@ export const DOUBAO_SETTINGS_NS = 'llm:doubao'
  * package builds and typechecks without the peer dependency installed. At
  * runtime Cordis passes a real `Context`, which satisfies this shape.
  */
+export type DoubaoAdapterRelease = (() => void) & { replace?: (ids: string[]) => void }
+
 export interface DoubaoPluginContext {
   llm: {
-    registerAdapter(ids: string[], adapter: unknown): () => void
+    registerAdapter(ids: string[], adapter: unknown): DoubaoAdapterRelease
     registerConfigurableProviders(entries: Array<{
       provider: string
       displayName: string
@@ -200,9 +214,10 @@ export function settingsNamespaceOf(ctx: unknown): string {
  */
 export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabledModelIds: [], toolEmulation: false, profileDir: '' }): void {
   let shim: ReturnType<typeof createDoubaoShim> | undefined
-  let adapterRelease: (() => void) | undefined
+  let adapterRelease: DoubaoAdapterRelease | undefined
   let directoryRelease: (() => void) | undefined
   let discoveryRelease: (() => void) | undefined
+  let disposed = false
 
   // The namespace the host serves, resolved once from the Loader entry.
   const settingsNs = settingsNamespaceOf(ctx)
@@ -225,16 +240,33 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
   // resolver — so the override has to be installed here, not lazily.
   setProfileOverride(profileDirOf(current))
 
+  let notifyAdapters = (): void => {}
+
+  const stats = new DoubaoStatsTracker()
+
   try {
     shim = createDoubaoShim({
       // Read live so a settings change takes effect without a host restart.
       toolEmulation: () => toolEmulationOf(current),
+      stats,
     })
+    let invalidateAdapter: (() => void) | undefined
+    notifyAdapters = (): void => {
+      if (disposed) return
+      invalidateAdapter?.()
+      try {
+        adapterRelease?.replace?.([DOUBAO_PROVIDER])
+      } catch {
+        /* registration may have already been disposed */
+      }
+    }
     const { adapter, invalidate, setEnabledModelIds } = createDoubaoAdapter({
       shim,
-      enabledModelIds: effectiveIds(config),
+      enabledModelIds: effectiveIds(current),
       modelsProvider: liveModels,
+      onBaseUrlReady: notifyAdapters,
     })
+    invalidateAdapter = invalidate
 
     // Register the adapter first: an empty INITIAL registration is invalid
     // (`INVALID_ADAPTER`), whereas releasing a landed one is always legal.
@@ -250,6 +282,7 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
     ])
 
     ctx.effect(() => () => {
+      disposed = true
       adapterRelease?.()
       directoryRelease?.()
       discoveryRelease?.()
@@ -261,10 +294,16 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
     // snapshot after startup already points at the live port.
     invalidate()
 
+    // Populate the live HTTP model catalog asynchronously so pure browser-login
+    // installs (with no desktop Preferences file) still see the full model list.
+    void refreshDiscovery().then(() => {
+      notifyAdapters()
+    }).catch(() => {})
+
     // Model discovery publishes the catalog, filtered by the user's ticked
-    // entries. The list itself comes from the CLIENT'S OWN CACHE (see
-    // doubao-discovery.ts), so a model Doubao ships appears here without a
-    // plugin release; the static catalog is only the fallback.
+    // entries. The list itself comes from live HTTP + the CLIENT'S OWN CACHE
+    // (see doubao-discovery.ts), so a model Doubao ships appears here without
+    // a plugin release; the static catalog is only the fallback.
     //
     // The checklist decides which entries exist in DSH's model picker. Routing
     // is a separate axis: the picked entry travels as `model_item_key`, and
@@ -272,7 +311,8 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
     try {
       discoveryRelease = ctx.llm.registerModelDiscovery(settingsNs, async (request) => {
         if (request.provider !== undefined && request.provider !== DOUBAO_PROVIDER) return []
-        return enabledModelsOf(effectiveIds(current), liveModels()).map(model => ({
+        const catalog = await refreshDiscovery()
+        return enabledModelsOf(effectiveIds(current), catalog).map(model => ({
           id: model.id,
           name: model.name,
           contextWindow: DOUBAO_CONTEXT_WINDOW,
@@ -389,7 +429,7 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
       // so the discovery closure below sees the new selection.
       if (next !== undefined) current = next
       setEnabledModelIds(effectiveIds(current))
-      invalidate()
+      notifyAdapters()
     }
     try {
       ;(ctx as unknown as { on(name: string, listener: () => void): unknown })
@@ -401,7 +441,11 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
     ctx.inject(['webServer'], (webCtx) => {
       try {
         const disposeQuota = registerDoubaoQuotaRoute(webCtx)
-        const disposeCatalog = registerDoubaoCatalogRoute(webCtx, { modelsProvider: liveModels })
+        const disposeCatalog = registerDoubaoCatalogRoute(webCtx, {
+          modelsProvider: liveModels,
+          refreshModels: async () => { await refreshDiscovery({ force: true }) },
+          onRefreshed: notifyAdapters,
+        })
         const disposeSave = registerDoubaoSaveRoute(
           {
             webServer: (webCtx as unknown as { webServer: WebServerLike }).webServer,
@@ -428,18 +472,30 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
             },
           },
         )
-        const disposeAuth = registerDoubaoAuthRoute(webCtx)
+        const disposeAuth = registerDoubaoAuthRoute(webCtx, {
+          onSignedIn: () => {
+            void refreshDiscovery({ force: true }).then(() => {
+              notifyAdapters()
+            }).catch(() => {})
+          },
+        })
+        const disposeStats = registerDoubaoStatsRoute(webCtx, {
+          read: () => shim?.stats() ?? stats.snapshot(0),
+          reset: () => { shim?.resetStats(); if (shim === undefined) stats.reset() },
+        })
         ctx.effect(() => () => {
           disposeQuota()
           disposeCatalog()
           disposeSave()
           disposeAuth()
+          disposeStats()
         })
       } catch (error: unknown) {
         ctx.logger.error('dsh-connect-doubao: web route registration failed', error)
       }
     })
   } catch (error: unknown) {
+    disposed = true
     ctx.logger.error('dsh-connect-doubao: provider registration failed', error)
     // Release whatever landed before the throw; a half-registered provider
     // would be visible in the model picker and unroutable.

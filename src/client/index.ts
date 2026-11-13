@@ -24,6 +24,13 @@ import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { DoubaoQuotaCard } from './DoubaoQuotaCard.tsx'
 import type { DoubaoCardInjected } from './DoubaoQuotaCard.tsx'
+import {
+  DoubaoComposerRateControl,
+  DoubaoModelOptionLabel,
+  ensureDoubaoStyles,
+  type ComposerRightSlotProps,
+  type ModelLabelSlotProps,
+} from './DoubaoRateControls.tsx'
 import { NAMESPACE, en, zh, translator } from './locales.ts'
 import type { DoubaoCardKey } from './locales.ts'
 
@@ -185,6 +192,66 @@ export function apply(ctx: DoubaoClientContext): void {
     }
 
     registerSettingsSection()
+
+    const resolveHostText = typeof (ctx.locale as unknown as { resolveText?: unknown }).resolveText === 'function'
+      ? (text: unknown): string =>
+          (ctx.locale as unknown as { resolveText(value: unknown): string }).resolveText(text)
+      : undefined
+
+    try {
+      ensureDoubaoStyles()
+    } catch {
+      /* safe on headless / SSR environments */
+    }
+
+    const registerModelRateLabel = (): void => {
+      try {
+        ctx.slots.inject('conversation.input.model.label' as never, () => (ctx.slots as unknown as {
+          register(
+            options: {
+              name: string
+              priority: number
+              inject: () => Pick<ModelLabelSlotProps, 't' | 'resolveText'>
+            },
+            component: unknown,
+          ): () => void
+        }).register({
+          name: 'conversation.input.model.label',
+          priority: 30,
+          inject: () => resolveHostText === undefined
+            ? { t }
+            : { t, resolveText: resolveHostText },
+        }, DoubaoModelOptionLabel))
+      } catch (error: unknown) {
+        console.error('[dsh-connect-doubao] conversation.input.model.label failed to register:', error)
+      }
+    }
+
+    const registerComposerRateControl = (): void => {
+      try {
+        ctx.slots.inject('conversation.input.right' as never, () => (ctx.slots as unknown as {
+          register(
+            options: {
+              name: string
+              id: string
+              order: number
+              inject: () => Pick<ComposerRightSlotProps, 't'>
+            },
+            component: unknown,
+          ): () => void
+        }).register({
+          name: 'conversation.input.right',
+          id: 'doubao-rate',
+          order: 90,
+          inject: () => ({ t }),
+        }, DoubaoComposerRateControl))
+      } catch (error: unknown) {
+        console.error('[dsh-connect-doubao] conversation.input.right failed to register:', error)
+      }
+    }
+
+    registerModelRateLabel()
+    registerComposerRateControl()
   } catch (error: unknown) {
     // Degrade silently on the page; developers see the cause in the console.
     console.error('[dsh-connect-doubao] client card failed to load (host provider unaffected):', error)
@@ -192,4 +259,5 @@ export function apply(ctx: DoubaoClientContext): void {
 }
 
 export { DoubaoQuotaCard } from './DoubaoQuotaCard.tsx'
+export { DoubaoModelOptionLabel, DoubaoComposerRateControl } from './DoubaoRateControls.tsx'
 export { en, zh, translator } from './locales.ts'

@@ -29,12 +29,14 @@ import {
   DOUBAO_QUOTA_PATH,
   DOUBAO_SAVE_PATH,
   DOUBAO_AUTH_PATH,
+  DOUBAO_STATS_PATH,
   classifyQuotaView,
   clampPercent,
   enabledModelIdsOf,
   DOUBAO_TOOL_EMULATION_FIELD,
   toolEmulationOf,
   formatCountdown,
+  formatCompactTokens,
 } from './contract.ts'
 import type {
   DoubaoAccountState,
@@ -42,9 +44,11 @@ import type {
   DoubaoCatalogView,
   DoubaoModelEntry,
   DoubaoQuotaView,
+  DoubaoStatsView,
 } from './contract.ts'
 import type { DoubaoCardKey, Translate } from './locales.ts'
 import { DOUBAO_CARD_CSS } from './styles.ts'
+import { setDoubaoCatalogSnapshot } from './DoubaoCatalogStore.ts'
 
 /**
  * How often the quota is re-read while the card is on screen.
@@ -158,6 +162,41 @@ async function fetchCatalog(signal: AbortSignal): Promise<DoubaoCatalogView | un
   })
   if (!response.ok) return undefined
   return (await response.json()) as DoubaoCatalogView
+}
+
+/** Read runtime session & token statistics. Never throws. */
+async function fetchStats(signal?: AbortSignal): Promise<DoubaoStatsView | undefined> {
+  const response = await fetch(DOUBAO_STATS_PATH, {
+    method: 'GET',
+    credentials: 'same-origin',
+    ...(signal === undefined ? {} : { signal }),
+    headers: { accept: 'application/json' },
+  })
+  if (!response.ok) return undefined
+  return (await response.json()) as DoubaoStatsView
+}
+
+/** Reset runtime session & token statistics on the host. */
+async function resetStatsRequest(): Promise<DoubaoStatsView | undefined> {
+  const response = await fetch(DOUBAO_STATS_PATH, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', accept: 'application/json', ...WRITE_HEADERS },
+    body: JSON.stringify({ action: 'reset' }),
+  })
+  if (!response.ok) return undefined
+  return (await response.json()) as DoubaoStatsView
+}
+
+function formatLatencyMs(ms: number | null): string {
+  if (ms === null || !Number.isFinite(ms)) return '--'
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`
+  return `${Math.round(ms)}ms`
+}
+
+function formatRatePercent(rate: number | null): string {
+  if (rate === null || !Number.isFinite(rate)) return '--'
+  return `${Math.round(rate * 100)}%`
 }
 
 /**
@@ -280,6 +319,8 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
 
   const [quota, setQuota] = useState<DoubaoQuotaView | undefined>(undefined)
   const [busy, setBusy] = useState(false)
+  const [stats, setStats] = useState<DoubaoStatsView | undefined>(undefined)
+  const [statsBusy, setStatsBusy] = useState(false)
   const [catalog, setCatalog] = useState<DoubaoCatalogView | undefined>(undefined)
   const [catalogBusy, setCatalogBusy] = useState(false)
   /** Ticking `settingsScope` bumps this so the model block re-reads the snapshot. */
@@ -362,12 +403,13 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
     // later read forces a fresh one (POST), because a 30-second poll answered
     // from the memo would never show a change.
     const load = async (force: boolean): Promise<void> => {
-      try {
-        const view = force ? await refreshQuota(controller.signal) : await fetchQuota(controller.signal)
-        if (alive) setQuota(view)
-      } catch {
-        if (alive) setQuota(undefined)
-      }
+      const [quotaView, statsView] = await Promise.all([
+        (force ? refreshQuota(controller.signal) : fetchQuota(controller.signal)).catch(() => undefined),
+        fetchStats(controller.signal).catch(() => undefined),
+      ])
+      if (!alive) return
+      setQuota(quotaView)
+      if (statsView !== undefined) setStats(statsView)
     }
     void load(false)
     const timer = setInterval(() => {
@@ -390,11 +432,38 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
   const onRefresh = useCallback(async (): Promise<void> => {
     setBusy(true)
     try {
-      setQuota(await refreshQuota())
-    } catch {
-      setQuota(undefined)
+      const [quotaView, statsView] = await Promise.all([
+        refreshQuota().catch(() => undefined),
+        fetchStats().catch(() => undefined),
+      ])
+      setQuota(quotaView)
+      if (statsView !== undefined) setStats(statsView)
     } finally {
       setBusy(false)
+    }
+  }, [])
+
+  const onRefreshStats = useCallback(async (): Promise<void> => {
+    setStatsBusy(true)
+    try {
+      const next = await fetchStats()
+      if (next !== undefined) setStats(next)
+    } catch {
+      /* ignore transient read failures */
+    } finally {
+      setStatsBusy(false)
+    }
+  }, [])
+
+  const onResetStats = useCallback(async (): Promise<void> => {
+    setStatsBusy(true)
+    try {
+      const next = await resetStatsRequest()
+      if (next !== undefined) setStats(next)
+    } catch {
+      /* ignore transient write failures */
+    } finally {
+      setStatsBusy(false)
     }
   }, [])
 
@@ -402,7 +471,9 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
   const loadCatalog = useCallback(async (): Promise<void> => {
     setCatalogBusy(true)
     try {
-      setCatalog(await fetchCatalog(new AbortController().signal))
+      const nextCatalog = await fetchCatalog(new AbortController().signal)
+      setCatalog(nextCatalog)
+      setDoubaoCatalogSnapshot(nextCatalog)
     } catch {
       setCatalog(undefined)
     } finally {
@@ -701,6 +772,101 @@ export function DoubaoQuotaCard(props: DoubaoCardProps): ReactElement {
             {busy ? t('quota.refreshing') : t('quota.refresh')}
           </button>
           <span className="dbq-note">{t('quota.autoNote')}</span>
+        </div>
+      </div>
+
+      {/* ---- session stats & token usage ------------------------ */}
+      <div className="dbq-section">
+        <div className="dbq-section-title">
+          <span>{t('stats.title')}</span>
+          <span className="dbq-count">
+            {stats === undefined
+              ? '—'
+              : t('stats.sessionsActive', { count: stats.activeConversations })}
+          </span>
+        </div>
+        {stats === undefined || stats.totals.requests === 0 ? (
+          <div className="dbq-note">{stats === undefined ? t('stats.loadFailed') : t('stats.empty')}</div>
+        ) : (
+          <>
+            <div className="dbq-row">
+              <div className="dbq-row-head">
+                <span className="dbq-label">{t('stats.requestsLabel')}</span>
+                <span className="dbq-figure">
+                  {t('stats.requestsValue', {
+                    succeeded: stats.totals.succeeded,
+                    continuations: stats.totals.continuations,
+                    failed: stats.totals.failed,
+                  })}
+                </span>
+              </div>
+            </div>
+            <div className="dbq-row">
+              <div className="dbq-row-head">
+                <span className="dbq-label">{t('stats.totalTokensLabel')}</span>
+                <span className="dbq-figure">
+                  {t('stats.totalTokensValue', {
+                    total: formatCompactTokens(stats.totals.totalTokens),
+                    input: formatCompactTokens(stats.totals.promptTokens),
+                    output: formatCompactTokens(stats.totals.completionTokens),
+                  })}
+                </span>
+              </div>
+              <div className="dbq-row-foot">
+                <span className="dbq-meta">
+                  {t('stats.tokenBreakdown', {
+                    uncached: formatCompactTokens(stats.totals.uncachedInputTokens),
+                    cached: formatCompactTokens(stats.totals.cachedInputTokens),
+                    reasoning: formatCompactTokens(stats.totals.reasoningTokens),
+                  })}
+                </span>
+                <span className="dbq-figure-sub">
+                  {t('stats.cacheHitRate', { rate: formatRatePercent(stats.totals.cacheHitRate) })}
+                </span>
+              </div>
+            </div>
+            <div className="dbq-row">
+              <div className="dbq-row-head">
+                <span className="dbq-label">{t('stats.latencyLabel')}</span>
+                <span className="dbq-figure">
+                  {t('stats.latencyValue', {
+                    ttft: formatLatencyMs(stats.totals.avgTtftMs),
+                    tps: stats.totals.avgTps === null ? '--' : String(stats.totals.avgTps),
+                  })}
+                </span>
+              </div>
+            </div>
+            {stats.lastTurn?.upstreamContextWindow != null && (
+              <div className="dbq-row">
+                <div className="dbq-row-head">
+                  <span className="dbq-label">{t('stats.upstreamWindowLabel')}</span>
+                  <span className="dbq-meta">
+                    {t('stats.upstreamWindowValue', {
+                      used: formatCompactTokens(stats.lastTurn.upstreamContextWindow.totalUsed),
+                      window: formatCompactTokens(stats.lastTurn.upstreamContextWindow.totalWindowSize),
+                      system: formatCompactTokens(stats.lastTurn.upstreamContextWindow.systemPrompt),
+                      messages: formatCompactTokens(stats.lastTurn.upstreamContextWindow.messages),
+                      tools: formatCompactTokens(stats.lastTurn.upstreamContextWindow.tools),
+                    })}
+                  </span>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+        <div className="dbq-actions">
+          <button type="button" className="dbq-btn" onClick={() => void onRefreshStats()} disabled={statsBusy}>
+            {statsBusy ? t('stats.refreshing') : t('stats.refresh')}
+          </button>
+          <button
+            type="button"
+            className="dbq-btn"
+            onClick={() => void onResetStats()}
+            disabled={statsBusy || (stats?.totals.requests ?? 0) === 0}
+          >
+            {t('stats.reset')}
+          </button>
+          <span className="dbq-note">{t('stats.note')}</span>
         </div>
       </div>
 

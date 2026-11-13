@@ -239,3 +239,103 @@ export interface DoubaoAuthView {
   daysLeft: number | null
   detail: string | null
 }
+
+/* ------------------------------------------------------------------ *
+ * Session & token stats
+ * ------------------------------------------------------------------ */
+
+/** Host route serving runtime session & token usage statistics. */
+export const DOUBAO_STATS_PATH = '/plugins/dsh-connect-doubao/stats'
+
+export interface DoubaoContextWindowUsageView {
+  systemPrompt: number
+  messages: number
+  skills: number
+  tools: number
+  totalWindowSize: number
+  totalUsed: number
+}
+
+export interface DoubaoModelStatsView {
+  model: string
+  requests: number
+  succeeded: number
+  failed: number
+  promptTokens: number
+  cachedInputTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  totalTokens: number
+}
+
+export interface DoubaoSessionStatsEntryView {
+  sessionKey: string
+  lastModel: string
+  turns: number
+  continuations: number
+  promptTokens: number
+  uncachedInputTokens: number
+  cachedInputTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  totalTokens: number
+  lastTtftMs: number | null
+  lastTps: number | null
+  lastActiveAt: number
+}
+
+export interface DoubaoLastTurnStatsView {
+  at: number
+  model: string
+  stream: boolean
+  continuation: boolean
+  promptTokens: number
+  uncachedInputTokens: number
+  cachedInputTokens: number
+  completionTokens: number
+  reasoningTokens: number
+  totalTokens: number
+  ttftMs: number | null
+  durationMs: number
+  decodeMs: number
+  tps: number | null
+  upstreamContextWindow: DoubaoContextWindowUsageView | null
+  upstreamFirstPacketMs: number | null
+  upstreamAckMs: number | null
+}
+
+export interface DoubaoStatsView {
+  ok: boolean
+  startedAt: number
+  updatedAt: number
+  activeConversations: number
+  totals: {
+    requests: number
+    succeeded: number
+    failed: number
+    continuations: number
+    promptTokens: number
+    uncachedInputTokens: number
+    cachedInputTokens: number
+    completionTokens: number
+    reasoningTokens: number
+    totalTokens: number
+    cacheHitRate: number | null
+    avgTtftMs: number | null
+    avgTps: number | null
+    totalDurationMs: number
+    decodeMs: number
+    decodeTokens: number
+  }
+  byModel: DoubaoModelStatsView[]
+  sessions: DoubaoSessionStatsEntryView[]
+  lastTurn: DoubaoLastTurnStatsView | null
+}
+
+/** Format large token totals compactly for the card UI. */
+export function formatCompactTokens(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0'
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`
+  if (value >= 10_000) return `${(value / 1_000).toFixed(1)}k`
+  return Math.round(value).toLocaleString('en-US')
+}
