@@ -93,7 +93,7 @@ export async function runDoctor(): Promise<DoctorReport> {
       detail: `${credentials.pairs.size} cookies in the sealed browser session; ${present.length}/${REQUIRED_COOKIE_NAMES.length} required session cookies present`,
       // Names and counts only — never values.
       data: {
-        source: 'browser (sealed DPAPI file)',
+        source: 'browser (sealed session file)',
         // Absent here is informational, not a fault: see the comment above.
         profile: profiles.length > 0 ? describeProfileLocation() : 'no Doubao app profile (not needed)',
         candidates: profiles.map((entry) => `${entry.dir} (via ${entry.source})`),
