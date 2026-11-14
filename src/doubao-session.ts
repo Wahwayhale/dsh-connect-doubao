@@ -42,10 +42,19 @@ export interface SessionState {
   at: number
 }
 
-/** A conversation nobody has touched for this long is dropped. */
-export const SESSION_TTL_MS = 30 * 60 * 1000
+/**
+ * A conversation nobody has touched for this long is dropped.
+ *
+ * Deliberately long: Doubao threads on the account live for weeks, and every
+ * dropped id makes the next turn open a NEW conversation — re-uploading the
+ * whole transcript instead of sending the delta, which is exactly what costs
+ * quota. A stale id is safe to keep because a continuation the server rejects
+ * (710020202) is re-issued as a fresh conversation within the same turn (see
+ * the shim), so expiry only needs to bound staleness, not to prevent loops.
+ */
+export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 /** Hard cap, so a long-lived host cannot grow this map without bound. */
-export const SESSION_MAX_ENTRIES = 64
+export const SESSION_MAX_ENTRIES = 256
 
 /**
  * Stable key for a transcript's opening HUMAN turn.
@@ -121,6 +130,10 @@ export class ConversationStore {
 
   remember(key: string | undefined, conversationId: string, messageCount: number, now = Date.now()): void {
     if (key === undefined || conversationId === '') return
+    // Re-insert instead of set: Map keeps an existing key's ORIGINAL position,
+    // which would make the eviction order insertion-based rather than least-
+    // recently-used — evicting a live session while stale ones sit at the end.
+    this.entries.delete(key)
     this.entries.set(key, { conversationId, messageCount, at: now })
     if (this.entries.size <= this.maxEntries) return
     // Oldest-first eviction: Map preserves insertion order, and `remember`
