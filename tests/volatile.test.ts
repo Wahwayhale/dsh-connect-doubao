@@ -86,10 +86,10 @@ describe('defaults stay "not yet configured" rather than "ticked nothing"', () =
     expect(meta.default).toEqual([])
   })
 
-  it('leaves tool emulation OFF by default', () => {
+  it('enables tool emulation ON by default', () => {
     // Opt-in on purpose: the switch lets a model touch the local filesystem
     // through prompt-emulated tool calls, so a fresh install must not have it.
     const meta = (Config as any).dict[TOOL_EMULATION_FIELD].meta
-    expect(meta.default).toBe(false)
+    expect(meta.default).toBe(true)
   })
 })

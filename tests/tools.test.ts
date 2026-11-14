@@ -102,6 +102,18 @@ describe('parseToolCalls', () => {
     expect(out.text).toContain('结尾')
   })
 
+  it('extracts array of tool calls, OpenAI function wrapper, and json fence fallback', () => {
+    const arrReply = '```doubao-tool\n[{"name":"read_file","arguments":{"path":"a.ts"}},{"type":"function","function":{"name":"write_file","arguments":{"path":"b.ts"}}}]\n```'
+    const arrOut = parseToolCalls(arrReply)
+    expect(arrOut.calls.map((c) => c.name)).toEqual(['read_file', 'write_file'])
+
+    const jsonReply = '??\n```json\n{"name":"read_file","arguments":{"path":"c.ts"}}\n```'
+    const jsonOut = parseToolCalls(jsonReply)
+    expect(jsonOut.calls).toHaveLength(1)
+    expect(jsonOut.calls[0].name).toBe('read_file')
+    expect(jsonOut.text).toBe('??')
+  })
+
   it('gives each call a distinct id', () => {
     const body = (n: string) => '```doubao-tool\n' + JSON.stringify({ name: n, arguments: {} }) + '\n```'
     const out = parseToolCalls(`${body('a')}\n${body('b')}`)

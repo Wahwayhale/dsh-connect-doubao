@@ -507,17 +507,52 @@ export function buildImagePrompt(
   return fallback
 }
 
-function buildPrompt(messages: Array<{ role?: string; content?: unknown; name?: string }> | undefined): string {
+function buildPrompt(
+  messages: Array<{
+    role?: string
+    content?: unknown
+    name?: string
+    tool_calls?: TokenizableToolCall[]
+  }> | undefined,
+): string {
   if (!Array.isArray(messages) || messages.length === 0) return ''
   const turns: string[] = []
   for (const message of messages) {
     const text = flattenContent(message.content)
-    if (!text) continue
     const role = message.role ?? 'user'
     if (role === 'tool') {
-      turns.push(toolResultAsText(message.name, text))
+      if (text) turns.push(toolResultAsText(message.name, text))
       continue
     }
+    // Replay an assistant turn that carried tool calls back into the prompt as
+    // the same ```doubao-tool fence the model is asked to emit, so a continued
+    // conversation keeps the call/result pairing the emulation depends on. An
+    // assistant message can have empty content but non-empty tool_calls, so this
+    // branch must run BEFORE the empty-text skip below.
+    if (role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      const fencedCalls = message.tool_calls
+        .map((tc) => {
+          const fnName = tc.function?.name ?? ''
+          const rawArgs = tc.function?.arguments
+          // arguments is typed `unknown` (OpenAI wire = JSON string, but a caller
+          // may hand us an already-parsed object). Only parse when it is a string.
+          let parsedArgs: unknown = rawArgs ?? {}
+          if (typeof rawArgs === 'string') {
+            try {
+              parsedArgs = JSON.parse(rawArgs)
+            } catch {
+              /* keep the raw string when it is not valid JSON */
+            }
+          }
+          return `\`\`\`doubao-tool\n${JSON.stringify({ name: fnName, arguments: parsedArgs })}\n\`\`\``
+        })
+        .join('\n\n')
+      const trimmed = text.trim()
+      const combined = trimmed ? `${trimmed}\n\n${fencedCalls}` : fencedCalls
+      turns.push(`[assistant] ${combined}`)
+      continue
+    }
+    if (!text) continue
     turns.push(role === 'user' ? text : `[${role}] ${text}`)
   }
   return turns.join('\n\n')
@@ -631,8 +666,8 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
   const sessions = new ConversationStore()
   const statsTracker = options.stats ?? new DoubaoStatsTracker()
 
-  /** Opt-in prompt-level tool calling; off unless the setting says otherwise. */
-  const emulationOn = options.toolEmulation ?? (() => false)
+  /** Prompt-level tool calling; ON by default so Doubao can drive local tools. */
+  const emulationOn = options.toolEmulation ?? (() => true)
 
   // Per-process shared secret. In memory only; pi-ai sends it as
   // `Authorization: Bearer`, the shim validates it, and it is never

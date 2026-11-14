@@ -48,6 +48,8 @@ const FENCE_RE = new RegExp(
   'm',
 )
 
+const JSON_FENCE_RE = /(?:^|\r?\n)\s*```\s*json\s*\r?\n([\s\S]*?)\r?\n\s*```\s*/gi
+
 /**
  * Render the tool contract appended to the prompt.
  *
@@ -127,24 +129,58 @@ export function parseToolCalls(
     if (match === null) break
     const raw = (match[1] ?? '').trim()
     rest = (rest.slice(0, match.index) + rest.slice(match.index + match[0].length)).trim()
-    const parsed = parseCallJson(raw)
-    if (parsed !== undefined) {
+    for (const parsed of parseCallJsonList(raw)) {
       calls.push({ id: makeId(calls.length), ...parsed })
     }
+  }
+  // Fallback: if the model used a ```json fence with strict {"name","arguments"} shape
+  if (calls.length === 0 && rest.includes('```')) {
+    rest = rest.replace(JSON_FENCE_RE, (fullMatch, body: string) => {
+      const parsedList = parseCallJsonList((body ?? '').trim(), true)
+      if (parsedList.length === 0) return fullMatch
+      for (const parsed of parsedList) {
+        calls.push({ id: makeId(calls.length), ...parsed })
+      }
+      return ''
+    }).trim()
   }
   return { calls: dedupeCalls(calls), text: rest }
 }
 
-/** Parse one fence body into a call, or undefined when it is not usable. */
-function parseCallJson(raw: string): { name: string; arguments: string } | undefined {
+/** Parse one fence body (single object or array of objects) into calls. */
+function parseCallJsonList(
+  raw: string,
+  strictKeys = false,
+): Array<{ name: string; arguments: string }> {
   let value: unknown
   try {
     value = JSON.parse(raw)
   } catch {
+    return []
+  }
+  const items = Array.isArray(value) ? value : [value]
+  const out: Array<{ name: string; arguments: string }> = []
+  for (const item of items) {
+    const single = parseSingleCallObject(item, strictKeys)
+    if (single !== undefined) out.push(single)
+  }
+  return out
+}
+
+/** Parse one call object into `{ name, arguments }`, or undefined when not usable. */
+function parseSingleCallObject(
+  value: unknown,
+  strictKeys = false,
+): { name: string; arguments: string } | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const outer = value as Record<string, unknown>
+  const record =
+    outer.function !== null && typeof outer.function === 'object' && !Array.isArray(outer.function)
+      ? (outer.function as Record<string, unknown>)
+      : outer
+  if (strictKeys && !('name' in record && ('arguments' in record || 'params' in record))) {
     return undefined
   }
-  if (value === null || typeof value !== 'object') return undefined
-  const record = value as Record<string, unknown>
   const name = record.name ?? record.tool ?? record.function
   if (typeof name !== 'string' || name === '') return undefined
   const args = record.arguments ?? record.params ?? record.input ?? {}
