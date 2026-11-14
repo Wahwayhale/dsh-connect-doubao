@@ -47,7 +47,7 @@ import {
   loadDoubaoCredentials,
   type DoubaoCredentials,
 } from './doubao-auth.ts'
-import { chat, DoubaoUpstreamError, classifyDoubaoFailure, isInvalidParamFailure, isRetryableFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
+import { chat, stopGeneration, DoubaoUpstreamError, classifyDoubaoFailure, isInvalidParamFailure, isRetryableFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
 import { fetchQuota, findWindow, millisUntilReset } from './doubao-quota.ts'
 import {
   DOUBAO_IMAGE_MODEL_ID,
@@ -849,6 +849,36 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     }
 
     let roleSent = false
+    // Turn identity published by SSE_ACK via callbacks.onTurnIds. The local
+    // abort only closes our socket — without break_stream_msg Doubao keeps
+    // thinking and burning credits for a reply nobody will read.
+    const turnIds: { conversationId?: string; questionId?: string } = {}
+    let stoppedQuestionId: string | undefined
+    const stopActiveTurn = (reason: string): void => {
+      const { conversationId, questionId } = turnIds
+      // Without both ids there is nothing the stop request can address.
+      if (conversationId === undefined || questionId === undefined) return
+      // At most one stop per turn (a fallback re-issue carries its own question id).
+      if (stoppedQuestionId === questionId) return
+      stoppedQuestionId = questionId
+      let credentials: DoubaoCredentials
+      try {
+        credentials = resolveCredentials()
+      } catch {
+        return
+      }
+      if (!credentials.ok) return
+      // Fire-and-forget: a failed stop must never disturb the response path.
+      void stopGeneration(credentials, { conversationId, questionId }).catch((error: unknown) => {
+        if (process.env.DSH_DOUBAO_DEBUG_PLAN === '1') {
+          process.stderr.write(`[plan] stop-generation(${reason}) failed: ${String(error)}\n`)
+        }
+      })
+    }
+    // Fires only on abnormal end (client hang-up, idle watchdog, upstream
+    // failure): normal completion never aborts this signal.
+    lifecycle.signal.addEventListener('abort', () => stopActiveTurn('abandoned'), { once: true })
+
     const callbacks = {
       // Private reasoning is forwarded as `reasoning_content`, the field
       // OpenAI-compatible clients read for it. It is NOT mixed into
@@ -875,6 +905,10 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         }
         sendChunk({ choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })
       },
+      onTurnIds: (ids: { conversationId?: string | undefined; questionId?: string | undefined }) => {
+        if (ids.conversationId !== undefined) turnIds.conversationId = ids.conversationId
+        if (ids.questionId !== undefined) turnIds.questionId = ids.questionId
+      },
     }
     let result
     try {
@@ -888,6 +922,10 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         // re-upload, not a lost turn. The accounting flips with it so stats
         // credit this turn to the fresh thread.
         forget()
+        // The rejected thread may still be generating server-side (the exact
+        // symptom: the web session keeps thinking and burning credits after
+        // 710020202) — stop it before re-issuing, while its ids are still here.
+        stopActiveTurn('fallback-reissue')
         accounting.isContinuationTurn = false
         accounting.cachedPrefixMessages = 0
         if (process.env.DSH_DOUBAO_DEBUG_PLAN === '1') {
