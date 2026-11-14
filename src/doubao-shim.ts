@@ -47,7 +47,7 @@ import {
   loadDoubaoCredentials,
   type DoubaoCredentials,
 } from './doubao-auth.ts'
-import { chat, DoubaoUpstreamError, classifyDoubaoFailure, isRetryableFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
+import { chat, stopGeneration, DoubaoUpstreamError, classifyDoubaoFailure, isInvalidParamFailure, isRetryableFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
 import { fetchQuota, findWindow, millisUntilReset } from './doubao-quota.ts'
 import {
   DOUBAO_IMAGE_MODEL_ID,
@@ -616,7 +616,7 @@ function revokeSession(): void {
 export function createRequestLifecycle(
   res: ServerResponse,
   options: { idleMs?: number } = {},
-): { signal: AbortSignal; onActivity: () => void; clientGone: () => boolean; release: () => void } {
+): { signal: AbortSignal; onActivity: () => void; clientGone: () => boolean; release: () => void; abortUpstream: (reason?: Error) => void } {
   const idleMs = options.idleMs ?? DOUBAO_STREAM_IDLE_TIMEOUT_MS
   const abort = new AbortController()
   let gone = false
@@ -650,7 +650,17 @@ export function createRequestLifecycle(
   res.once('finish', release)
   res.once('close', release)
   onActivity()
-  return { signal: abort.signal, onActivity, clientGone: () => gone, release }
+  /**
+   * Hard-abandon the upstream fetch after a terminal failure.
+   *
+   * `reader.cancel()` only lets go of the body; aborting the signal closes the
+   * socket itself, which is the same reach `stop` has — without it a failed
+   * turn leaves Doubao generating into a connection nobody reads.
+   */
+  const abortUpstream = (reason?: Error): void => {
+    abort.abort(reason ?? new Error('豆包上游请求已中止。'))
+  }
+  return { signal: abort.signal, onActivity, clientGone: () => gone, release, abortUpstream }
 }
 
 export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
@@ -665,6 +675,26 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
    */
   const sessions = new ConversationStore()
   const statsTracker = options.stats ?? new DoubaoStatsTracker()
+  /**
+   * Circuit valve: consecutive upstream failures per conversation.
+   *
+   * While a conversation is in cooldown NO request leaves the process — no
+   * server-side turn can start, so a retry loop can never re-trigger
+   * generation and burn quota. Cleared by the next successful turn.
+   */
+  const recentFailures = new Map<string, { count: number; until: number }>()
+  const CIRCUIT_FAILURES = 3
+  const CIRCUIT_COOLDOWN_MS = 60_000
+  const bumpFailure = (key: string): void => {
+    const prev = recentFailures.get(key)
+    const count = (prev?.count ?? 0) + 1
+    const until = count >= CIRCUIT_FAILURES ? Date.now() + CIRCUIT_COOLDOWN_MS : (prev?.until ?? 0)
+    if (recentFailures.size >= 256 && !recentFailures.has(key)) {
+      const oldest = recentFailures.keys().next().value
+      if (oldest !== undefined) recentFailures.delete(oldest)
+    }
+    recentFailures.set(key, { count, until })
+  }
 
   /** Prompt-level tool calling; ON by default so Doubao can drive local tools. */
   const emulationOn = options.toolEmulation ?? (() => true)
@@ -778,6 +808,8 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       onActivity: () => void
       /** True when the request's client disconnected before we finished. */
       clientGone: () => boolean
+      /** Hard-abandon the upstream fetch after a terminal failure. */
+      abortUpstream: (reason?: Error) => void
     },
     accounting: {
       modelId: string
@@ -817,38 +849,94 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
     }
 
     let roleSent = false
-    try {
-      const result = await chat(prompt, {
-        ...upstreamOptions,
-        signal: lifecycle.signal,
-        callbacks: {
-          // Private reasoning is forwarded as `reasoning_content`, the field
-          // OpenAI-compatible clients read for it. It is NOT mixed into
-          // `content`: a client that does not understand it simply ignores it,
-          // which is the right degradation.
-          onThinking: (delta) => {
-            lifecycle.onActivity()
-            if (delta !== '') markFirstToken()
-            if (!roleSent) {
-              sendChunk({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
-              roleSent = true
-            }
-            sendChunk({ choices: [{ index: 0, delta: { reasoning_content: delta }, finish_reason: null }] })
-          },
-          onText: (delta) => {
-            lifecycle.onActivity()
-            // In emulated mode the fence is still forming, so nothing can be
-            // forwarded live; the whole turn is parsed after it completes.
-            if (emulate) return
-            if (delta !== '') markFirstToken()
-            if (!roleSent) {
-              sendChunk({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
-              roleSent = true
-            }
-            sendChunk({ choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })
-          },
-        },
+    // Turn identity published by SSE_ACK via callbacks.onTurnIds. The local
+    // abort only closes our socket — without break_stream_msg Doubao keeps
+    // thinking and burning credits for a reply nobody will read.
+    const turnIds: { conversationId?: string; questionId?: string } = {}
+    let stoppedQuestionId: string | undefined
+    const stopActiveTurn = (reason: string): void => {
+      const { conversationId, questionId } = turnIds
+      // Without both ids there is nothing the stop request can address.
+      if (conversationId === undefined || questionId === undefined) return
+      // At most one stop per turn (a fallback re-issue carries its own question id).
+      if (stoppedQuestionId === questionId) return
+      stoppedQuestionId = questionId
+      let credentials: DoubaoCredentials
+      try {
+        credentials = resolveCredentials()
+      } catch {
+        return
+      }
+      if (!credentials.ok) return
+      // Fire-and-forget: a failed stop must never disturb the response path.
+      void stopGeneration(credentials, { conversationId, questionId }).catch((error: unknown) => {
+        if (process.env.DSH_DOUBAO_DEBUG_PLAN === '1') {
+          process.stderr.write(`[plan] stop-generation(${reason}) failed: ${String(error)}\n`)
+        }
       })
+    }
+    // Fires only on abnormal end (client hang-up, idle watchdog, upstream
+    // failure): normal completion never aborts this signal.
+    lifecycle.signal.addEventListener('abort', () => stopActiveTurn('abandoned'), { once: true })
+
+    const callbacks = {
+      // Private reasoning is forwarded as `reasoning_content`, the field
+      // OpenAI-compatible clients read for it. It is NOT mixed into
+      // `content`: a client that does not understand it simply ignores it,
+      // which is the right degradation.
+      onThinking: (delta: string) => {
+        lifecycle.onActivity()
+        if (delta !== '') markFirstToken()
+        if (!roleSent) {
+          sendChunk({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
+          roleSent = true
+        }
+        sendChunk({ choices: [{ index: 0, delta: { reasoning_content: delta }, finish_reason: null }] })
+      },
+      onText: (delta: string) => {
+        lifecycle.onActivity()
+        // In emulated mode the fence is still forming, so nothing can be
+        // forwarded live; the whole turn is parsed after it completes.
+        if (emulate) return
+        if (delta !== '') markFirstToken()
+        if (!roleSent) {
+          sendChunk({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })
+          roleSent = true
+        }
+        sendChunk({ choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })
+      },
+      onTurnIds: (ids: { conversationId?: string | undefined; questionId?: string | undefined }) => {
+        if (ids.conversationId !== undefined) turnIds.conversationId = ids.conversationId
+        if (ids.questionId !== undefined) turnIds.questionId = ids.questionId
+      },
+    }
+    let result
+    try {
+      try {
+        result = await chat(prompt, { ...upstreamOptions, signal: lifecycle.signal, callbacks })
+      } catch (error) {
+        if (!accounting.isContinuationTurn || !isInvalidParamFailure(error) || firstTokenAt !== null) throw error
+        // The remembered thread was rejected as an invalid parameter (710020202):
+        // nothing was stored server-side, so the same turn is re-issued as a
+        // fresh conversation instead of failing — a stale id must cost one
+        // re-upload, not a lost turn. The accounting flips with it so stats
+        // credit this turn to the fresh thread.
+        forget()
+        // The rejected thread may still be generating server-side (the exact
+        // symptom: the web session keeps thinking and burning credits after
+        // 710020202) — stop it before re-issuing, while its ids are still here.
+        stopActiveTurn('fallback-reissue')
+        accounting.isContinuationTurn = false
+        accounting.cachedPrefixMessages = 0
+        if (process.env.DSH_DOUBAO_DEBUG_PLAN === '1') {
+          process.stderr.write('[plan] continuation rejected (710020202); re-issuing as fresh conversation\\n')
+        }
+        result = await chat(buildPrompt(parsed.messages ?? []) + accounting.emulatedContractText, {
+          ...requestOptions(parsed),
+          signal: lifecycle.signal,
+          callbacks,
+        })
+      }
       // Only a completed turn teaches us the thread id; a failed one leaves the
       // previous mapping alone so the next attempt can still continue it.
       remember(result.conversationId)
@@ -940,6 +1028,11 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         model: accounting.modelId,
         durationMs: Math.max(0, Date.now() - chatStartedAt),
       })
+      // Terminal for this attempt: tear the upstream socket down so Doubao is
+      // not left generating into a stream nobody will read (quota keeps burning
+      // until the server-side turn ends on its own).
+      lifecycle.abortUpstream(error instanceof Error ? error : undefined)
+      if (error instanceof DoubaoUpstreamError && accounting.sessionKey !== undefined) bumpFailure(accounting.sessionKey)
       const kind: DoubaoErrorKind = error instanceof DoubaoUpstreamError
         ? classifyDoubaoFailure(error)
         : 'network'
@@ -949,6 +1042,12 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       if (kind === 'session_dead') {
         forget()
         revokeSession()
+      } else if (accounting.isContinuationTurn && isInvalidParamFailure(error)) {
+        // 710020202 on a continuation means the remembered conversation id was
+        // rejected as an invalid parameter (the thread expired upstream).
+        // Without this drop, every later turn resends the same rejected id and
+        // fails identically until the store's TTL lapses.
+        forget()
       }
       // The client hung up (Stop button, window closed, Harness shutting down).
       // Nothing to report and nobody listening — writing here only produces
@@ -1069,6 +1168,13 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       const imageModel = isImageModel(parsed.model)
       const sessionKey = sessionKeyOf(parsed.messages)
       const known = sessions.get(sessionKey)
+      // ---- circuit valve ------------------------------------------------
+      const cooldown = sessionKey !== undefined ? recentFailures.get(sessionKey) : undefined
+      if (cooldown !== undefined && cooldown.count >= CIRCUIT_FAILURES && Date.now() < cooldown.until) {
+        const waitSec = Math.ceil((cooldown.until - Date.now()) / 1000)
+        writeOpenAIError(res, 429, 'RATE_LIMIT', `豆包已连续失败 ${cooldown.count} 次，暂停发送 ${waitSec} 秒以避免继续消耗积分；稍后重试即可。`)
+        return
+      }
       // Image turns run standalone under `imageGen`; reusing a prior text or task
       // conversationId carries old mode/refusal context and causes text replies.
       const continuing = !imageModel && isContinuation(parsed.messages, known)
@@ -1084,7 +1190,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       // A transcript that grew by only an assistant message leaves nothing to
       // send; fall back to the full prompt rather than 400-ing the request.
       const useDelta = delta.length > 0
-      const isContinuationTurn = continuing && useDelta
+      let isContinuationTurn = continuing && useDelta
       const outgoing = useDelta ? delta : (parsed.messages ?? [])
       // IMAGEGEN_SLIM_PROMPT: 生图模型只该看到用户那句描述。
       // 完整上下文（系统提示、工具清单、MCP、技能、历史）会让它先分析"该用哪个工具"，
@@ -1129,17 +1235,18 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       //
       // Both chat paths share this: an abort reaches the upstream socket, and
       // a stream that stops sending is given up on instead of held forever.
-      const { signal, onActivity, clientGone } = createRequestLifecycle(res)
+      const { signal, onActivity, clientGone, abortUpstream } = createRequestLifecycle(res)
 
       const upstreamOptions = {
         ...requestOptions(parsed),
         // Cancellation has to reach the socket, not just our side: without it
         // the upstream turn keeps running to completion after everyone left.
         signal,
-        ...isContinuationTurn ? { conversationId: known.conversationId, continueConversation: true } : {},
+        ...isContinuationTurn && known !== undefined ? { conversationId: known.conversationId, continueConversation: true } : {},
       }
       /** Record the thread id the server handed back, for the next turn. */
       const remember = (conversationId: string | undefined): void => {
+        if (sessionKey !== undefined) recentFailures.delete(sessionKey)
         if (!imageModel && conversationId !== undefined) {
           sessions.remember(sessionKey, conversationId, (parsed.messages?.length ?? 0) + 1)
         }
@@ -1151,7 +1258,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
           `[plan] continuation=${isContinuationTurn} ` +
           `messages=${parsed.messages?.length ?? 0} ` +
           `sending=${outgoing.length} chars=${prompt.length} ` +
-          `conversation=${isContinuationTurn ? known.conversationId : '(new)'}\n`,
+          `conversation=${isContinuationTurn && known !== undefined ? known.conversationId : '(new)'}\n`,
         )
       }
 
@@ -1159,18 +1266,38 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       // catalog, so an unknown id degrades to the default instead of being
       // echoed back as if it had been honoured.
       const sent = findDoubaoModel(parsed.model)
-      const cachedPrefixMessages = isContinuationTurn && known !== undefined ? known.messageCount : 0
+      let cachedPrefixMessages = isContinuationTurn && known !== undefined ? known.messageCount : 0
 
       if (parsed.stream === false) {
         const chatStartedAt = Date.now()
         let result
         try {
-          result = await chat(prompt, upstreamOptions)
+          try {
+            result = await chat(prompt, upstreamOptions)
+          } catch (error) {
+            if (!isContinuationTurn || !isInvalidParamFailure(error)) throw error
+            // Same fallback as the streaming path: a continuation rejected with
+            // 710020202 stored nothing server-side, so re-issue this turn as a
+            // fresh conversation instead of failing it.
+            sessions.forget(sessionKey)
+            isContinuationTurn = false
+            cachedPrefixMessages = 0
+            if (process.env.DSH_DOUBAO_DEBUG_PLAN === '1') {
+              process.stderr.write('[plan] continuation rejected (710020202); re-issuing as fresh conversation\\n')
+            }
+            result = await chat(buildPrompt(parsed.messages ?? []) + emulatedContractText, {
+              ...requestOptions(parsed),
+              signal,
+            })
+          }
         } catch (error) {
           statsTracker.recordFailure({
             model: sent.id,
             durationMs: Math.max(0, Date.now() - chatStartedAt),
           })
+          abortUpstream(error instanceof Error ? error : undefined)
+          if (error instanceof DoubaoUpstreamError && sessionKey !== undefined) bumpFailure(sessionKey)
+          if (isContinuationTurn && isInvalidParamFailure(error)) sessions.forget(sessionKey)
           throw error
         }
         const completedAt = Date.now()
@@ -1248,7 +1375,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         res, prompt, parsed, upstreamOptions, remember,
         () => sessions.forget(sessionKey),
         emulate,
-        { signal, onActivity, clientGone },
+        { signal, onActivity, clientGone, abortUpstream },
         {
           modelId: sent.id,
           sessionKey,

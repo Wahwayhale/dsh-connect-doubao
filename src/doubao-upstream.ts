@@ -55,6 +55,9 @@ export const TOOL_LOCAL_COMPLETE_ENDPOINT =
   'https://www.doubao.com/alice/office/tool_local/msg/complete'
 export const ACTION_BAR_BRIEF_LIST_ENDPOINT =
   'https://www.doubao.com/alice/slot/action_bar_v3/brief_list'
+export const BREAK_STREAM_ENDPOINT = 'https://www.doubao.com/im/message/break_stream_msg'
+/** Own timeout for the fire-and-forget stop; never inherits the turn's signal. */
+const STOP_GENERATION_TIMEOUT_MS = 5_000
 
 /**
  * Client version strings. These are the desktop app build this was last
@@ -1046,6 +1049,8 @@ export interface StreamCallbacks {
   /** Private reasoning deltas (deep-think turns); never part of the answer. */
   onThinking?: (delta: string) => void
   onEvent?: (event: string) => void
+  /** Turn identity from `SSE_ACK`; feeds the server-side stop request. */
+  onTurnIds?: (ids: { conversationId?: string | undefined; questionId?: string | undefined }) => void
 }
 
 /**
@@ -1278,6 +1283,9 @@ export async function streamChat(
     // reasoning delta and `reasoning_content` was always empty.
     onThinking: (delta) => options.callbacks?.onThinking?.(delta),
     onEvent: (event) => options.callbacks?.onEvent?.(event),
+    // Forwarded like onThinking: without it the ids die in this wrapper and
+    // the shim can never address a stop at the active turn.
+    onTurnIds: (ids) => options.callbacks?.onTurnIds?.(ids),
   }
   const wanted = taskModeEnabled(options)
   const call = (taskMode: boolean): Promise<DoubaoChatResult> =>
@@ -1338,6 +1346,61 @@ export function applyRenewals(header: string): string {
   return [...pairs.entries()].map(([name, value]) => `${name}=${value}`).join('; ')
 }
 
+/**
+ * Ask Doubao to stop generating the current turn server-side — the same
+ * request the web client's stop button sends (`cmd 2240`).
+ *
+ * Closing our socket does NOT stop the model: it keeps thinking and burning
+ * credits until the server-side turn ends on its own. `reply_msg_id` must be
+ * the USER question message id captured from this turn's `SSE_ACK`
+ * (`query_list[0].question_id`); `message_id` stays empty per the wire
+ * format. Fire-and-forget from the caller's view — rejects so the caller can
+ * log, never throws into a response path it has already left.
+ */
+export async function stopGeneration(
+  credentials: DoubaoCredentials,
+  ids: { conversationId: string; questionId: string },
+): Promise<void> {
+  const msToken = credentials.pairs.get('msToken')
+  const url = buildQueryUrl(BREAK_STREAM_ENDPOINT, msToken)
+  const headers = buildHeaders(credentials, {
+    'content-type': 'application/json; encoding=utf-8',
+  })
+  delete headers['last-event-id']
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      cmd: 2240,
+      uplink_body: {
+        break_stream_msg_uplink_body: {
+          reply_msg_id: ids.questionId,
+          message_id: '',
+          conversation_id: ids.conversationId,
+          conversation_type: 3,
+          break_reason: 7,
+        },
+      },
+      sequence_id: randomUUID(),
+      channel: 2,
+      version: '1',
+    }),
+    signal: AbortSignal.timeout(STOP_GENERATION_TIMEOUT_MS),
+  })
+  absorbSetCookies(res.headers)
+  const text = await res.text()
+  if (!res.ok) throw new Error(`Doubao break_stream_msg failed with HTTP ${res.status}.`)
+  let parsed: { status_code?: number }
+  try {
+    parsed = JSON.parse(text) as { status_code?: number }
+  } catch {
+    throw new Error('Doubao break_stream_msg returned a non-JSON response.')
+  }
+  if (parsed.status_code !== 0) {
+    throw new Error(`Doubao break_stream_msg refused to stop the turn (status_code=${String(parsed.status_code)}).`)
+  }
+}
+
 async function consumeStream(
   response: Response,
   callbacks?: StreamCallbacks,
@@ -1358,6 +1421,12 @@ async function consumeStream(
   const blockState = createBlockCollectState()
   let conversationId: string | undefined
   let messageId: string | undefined
+  /**
+   * USER question id from SSE_ACK, kept apart from `messageId` (later frames
+   * overwrite that with the assistant reply id): break_stream_msg addresses
+   * the turn by the question id, never by the reply.
+   */
+  let questionId: string | undefined
   let model: string | undefined
   let thinking = false
   let reasoningText: string | undefined
@@ -1517,7 +1586,12 @@ function collectTelemetry(payload: unknown, target: DoubaoUpstreamTelemetry): vo
     if (name === 'SSE_ACK') {
       const ack = payload as { query_list?: Array<{ question_id?: string }>; ack_client_meta?: { conversation_id?: string } }
       conversationId = ack.ack_client_meta?.conversation_id ?? conversationId
+      // Capture the USER question id before later frames overwrite `messageId`
+      // with the assistant reply id: the stop request addresses this turn by
+      // its question id.
+      questionId = ack.query_list?.[0]?.question_id ?? questionId
       messageId = ack.query_list?.[0]?.question_id ?? messageId
+      callbacks?.onTurnIds?.({ conversationId, questionId })
       return
     }
 
@@ -1780,6 +1854,26 @@ const THINKING_BLOCK_TYPE = 10040
  * client has nothing to register, so the agent has nowhere to run.
  */
 const CODE_TASK_RUNTIME_UNAVAILABLE = 710010702
+/**
+ * The server's business code for "common invalid param".
+ *
+ * Observed on a CONTINUATION turn whose remembered `conversation_id` the
+ * server no longer accepts (the thread expired or was deleted upstream): the id
+ * is the only parameter that differs from a fresh-conversation request, and the
+ * same request then fails identically on every retry.
+ */
+const CODE_INVALID_PARAM = 710020202
+
+/**
+ * Whether the upstream rejected the request parameters outright.
+ *
+ * Callers that were continuing a remembered conversation should drop the id
+ * after this failure — keeping it would repeat the same rejection for the rest
+ * of the session TTL instead of opening a fresh thread on the next turn.
+ */
+export function isInvalidParamFailure(error: unknown): boolean {
+  return error instanceof DoubaoUpstreamError && error.code === CODE_INVALID_PARAM
+}
 
 /**
  * Map one upstream error onto its class.
