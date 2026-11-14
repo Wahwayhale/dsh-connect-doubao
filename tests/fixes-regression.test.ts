@@ -20,6 +20,19 @@ import { createDoubaoAdapter } from '../src/doubao-adapter.ts'
 import { registerDoubaoCatalogRoute, WRITE_HEADER } from '../src/doubao-status.ts'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
+// The HTTP-level tests must not depend on a local Doubao login: chat resolves
+// credentials itself on every upstream call, so without this mock the suite
+// only passes on a machine with a sealed browser session.
+vi.mock('../src/doubao-auth.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/doubao-auth.ts')>()
+  const fake: DoubaoCredentials = {
+    ok: true,
+    header: actual.REQUIRED_COOKIE_NAMES.map((name) => `${name}=test`).join('; '),
+    pairs: new Map(actual.REQUIRED_COOKIE_NAMES.map((name) => [name, 'test'])),
+  }
+  return { ...actual, loadDoubaoCredentials: () => fake }
+})
+
 const credentials: DoubaoCredentials = {
   ok: true,
   header: REQUIRED_COOKIE_NAMES.map((name) => `${name}=test`).join('; '),
@@ -443,5 +456,102 @@ describe('model discovery and catalog completeness regressions', () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down') }))
     const models = await refreshDiscovery({ force: true })
     expect(models.length).toBeGreaterThanOrEqual(DOUBAO_MODELS.length)
+  })
+})
+
+describe('conversation continuation regressions', () => {
+  it('drops a remembered conversation id the server rejects as invalid param (710020202)', async () => {
+    const capturedBodies: Array<Record<string, any>> = []
+    const realFetch = globalThis.fetch
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.startsWith('http://127.0.0.1:')) return realFetch(input, init)
+        if (url.includes('/quota/summary/')) {
+          return new Response(
+            JSON.stringify({ data: { window_limit_section: { usage_exhausted: false } } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        if (url.includes('/chat/completion')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+          capturedBodies.push(body)
+          if (capturedBodies.length === 2) {
+            // The remembered thread is gone upstream: the continuation is
+            // rejected as an invalid parameter.
+            return sseResponse([
+              frame('STREAM_ERROR', { error_code: 710020202, error_msg: 'common invalid param' }),
+            ])
+          }
+          const conversationId = capturedBodies.length === 1 ? 'conv-stale' : 'conv-fresh'
+          return sseResponse([
+            frame('SSE_ACK', { ack_client_meta: { conversation_id: conversationId } }),
+            frame('STREAM_CHUNK', {
+              block_type: 10000,
+              block_id: 'txt-1',
+              content: { text_block: { text: '好的' } },
+            }),
+            frame('SSE_REPLY_END', {}),
+          ])
+        }
+        throw new Error(`unexpected fetch url: ${url}`)
+      }),
+    )
+
+    const shim = createDoubaoShim({ resolveCredentials: () => credentials })
+    shims.push(shim)
+    const base = await shim.baseUrl()
+    const headers = {
+      'content-type': 'application/json',
+      authorization: `Bearer ${shim.token()}`,
+    }
+
+    // Turn 1: a successful turn remembers conv-stale.
+    const res1 = await realFetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: '3', stream: false, messages: [{ role: 'user', content: '先聊两句' }] }),
+    })
+    expect(res1.status).toBe(200)
+
+    // Turn 2: a longer transcript continues the remembered thread — and the
+    // server rejects it with 710020202.
+    const res2 = await realFetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: '3',
+        stream: true,
+        messages: [
+          { role: 'user', content: '先聊两句' },
+          { role: 'assistant', content: '好的' },
+          { role: 'user', content: '继续' },
+        ],
+      }),
+    })
+    expect(res2.status).toBe(200)
+    expect(capturedBodies[1]?.client_meta?.conversation_id).toBe('conv-stale')
+
+    // Turn 3: the rejected id must have been dropped — this request opens a
+    // fresh thread instead of resending conv-stale (the pre-fix behaviour).
+    const res3 = await realFetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: '3',
+        stream: false,
+        messages: [
+          { role: 'user', content: '先聊两句' },
+          { role: 'assistant', content: '好的' },
+          { role: 'user', content: '继续' },
+          { role: 'assistant', content: '好的，然后呢' },
+          { role: 'user', content: '再继续' },
+        ],
+      }),
+    })
+    expect(res3.status).toBe(200)
+    expect(capturedBodies[2]?.option?.need_create_conversation).toBe(true)
+    expect(capturedBodies[2]?.client_meta?.conversation_id).toBe('')
   })
 })

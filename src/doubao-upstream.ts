@@ -1780,6 +1780,26 @@ const THINKING_BLOCK_TYPE = 10040
  * client has nothing to register, so the agent has nowhere to run.
  */
 const CODE_TASK_RUNTIME_UNAVAILABLE = 710010702
+/**
+ * The server's business code for "common invalid param".
+ *
+ * Observed on a CONTINUATION turn whose remembered `conversation_id` the
+ * server no longer accepts (the thread expired or was deleted upstream): the id
+ * is the only parameter that differs from a fresh-conversation request, and the
+ * same request then fails identically on every retry.
+ */
+const CODE_INVALID_PARAM = 710020202
+
+/**
+ * Whether the upstream rejected the request parameters outright.
+ *
+ * Callers that were continuing a remembered conversation should drop the id
+ * after this failure — keeping it would repeat the same rejection for the rest
+ * of the session TTL instead of opening a fresh thread on the next turn.
+ */
+export function isInvalidParamFailure(error: unknown): boolean {
+  return error instanceof DoubaoUpstreamError && error.code === CODE_INVALID_PARAM
+}
 
 /**
  * Map one upstream error onto its class.

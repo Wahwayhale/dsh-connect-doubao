@@ -47,7 +47,7 @@ import {
   loadDoubaoCredentials,
   type DoubaoCredentials,
 } from './doubao-auth.ts'
-import { chat, DoubaoUpstreamError, classifyDoubaoFailure, isRetryableFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
+import { chat, DoubaoUpstreamError, classifyDoubaoFailure, isInvalidParamFailure, isRetryableFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
 import { fetchQuota, findWindow, millisUntilReset } from './doubao-quota.ts'
 import {
   DOUBAO_IMAGE_MODEL_ID,
@@ -949,6 +949,12 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       if (kind === 'session_dead') {
         forget()
         revokeSession()
+      } else if (accounting.isContinuationTurn && isInvalidParamFailure(error)) {
+        // 710020202 on a continuation means the remembered conversation id was
+        // rejected as an invalid parameter (the thread expired upstream).
+        // Without this drop, every later turn resends the same rejected id and
+        // fails identically until the store's TTL lapses.
+        forget()
       }
       // The client hung up (Stop button, window closed, Harness shutting down).
       // Nothing to report and nobody listening — writing here only produces
@@ -1171,6 +1177,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
             model: sent.id,
             durationMs: Math.max(0, Date.now() - chatStartedAt),
           })
+          if (isContinuationTurn && isInvalidParamFailure(error)) sessions.forget(sessionKey)
           throw error
         }
         const completedAt = Date.now()
