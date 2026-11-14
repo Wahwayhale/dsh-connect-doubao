@@ -71,10 +71,10 @@ export function profileDirOf(config: unknown): string | undefined {
   return typeof value === 'string' && value.trim() !== '' ? value : undefined
 }
 
-/** Read the switch out of an arbitrary config snapshot; default false. */
+/** Read the switch out of an arbitrary config snapshot; default true. */
 export function toolEmulationOf(config: unknown): boolean {
   const value = (config as { toolEmulation?: unknown } | undefined)?.toolEmulation
-  return value === true
+  return value !== false
 }
 
 /** Whether the user has ever saved a selection (i.e. the field is not the default). */
@@ -123,8 +123,8 @@ function asVolatile<T>(schema: T): T {
 export const Config: z<DoubaoSettings> = z.object({
   enabledModelIds: asVolatile(z.array(z.string()).default([]))
     .description('Catalog ids enabled in the DSH model picker. Doubao routes upstream by content, so this selects which entries are offered, never which model answers. Empty means "not yet configured" and serves the whole catalog.'),
-  toolEmulation: asVolatile(z.boolean().default(false))
-    .description('实验性：豆包没有函数调用通道（tools 字段会被静默忽略），此项改用提示词模拟工具调用，让豆包能驱动 Harness 的本地工具。约 11.5 秒/轮，且可能随上游模型变化而退化，故默认关闭。'),
+  toolEmulation: asVolatile(z.boolean().default(true))
+    .description('使用提示词模拟工具调用（OpenAI tools → doubao-tool 围栏 → tool_calls），让豆包及客户端接入的第三方模型能驱动 Harness 的本地工具。默认开启。'),
   profileDir: asVolatile(z.string().default(''))
     .description('豆包客户端 User Data 目录。留空表示自动探测（%LOCALAPPDATA%、%APPDATA%、运行中客户端的 --user-data-dir、全盘扫描）。只有当豆包把数据放在自动探测找不到的位置时才需要填。'),
 })

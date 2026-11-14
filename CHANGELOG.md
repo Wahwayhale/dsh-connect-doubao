@@ -4,6 +4,31 @@
 
 ---
 
+## 0.7.1 — 2026-11-14
+
+> 这一版把「提示词模拟工具调用」从实验性默认关闭改为**默认开启**，并加固了解析与多轮上下文，让豆包及客户端接入的第三方模型（DeepSeek / Kimi / GLM 等）开箱即能驱动 DSH 的本地工具。
+
+### 变更
+
+- **工具模拟默认开启**（`doubao-config` / `doubao-shim`）：`toolEmulation` 默认值由 `false` 改为 `true`，`toolEmulationOf` 改为「除非显式设为 `false` 否则开启」，shim 的 `emulationOn` 回退同步改为 `true`。新装用户无需手动打开开关，即可让豆包通过 OpenAI `tools` → `doubao-tool` 围栏 → `tool_calls` 的转译调用本地工具。设置页文案同步更新，去掉「实验性 / 默认关闭」措辞。
+
+### 修复与加固
+
+- **工具调用解析支持更多形态**（`doubao-tools`）：
+  - 单个围栏内的 **JSON 数组**（一次并行多个工具调用）现在会被全部解析，而不再只取第一个。
+  - 兼容 **OpenAI 嵌套结构** `{"type":"function","function":{"name":...,"arguments":...}}`。
+  - 新增 ```json 围栏回退：当模型改用 ```json 输出严格包含 `name` 与 `arguments`/`params` 的对象（或数组）时也能识别并转译为标准 `tool_calls`；非工具形状的普通 JSON 代码块保持原样不误吞。
+- **多轮工具调用上下文不再丢失**（`doubao-shim`）：`buildPrompt` 展开历史消息时，若 `assistant` 消息正文为空但带有 `tool_calls`，此前会被整条跳过；现在会把它还原为 ```doubao-tool 围栏拼回上下文，与随后的 `[tool result]` 正确配对，避免续接轮里模型「忘记」自己刚发起过哪个调用。参数为已解析对象或非法 JSON 字符串时均做了安全兜底。
+
+### 测试与校验
+
+- 新增解析回归：JSON 数组多调用、OpenAI `function` 包装、```json 围栏回退各一例。
+- 更新默认值断言：`toolEmulation` 默认应为 `true`。
+- 新增 `vitest.config.ts`，把测试范围限定在 `tests/`，避免误扫本机克隆的市场仓库（`awesome-dsh-plugin/`）里不相干的脚本。
+- `npm run check`（typecheck + build + test + locale）全绿。
+
+---
+
 ## 0.7.0 — 2026-11-13
 
 > 这一版补齐了在线模型发现链路，把思考链（CoT）、对话框模型倍率展示、以及 DSH 原生 Token 用量与会话统计全部接了进来。
