@@ -22,15 +22,16 @@ neither required nor read.**
 
 Pressing 「重新登录」 in the card opens a dedicated Chromium window on Doubao's login
 page. Once you scan the code (or finish the phone-verification flow) the plugin
-pulls the session cookies over CDP and seals them with Windows DPAPI into
-`%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`. Only that one moment needs a
+pulls the session cookies over CDP and seals them locally — Windows DPAPI into
+`%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`, or the macOS login keychain.
+Only that one moment needs a
 human; everything after it is plain HTTP.
 
 | Requirement | Notes |
 | --- | --- |
 | **One QR sign-in** | Otherwise the card reports "not signed in" and the provider is unavailable |
-| **Windows** | Sealing relies on Windows DPAPI. **macOS / Linux are not supported** |
-| Chrome or Edge installed | That window IS the sign-in surface; the default install path is enough |
+| **Windows / macOS** | Sealing: Windows DPAPI, macOS login keychain (Linux unsupported) |
+| Chrome or Edge installed | That window IS the sign-in surface; default path on Windows, /Applications or ~/Applications on macOS (Chromium / Canary also accepted) |
 | Some subscription quota | A free account connects too, but the quota is small |
 
 With no session the plugin fails loudly ("还没有浏览器登录态…") rather than silently.
@@ -75,7 +76,7 @@ works everywhere):
 
 | Item | Value |
 | --- | --- |
-| OS | Windows x64 |
+| OS | Windows x64 / macOS |
 | Doubao desktop app | 2.31.4 (signed in) |
 | DeepSeek Harness | 0.2.0-rc.2 (desktop) |
 | Node.js | 24.18.1 (inside the host) |
@@ -175,9 +176,11 @@ DSH (pi-ai provider)
 ```
 
 1. **Credentials** come only from the browser sign-in: one CDP `Storage.getCookies`
-   call, sealed immediately with Windows DPAPI into
-   `~/.dsh/doubao-credentials-browser.dpapi`. The values reach the outbound request
-   header and nothing else — never logs, argv, the environment or another file.
+   call, sealed immediately into the platform store (Windows DPAPI file
+   `~/.dsh/doubao-credentials-browser.dpapi`; macOS login-keychain item
+   `dsh-connect-doubao`). The values reach the outbound request header and nothing
+   else — never logs, the environment or another file (one exception: the macOS seal
+   passes the payload through a short-lived `security` child's argv, see below).
 2. **Provider** translates pi-ai's OpenAI-shaped request into Doubao's dialect
    (`bot_id` + `reasoning_effort`).
 3. **Streaming** — upstream's three-line frames are parsed into pi-ai's event stream;
@@ -230,8 +233,8 @@ plugin marketplace and what keeps runtime types consistent.
 | Platform | Status |
 | --- | --- |
 | **Windows x64** | ✅ **verified on real hardware** |
-| macOS | ❌ unsupported (DPAPI is Windows-only) |
-| Linux | ❌ unsupported (same) |
+| **macOS** | ✅ supported (session sealed in the login keychain) |
+| Linux | ❌ unsupported (no local sealing counterpart) |
 
 **Session** — one source only (`src/doubao-auth.ts` + `src/doubao-auth-browser.ts`):
 
@@ -240,10 +243,18 @@ plugin marketplace and what keeps runtime types consistent.
 2. you scan the code, and the plugin collects every cookie with one CDP
    `Storage.getCookies` call;
 3. only the Doubao/Bytedance cookies are kept, and only if all 9 required session
-   cookies are there; the result is sealed with Windows DPAPI into
-   `%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi` (current-user scope — another
+   cookies are there; the result is sealed locally — Windows DPAPI into
+   `%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`, or the macOS login-keychain
+   item `dsh-connect-doubao` / `browser-session` (current-user scope — another
    account or machine cannot open it);
-4. every later request reads that file, cached in-process for 10 minutes.
+4. every later request reads that sealed store, cached in-process for 10 minutes.
+
+> **On macOS the session also exists a second time**: the throwaway Chrome profile
+> used for the scan (`~/.dsh/doubao-browser-profile`, created 0700, `Cookies` 0600)
+> keeps the same cookies, encrypted with Chrome Safe Storage. It is still only
+> readable by the current user, but it IS a second resting place outside the
+> keychain; delete that directory after signing in if that matters to you (the
+> cost is a fresh scan next time).
 
 **Why the client's cookie jar is no longer decrypted.** While the Doubao client runs it
 holds `Default\Network\Cookies` with an EXCLUSIVE lock — and this plugin exists for
@@ -335,7 +346,10 @@ npm run check       # all of the above
    own business — sending an invented key still returns HTTP 200, so the field is not
    validated. What 0.4.1 offers is **the whole task-mode request shape for a given
    key** (verified to answer), not a guarantee that Pro rather than Lite did the work.
-5. **Windows only** — the session is sealed with DPAPI. The Doubao app does **not**
+5. **Windows and macOS** — the session is sealed with DPAPI on Windows and the login
+   keychain on macOS (the macOS seal passes the payload through a short-lived
+   `security` child's argv — that CLI has no stdin/interactive channel — leaving a
+   millisecond-scale same-user `ps` window). The Doubao app does **not**
    have to be installed: the session comes from the browser sign-in. `User Data` is only
    read for model discovery and the task-mode workspace (see the lookup above); when it
    is missing the workspace falls back to a temp directory and the session is unaffected.

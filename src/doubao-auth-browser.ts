@@ -17,11 +17,11 @@
  *
  * HOW
  *
- * Spawn Chrome/Edge against a DEDICATED profile under `~/.dsh` and drive it over
- * the DevTools protocol. `Storage.getCookies` is browser-scoped, so one call
- * returns every cookie for every context — no target attach, no page reload.
- * The profile persists between logins, so the second run usually finds the
- * session still valid and needs no scan at all.
+ * Spawn Chrome/Edge/Chromium against a DEDICATED profile under `~/.dsh` and
+ * drive it over the DevTools protocol. `Storage.getCookies` is browser-scoped,
+ * so one call returns every cookie for every context — no target attach, no
+ * page reload. The profile persists between logins, so the second run usually
+ * finds the session still valid and needs no scan at all.
  *
  * SECURITY: the returned pairs are the user's live session. They are handed to
  * `doubao-auth.ts`, which seals them with DPAPI before anything touches disk.
@@ -45,11 +45,28 @@ export function browserProfileDir(): string {
   return join(homedir(), '.dsh', 'doubao-browser-profile')
 }
 
+/**
+ * Where a Chromium may live, per platform.
+ *
+ * One flat list with `existsSync` filtering rather than a `process.platform`
+ * switch: a path that does not exist costs nothing, and the list is then
+ * verifiable from tests on any host. Windows installs default to Program
+ * Files; macOS apps live in `/Applications` (or `~/Applications` for
+ * per-user installs).
+ */
 const CANDIDATES = [
+  // Windows
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  // macOS
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+  join(homedir(), 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'),
+  join(homedir(), 'Applications', 'Microsoft Edge.app', 'Contents', 'MacOS', 'Microsoft Edge'),
 ]
 
 /** Host page for the sign-in. `/chat` is the page that actually mints the jar. */
@@ -183,16 +200,54 @@ function pickPairs(cookies: readonly CdpCookie[]): Map<string, string> {
   return pairs
 }
 
-/** Kill a spawned browser including its renderer children. */
-function terminate(child: ChildProcess): void {
+/** How long a polite SIGTERM gets before the process is force-killed. */
+const TERMINATE_GRACE_MS = 1500
+
+/**
+ * Kill a spawned browser including its renderer children.
+ *
+ * Async because the non-Windows path has to WAIT for the exit: `browserLogin`
+ * returns right after this, and a half-dead Chrome still holds the
+ * `--user-data-dir` and port 9333, so the user's next 「重新登录」 would fail
+ * with "调试端口没起来". SIGTERM only asks; a Chrome stuck on a modal or a
+ * risk-control page ignores it, hence the SIGKILL escalation.
+ */
+async function terminate(child: ChildProcess): Promise<void> {
   if (child.pid === undefined) return
-  try {
-    // Windows: `child.kill()` leaves the renderer/gpu children behind, which
-    // keeps the user-data-dir locked and the next login fails to start.
-    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
-  } catch {
-    try { child.kill() } catch { /* gone already */ }
+  if (process.platform === 'win32') {
+    try {
+      // Windows: `child.kill()` leaves the renderer/gpu children behind, which
+      // keeps the user-data-dir locked and the next login fails to start.
+      spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+      return
+    } catch {
+      /* fall through to the plain signal */
+    }
   }
+  // macOS/Linux: Chrome handles SIGTERM as a clean quit and reaps its own
+  // renderer/gpu children with it — no tree-kill needed.
+  try { child.kill('SIGTERM') } catch { /* gone already */ }
+  if (await waitForExit(child, TERMINATE_GRACE_MS)) return
+  try { child.kill('SIGKILL') } catch { /* gone already */ }
+  await waitForExit(child, 500)
+}
+
+/** Resolve true when the child exited within `budgetMs`. */
+function waitForExit(child: ChildProcess, budgetMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    let settled = false
+    const done = (exited: boolean): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      resolve(exited)
+    }
+    const onExit = (): void => { done(true) }
+    const timer = setTimeout(() => { done(false) }, budgetMs)
+    child.once('exit', onExit)
+  })
 }
 
 /**
@@ -208,14 +263,17 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
   if (exe === undefined) {
     return {
       ok: false,
-      reason: '没找到 Chrome 或 Edge。浏览器扫码登录需要一个 Chromium 内核的浏览器。',
+      reason: '没找到 Chrome 或 Edge。浏览器扫码登录需要一个 Chromium 内核的浏览器（macOS 请装到 /Applications）。',
     }
   }
 
   const timeoutMs = options.timeoutMs ?? 300_000
   const deadline = Date.now() + timeoutMs
   const profile = browserProfileDir()
-  mkdirSync(profile, { recursive: true })
+  // 0700 rather than the umask default: the profile ends up holding a copy of
+  // the Doubao session cookies, and a multi-user Mac must not even be able to
+  // list it. Windows ignores `mode`, so this is a no-op there.
+  mkdirSync(profile, { recursive: true, mode: 0o700 })
 
   // A fixed port would collide with a real debugging session the user may have
   // open; 9333 is unusual enough to be safe and stable across retries.
@@ -270,6 +328,6 @@ export async function browserLogin(options: BrowserLoginOptions = {}): Promise<B
     }
     return { ok: false, reason: '等待登录超时。扫码完成后请重试。' }
   } finally {
-    terminate(child)
+    await terminate(child)
   }
 }

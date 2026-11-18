@@ -3,7 +3,7 @@
 > 把**豆包（Doubao）账号**接入 DeepSeek Harness：**对话模型**与
 > **「工作任务」模型**（2.1 Lite / 2.1 Pro / 自动，走会员付费额度）、**Seedream 生图**，
 > 外加一块**只读**额度看板（可用额度汇总 / 套餐积分 / 活动赠送额度，含重置与到期倒计时）。
-> 登录方式只有一种：**浏览器扫码登录一次**。仅 Windows x64 —— 会话用 Windows DPAPI 密封在本机。
+> 登录方式只有一种：**浏览器扫码登录一次**。Windows 用 DPAPI、macOS 用登录钥匙串把会话密封在本机。
 
 [![npm version](https://img.shields.io/npm/v/dsh-connect-doubao.svg)](https://www.npmjs.com/package/dsh-connect-doubao)
 [![license](https://img.shields.io/npm/l/dsh-connect-doubao.svg)](./LICENSE)
@@ -18,15 +18,15 @@
 **登录方式只有一种：浏览器扫码登录一次。不需要安装或登录豆包桌面客户端。**
 
 点卡片里的「重新登录」，插件拉起一个独立的 Chromium 窗口打开豆包登录页；你扫码（或手机号
-验证）之后它通过 CDP 取回会话 cookie，并用 Windows DPAPI 密封到
-`%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`。整个流程只在登录那一刻需要人，
+验证）之后它通过 CDP 取回会话 cookie，并密封到本机 —— Windows 走 DPAPI 文件
+`%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`，macOS 走登录钥匙串条目。整个流程只在登录那一刻需要人，
 之后都是纯 HTTP 调用。
 
 | 要求 | 说明 |
 | --- | --- |
 | **扫码登录一次** | 未登录 → 卡片显示「未登录」，provider 不可用 |
-| **Windows** | 会话密封依赖 Windows DPAPI。macOS / Linux **不支持** |
-| 本机有 Chrome 或 Edge | 登录窗口就是它，装在默认路径即可 |
+| **Windows / macOS** | 会话密封：Windows 走 DPAPI，macOS 走登录钥匙串（Linux 不支持） |
+| 本机有 Chrome 或 Edge | 登录窗口就是它；Windows 装在默认路径，macOS 装在 /Applications 或 ~/Applications（也认 Chromium / Chrome Canary） |
 | 有可用订阅额度 | 免费账号也能连，但配额很小 |
 
 没有登录态时插件会明确报错（「还没有浏览器登录态。请在豆包卡片里点「重新登录」扫码一次。」），
@@ -57,7 +57,7 @@
 
 | 项 | 值 |
 | --- | --- |
-| 操作系统 | Windows x64 |
+| 操作系统 | Windows x64 / macOS |
 | 豆包电脑版 | 2.31.4（已登录） |
 | DeepSeek Harness | 0.2.0-rc.2（桌面版） |
 | Node.js | 24.18.1（宿主内） |
@@ -265,9 +265,10 @@ DSH (pi-ai provider)
                                                 （带上密封会话里的 cookie）
 ```
 
-1. **凭据**：只来自浏览器扫码 —— 一次 CDP `Storage.getCookies`，立刻用 Windows DPAPI
-   密封到 `~/.dsh/doubao-credentials-browser.dpapi`；读出的值只进请求头，**从不**写日志、
-   命令行、环境变量或其它文件。
+1. **凭据**：只来自浏览器扫码 —— 一次 CDP `Storage.getCookies`，立刻密封到本机
+   （Windows：DPAPI 文件 `~/.dsh/doubao-credentials-browser.dpapi`；macOS：登录钥匙串
+   条目 `dsh-connect-doubao`）；读出的值只进请求头，**从不**写日志、环境变量或其它文件
+   （macOS 例外：封存那一刻 payload 会经过一次 `security` 子进程的 argv，见「平台支持」）。
 2. **provider**：把 pi-ai 的 OpenAI 形状请求翻译成豆包方言（`bot_id` + `reasoning_effort`）。
 3. **流式**：上游的三行帧被解析成 pi-ai 的事件流，工具调用 / 压缩 / 权限仍由 Harness 掌控。
 4. **只读路由**：`/plugins/dsh-connect-doubao/quota` 与 `/catalog` 提供额度与目录，
@@ -311,18 +312,24 @@ dsh plugin --profile desktop add "E:\path\to\dsh-connect-doubao"
 | 平台 | 状态 |
 | --- | --- |
 | **Windows x64** | ✅ **实测验证** |
-| macOS | ❌ 不支持（DPAPI 是 Windows 专有） |
-| Linux | ❌ 不支持（同上） |
+| **macOS** | ✅ 支持（会话用登录钥匙串密封） |
+| Linux | ❌ 不支持（没有对等的本机密封） |
 
 **登录态**只有一个来源（`src/doubao-auth.ts` + `src/doubao-auth-browser.ts`）：
 
 1. 卡片点「重新登录」→ 拉一个独立的 Chromium 用户目录（`~/.dsh/doubao-browser-profile`），
    打开 `https://www.doubao.com/chat/`；
 2. 扫码（或手机号验证）完成 → 通过 CDP `Storage.getCookies` 一次取回全部 cookie；
-3. 只保留豆包/Bytedance 域下、且 9 个必需会话 cookie 齐备的那份，用 Windows DPAPI
-   密封到 `%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`（当前用户作用域，别的账户和
+3. 只保留豆包/Bytedance 域下、且 9 个必需会话 cookie 齐备的那份，密封到本机 ——
+   Windows 用 DPAPI 写 `%USERPROFILE%\.dsh\doubao-credentials-browser.dpapi`，macOS 写登录
+   钥匙串条目 `dsh-connect-doubao` / `browser-session`（都只对当前用户可解，别的账户和
    别的机器解不开）；
-4. 之后所有请求只读这个密封文件，进程内缓存 10 分钟。
+4. 之后所有请求只读这个密封存档，进程内缓存 10 分钟。
+
+> **macOS 上会话还有第二份副本**：扫码用的那个 Chrome 用户目录
+> （`~/.dsh/doubao-browser-profile`，建时 0700、Cookies 文件 0600）里也留着同一份
+> 会话 cookie，由 Chrome Safe Storage 加密。它同样只对当前用户可解，但确实是
+> 钥匙串之外的第二个落点；在意的话可以在登录成功后删掉该目录（代价：下次仍要扫码）。
 
 **为什么不再解密豆包客户端的 cookie。** 客户端运行时对 `Default\Network\Cookies` 持**独占锁**，
 而本插件恰恰是为「客户端正在运行」的账号准备的：读不到 → 回退到 12 小时前的密封副本 →
@@ -390,7 +397,9 @@ npm run check       # 以上全部
    所以**没有**一个响应侧的字段可以拿来证明"服务端真的用了你选的那个模型"。
    本插件能确定的是：它把 `model_item_key` 随请求发出（这已抓包确认）。
    至于服务端如何解释这个键，只能由服务端回答。
-4. **仅 Windows。** 会话密封依赖 DPAPI（macOS / Linux 不支持）。
+4. **Windows 与 macOS。** 会话密封：Windows 用 DPAPI，macOS 用登录钥匙串（Linux 不支持）。
+   macOS 封存时 payload 会短暂经过 `security` 子进程的 argv（实测该工具没有 stdin/交互输入
+   通道，省略 `-w` 会直接建空密码条目），存在毫秒级同用户 `ps` 可见窗口。
    豆包客户端**不需要**安装：登录态只来自浏览器扫码。数据目录只在两处还会被读到 ——
    模型清单缓存与「工作任务」模式的本地工作区 —— 自动探测几层（配置文件里的 `profileDir`、
    环境变量 `DSH_DOUBAO_PROFILE`、AppData 候选、运行中客户端的 `--user-data-dir`、限时扫盘）；

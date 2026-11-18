@@ -23,10 +23,11 @@
  * means one account: no fallback can silently serve whoever else happened to be
  * signed in somewhere on this machine.
  *
- * SECURITY: cookie values live in this process's memory and in one file sealed
- * with Windows DPAPI (current-user scope), which no other Windows account and no
- * other machine can open. Nothing here is logged, and nothing leaves except the
- * outbound request's `Cookie:` header.
+ * SECURITY: cookie values live in this process's memory and in one platform
+ * sealed store — Windows DPAPI (current-user scope) or the macOS login
+ * keychain — which no other account and no other machine can open. Nothing
+ * here is logged, and nothing leaves except the outbound request's
+ * `Cookie:` header.
  *
  * @module dsh-connect-doubao/auth
  */
@@ -49,10 +50,11 @@ export interface DoubaoCredentials {
 /**
  * How long a loaded session stays in the process cache.
  *
- * Not a security boundary: DPAPI unprotect costs a PowerShell child process, and
- * every upstream call wants the header, so the cache is what keeps a chat turn
- * from spawning one process per request. Doubao rotates its own cookies
- * server-side; the first rejected request is the accurate expiry signal.
+ * Not a security boundary: unsealing costs a child process (the PowerShell
+ * DPAPI helper on Windows, `security(1)` on macOS), and every upstream call
+ * wants the header, so the cache is what keeps a chat turn from spawning one
+ * process per request. Doubao rotates its own cookies server-side; the first
+ * rejected request is the accurate expiry signal.
  */
 export const CREDENTIAL_TTL_MS = 10 * 60 * 1000
 
@@ -213,11 +215,101 @@ function dpapiCall(mode: 'protect' | 'unprotect', blob: Buffer): Buffer {
 }
 
 /* ------------------------------------------------------------------ *
+ * macOS login keychain
+ * ------------------------------------------------------------------ */
+
+/**
+ * Keychain identity of the sealed session.
+ *
+ * One generic-password item per install: `security find-generic-password
+ * -s dsh-connect-doubao` finds exactly the one thing to read or delete.
+ */
+const KEYCHAIN_SERVICE = 'dsh-connect-doubao'
+const KEYCHAIN_ACCOUNT = 'browser-session'
+
+/**
+ * Why the last keychain read failed, for the card's message. Never a secret.
+ *
+ * `loadBrowserCredentials` is a total function by design (absent == undefined),
+ * and that used to be fine on Windows, where "no file" really does mean "never
+ * signed in". On macOS a LOCKED or denied keychain produces the same undefined,
+ * so the card said「重新登录」for a state where logging in again changes nothing.
+ * Keep the last reason here and let the caller append it.
+ */
+let lastKeychainError: string | undefined
+
+/**
+ * Run one `security(1)` invocation.
+ *
+ * The login keychain is the at-rest boundary on macOS — the counterpart of
+ * DPAPI on Windows: the blob is encrypted under the user's keybag instead of
+ * sitting in a readable file. Two deliberate properties, measured 2026-11-18
+ * on this macOS:
+ *
+ *  * the payload travels in the argv of a short-lived `security` child. This
+ *    `security add-generic-password` has no stdin option and no prompt
+ *    (omitting `-w` silently creates an EMPTY-password item; a pty gets the
+ *    same), so argv is the only channel. The exposure is a same-user `ps` read
+ *    during the child's milliseconds-long life;
+ *  * `/usr/bin/security` is a fixed path, for the same reason `powershellPath()`
+ *    is absolute: a planted `security` earlier in PATH would receive the
+ *    payload in its argv.
+ *
+ * Exit status is the only success signal `add-generic-password` gives: it prints
+ * NOTHING on success. Treating empty stdout as failure (measured 2026-11-18 on
+ * a real Chrome login) made every macOS save throw while the item had in fact
+ * been written.
+ */
+function securityRun(argv: string[], mode: string): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync('/usr/bin/security', argv, { encoding: 'utf8', maxBuffer: 1 << 24 })
+  const status = result.status
+  const stdout = result.stdout ?? ''
+  const stderr = result.stderr ?? ''
+  if (status !== 0) {
+    throw new Error(
+      `security(1) ${mode} failed (status=${String(status)}, ` +
+      `stderr=${JSON.stringify(stderr.slice(-200))})`,
+    )
+  }
+  return { status, stdout, stderr }
+}
+
+/** Write (or overwrite) the sealed session item. Throws on failure. */
+function keychainProtect(blob: Buffer): void {
+  securityRun(
+    ['add-generic-password', '-U', '-s', KEYCHAIN_SERVICE, '-a', KEYCHAIN_ACCOUNT, '-w', blob.toString('utf8')],
+    'protect',
+  )
+}
+
+/** Read the sealed session payload. Throws on failure. */
+function keychainUnprotect(): string {
+  const { stdout } = securityRun(
+    ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', KEYCHAIN_ACCOUNT, '-w'],
+    'unprotect',
+  )
+  if (stdout === '') throw new Error('security(1) unprotect returned no payload')
+  // `find-generic-password -w` appends one newline; the payload is JSON and
+  // cannot end in one, so stripping exactly one is unambiguous.
+  return stdout.replace(/\n$/, '')
+}
+
+/** Delete the sealed session item. Absence is success. */
+function keychainDelete(): void {
+  try {
+    securityRun(['delete-generic-password', '-s', KEYCHAIN_SERVICE, '-a', KEYCHAIN_ACCOUNT], 'delete')
+  } catch { /* already gone */ }
+}
+
+/* ------------------------------------------------------------------ *
  * The sealed browser session
  * ------------------------------------------------------------------ */
 
 /**
- * Where the one usable session lives.
+ * Where the one usable session lives on Windows.
+ *
+ * macOS stores the same payload as the login-keychain item
+ * (`dsh-connect-doubao` / `browser-session`) rather than a file.
  *
  * The file name keeps the `-browser` suffix it was introduced with so an
  * existing sealed session survives the upgrade that removed the client path.
@@ -232,7 +324,10 @@ function browserCachePath(): string {
   return join(homedir(), '.dsh', BROWSER_CACHE_FILENAME)
 }
 
-/** Seal browser-harvested cookies to disk. Throws on a DPAPI failure. */
+/**
+ * Seal browser-harvested cookies to the platform store — the DPAPI file on
+ * Windows, the login keychain on macOS. Throws on a sealing failure.
+ */
 export function saveBrowserCredentials(pairs: Map<string, string>): void {
   const header = [...pairs.entries()].map(([name, value]) => `${name}=${value}`).join('; ')
   const payload = JSON.stringify({
@@ -241,7 +336,16 @@ export function saveBrowserCredentials(pairs: Map<string, string>): void {
     header,
     pairs: [...pairs.entries()],
   })
-  const sealed = dpapiCall('protect', Buffer.from(payload, 'utf8'))
+  const blob = Buffer.from(payload, 'utf8')
+  if (process.platform === 'darwin') {
+    keychainProtect(blob)
+    lastKeychainError = undefined
+    return
+  }
+  if (process.platform !== 'win32') {
+    throw new Error('当前系统不支持凭据密封（支持 Windows / macOS）')
+  }
+  const sealed = dpapiCall('protect', blob)
   mkdirSync(dirname(browserCachePath()), { recursive: true })
   writeFileSync(browserCachePath(), sealed, { mode: 0o600 })
 }
@@ -249,8 +353,9 @@ export function saveBrowserCredentials(pairs: Map<string, string>): void {
 /** Read the sealed browser session, or `undefined` when absent/unusable. */
 export function loadBrowserCredentials(): DoubaoCredentials | undefined {
   try {
-    const sealed = readFileSync(browserCachePath())
-    const json = dpapiCall('unprotect', sealed).toString('utf8')
+    const json = process.platform === 'darwin'
+      ? keychainUnprotect()
+      : dpapiCall('unprotect', readFileSync(browserCachePath())).toString('utf8')
     const parsed = JSON.parse(json) as { header?: unknown; pairs?: unknown }
     if (typeof parsed.header !== 'string' || !Array.isArray(parsed.pairs)) return undefined
     const pairs = new Map<string, string>()
@@ -260,24 +365,36 @@ export function loadBrowserCredentials(): DoubaoCredentials | undefined {
       if (typeof name === 'string' && typeof value === 'string' && name !== '') pairs.set(name, value)
     }
     const missing = REQUIRED_COOKIE_NAMES.filter((name) => !pairs.get(name))
-    // A file that decrypts but lacks a required cookie is a HALF session: the
-    // scan was abandoned mid-flow or the server rotated part of the jar. Serving
-    // it would fail upstream with a message about the account, not about the
-    // login, so treat it as absent and let the card ask for a fresh scan.
+    // A sealed blob that opens but lacks a required cookie is a HALF session:
+    // the scan was abandoned mid-flow or the server rotated part of the jar.
+    // Serving it would fail upstream with a message about the account, not
+    // about the login, so treat it as absent and let the card ask for a scan.
     if (missing.length > 0) return undefined
+    lastKeychainError = undefined
     return { ok: true, header: parsed.header, pairs }
-  } catch {
+  } catch (error: unknown) {
+    // Remember WHY, so the card can tell "never signed in" apart from "the
+    // keychain refused/did not answer". Only macOS reads this; the Windows
+    // message is unchanged.
+    if (process.platform === 'darwin') {
+      lastKeychainError = error instanceof Error ? error.message : String(error)
+    }
     return undefined
   }
 }
 
-/** True when a sealed browser session exists on disk. */
+/** True when a sealed browser session is present in the platform store. */
 export function hasBrowserCredentials(): boolean {
   return loadBrowserCredentials() !== undefined
 }
 
 /** Drop the sealed session (a re-login always overwrites it). */
 export function clearBrowserCredentials(): void {
+  if (process.platform === 'darwin') {
+    keychainDelete()
+    lastKeychainError = undefined
+    return
+  }
   try { unlinkSync(browserCachePath()) } catch { /* already gone */ }
 }
 
@@ -331,9 +448,15 @@ export function loadDoubaoCredentials(options: { force?: boolean } = {}): Doubao
   }
 
   const sealed = loadBrowserCredentials()
+  // On macOS an item that exists but cannot be read (locked keychain, denied
+  // access) is NOT "never signed in": telling the user to scan again would send
+  // them in a circle. Name the real cause instead. Windows text stays as is.
+  const keychainHint = process.platform === 'darwin' && lastKeychainError !== undefined
+    ? `（读取登录钥匙串失败：${lastKeychainError}）`
+    : ''
   const credentials: DoubaoCredentials = sealed ?? {
     ok: false,
-    reason: '还没有浏览器登录态。请在豆包卡片里点「重新登录」扫码一次。',
+    reason: '还没有浏览器登录态。请在豆包卡片里点「重新登录」扫码一次。' + keychainHint,
     header: '',
     pairs: new Map(),
   }

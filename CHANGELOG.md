@@ -4,6 +4,30 @@
 
 ---
 
+## 0.7.3 — 未发布
+
+> 这一版把插件从「仅 Windows」扩展到 macOS：浏览器探测补上 macOS 路径，会话密封在 macOS 改用登录钥匙串（对等 Windows DPAPI 的作用）。Windows 的路径与行为不变。
+
+### 新增
+
+- **macOS 浏览器登录支持**（`doubao-auth-browser`）：
+  - 候选浏览器路径补上 macOS 标准位置（`/Applications` 与 `~/Applications` 下的 Chrome / Edge / Chromium / Chrome Canary）。修掉 macOS 上误报「没找到 Chrome 或 Edge」。
+  - 收尾杀进程改为仅 Windows 用 `taskkill`；macOS/Linux 用 SIGTERM，Chrome 收到后会连带退出渲染进程。SIGTERM 之后再等 1.5 秒，仍未退出就 SIGKILL —— 否则卡住的 Chrome 会占着 9333 端口与 `--user-data-dir`，用户下一次点「重新登录」只会得到「调试端口没起来」。
+  - 浏览器用户目录在建时就设 0700（里面放着会话 cookie 的第二份副本，多用户机器上不该被列出来）；Windows 忽略该权限位。
+- **macOS 会话密封走登录钥匙串**（`doubao-auth`）：登录成功后的会话 cookie 在 macOS 写入登录钥匙串条目（service `dsh-connect-doubao` / account `browser-session`，经绝对路径 `/usr/bin/security` 调用），读取与删除同一路径；Windows 的 DPAPI 密封保持不变。已知取舍：macOS 的 `security add-generic-password` 没有 stdin/交互输入通道（实测省略 `-w` 会直接建空密码条目），封存时 payload 会经过子进程 argv，存在毫秒级同用户 `ps` 可见窗口。
+- `doctor` 诊断按平台报告密封来源（`sealed DPAPI file` / `sealed keychain item`）。
+
+### 修复
+
+- **`security add-generic-password` 成功时没有任何 stdout**，最初版本把「stdout 为空」判为失败，导致 macOS 上每次保存都报 `security(1) protect failed (status=0)`，而条目其实已经写进去了。改为只看退出码；`unprotect` 空输出仍视为失败。
+- **钥匙串读取失败不再伪装成「没登录」**：钥匙串被锁或授权被拒时，卡片此前一律提示「还没有浏览器登录态，请重新登录」，用户照做也没用。现在 macOS 会把 `security` 的失败摘要附在提示后面（只含退出码与 stderr 片段，不含任何 cookie 值）。
+
+### 测试
+
+- 新增 `auth-sealing.test.ts` 6 例：macOS 浏览器候选路径、taskkill 限 Windows、`/usr/bin/security` 绝对路径调用、钥匙串条目生命周期、`add-generic-password` 空 stdout 不算失败、DPAPI 路径保持不变。
+
+---
+
 ## 0.7.2 — 2026-11-17
 
 > 这一版跟随豆包的额度体系改版：**5 小时限额与周额度已下线**，主额度统一变成「套餐积分」（`window_type: 4`）。此前插件不认识这个类型，结果卡片上既没有主额度、`/quota` 也少一条，看起来像额度读丢了。
