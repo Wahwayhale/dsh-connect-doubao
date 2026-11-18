@@ -4,6 +4,57 @@
 
 ---
 
+## 未发布 — macOS 支持
+
+> 上游此前是"仅 Windows"的构造：注册表探测、扫码浏览器查找、凭据密封三处都写死 Windows。
+> 在 macOS 上表现为三件事同时哑火 —— 卡片报「没找到 Chrome 或 Edge」、已密封的会话读不出来、
+> 模型清单回落到 6 条静态条目（而客户端实际列了 13 个）。本版让这三处都能在 darwin 上工作，
+> Windows 行为逐字不变。
+
+### 修复
+
+- **扫码登录找不到浏览器**（`doubao-auth-browser`）：`CANDIDATES` 原本是 4 条
+  `C:\Program Files` 路径，macOS 上 `findBrowser()` 恒为 `undefined`。改为按平台取值，
+  非 Windows 走 `posixCandidates()`（`/Applications` 与 `~/Applications` 下的
+  Chrome / Edge / Chromium / Brave，外加 Linux 的 `/usr/bin` 若干）。新增
+  `DSH_DOUBAO_CHROME` 环境变量，可指向任意 Chromium 二进制，命中即优先。
+- **登录后浏览器不退、9333 端口被占**（`doubao-auth-browser` 的 `terminate`）：
+  POSIX 上 `spawnSync('taskkill')` 不抛异常，而是把 `ENOENT` 放进 `result.error`，
+  于是原来的 `catch` 兜底永远不执行 —— 浏览器带着调试端口活下来，下次登录报端口占用。
+  非 Windows 改为直接 `child.kill('SIGTERM')`，defect 已实测复现并修复。
+- **已密封的会话读不出来**（`doubao-auth`）：密封只有一个后端 —— PowerShell + `crypt32.dll`。
+  新增 `sealBlob` / `unsealBlob` 抽象：Windows 仍走 DPAPI（逐字保留），其余平台用
+  AES-256-GCM，密钥放在 `~/.dsh/doubao-credentials.key`（0600，首次使用时生成）。
+  密封体带 `DSHD1:` 版本魔数，格式不符或校验失败一律当作"未登录"，恢复方式就是重新扫码一次。
+- **macOS 上模型发现永远只有 6 条**（`doubao-profile`）：这是前两轮平台补丁都漏掉的一处 ——
+  `listDoubaoProfiles` 开头就 `if (platform !== 'win32') return []`，而它只被
+  `doubao-auth-browser` / `doubao-auth` 之外的调用方使用，所以补了登录也仍然读不到客户端的
+  模型清单。改为放行 darwin，并把真正 Windows 专属的两段（`Get-CimInstance` 探测、`C:\`
+  盘符扫描）单独加条件，不再用一个平台判断兜住整个函数。
+- **macOS 的豆包客户端布局与 Windows 不同**（`doubao-profile`）：cookie 库在
+  `Default/Cookies` 而不是 `Default/Network/Cookies`，数据目录也没有 `User Data` 这一层。
+  `looksLikeProfile` 增加两种判定（`Default/Cookies`、`Default/Preferences`），
+  `defaultAppDataBases` 在非 Windows 上追加
+  `~/Library/Application Support/Doubao`。
+
+### 测试
+
+- 新增 `tests/macos-support.test.ts`（14 条）：AES-256-GCM 密封往返、密钥长度、篡改拒绝、
+  魔数不符拒绝；浏览器候选与 `terminate` 的源码级断言；`looksLikeProfile` 的两种 macOS
+  写法；`listDoubaoProfiles` 在 darwin 下不再触发 PowerShell 探测与盘符扫描。
+- 负向验证：同一批测试在原版 0.7.2 源码上跑，14 条里 12 条失败 —— 证明它们确实覆盖缺陷，
+  而不是"跟着实现写出来的同义反复"。
+
+### 已知边界
+
+- **Linux 仍然返回空。** 密封与浏览器查找已按 POSIX 写好，但没有任何一次真机验证过
+  Linux 版豆包客户端的目录布局。凭空写一个没见过的路径，比老实说"还没验证"更糟；
+  `tests/profile.test.ts` 里那条 `platform: 'linux'` 断言返回空的用例因此保持原样。
+- macOS 只认 Chrome / Edge / Chromium / Brave 的默认安装位置，装在别处需要用
+  `DSH_DOUBAO_CHROME` 显式指定。
+
+---
+
 ## 0.7.2 — 2026-11-17
 
 > 这一版跟随豆包的额度体系改版：**5 小时限额与周额度已下线**，主额度统一变成「套餐积分」（`window_type: 4`）。此前插件不认识这个类型，结果卡片上既没有主额度、`/quota` 也少一条，看起来像额度读丢了。

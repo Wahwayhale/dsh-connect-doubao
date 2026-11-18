@@ -30,6 +30,7 @@
  * @module dsh-connect-doubao/profile
  */
 import { existsSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
@@ -95,9 +96,20 @@ export function currentProfileOverride(): string | undefined {
   return manualOverride
 }
 
-/** A directory is a profile only if the cookie jar is really there. */
+/**
+ * A directory is a profile only if the Chromium data is really there.
+ *
+ * Two spellings, because Chromium moved the cookie jar and not every platform
+ * build has caught up the same way: Windows keeps it at `Default/Network/
+ * Cookies`, while the macOS Doubao build ships `Default/Cookies` and no
+ * `Network` folder at all. `Default/Preferences` is the last-resort marker.
+ */
 export function looksLikeProfile(dir: string): boolean {
-  return existsSync(join(dir, 'Default', 'Network', 'Cookies'))
+  return (
+    existsSync(join(dir, 'Default', 'Network', 'Cookies')) ||
+    existsSync(join(dir, 'Default', 'Cookies')) ||
+    existsSync(join(dir, 'Default', 'Preferences'))
+  )
 }
 
 /**
@@ -178,6 +190,12 @@ function defaultAppDataBases(env: NodeJS.ProcessEnv): string[] {
     (entry): entry is string => typeof entry === 'string' && entry !== '',
   )
   const candidates = bases.map((base) => join(base, 'Doubao', 'User Data'))
+  // macOS: the app keeps its Chromium data directly under Application Support,
+  // with no `User Data` level. Only added off-Windows: on Windows the same
+  // folder name would be a stray path under a non-existent Library tree.
+  if (process.platform !== 'win32') {
+    candidates.push(join(homedir(), 'Library', 'Application Support', 'Doubao'))
+  }
   // Roaming first, then every other user's Local: a second account on the same
   // machine is a real setup, and `C:\Users` is cheap to list.
   const usersRoot = 'C:\\Users'
@@ -270,7 +288,18 @@ function scanForProfiles(
  */
 export function listDoubaoProfiles(deps: ProfileProbeDeps = {}): DoubaoProfileLocation[] {
   const platform = deps.platform ?? process.platform
-  if (platform !== 'win32') return []
+  // The Windows-only guard is about the PROBES, not the concept: every branch
+  // below that shells out (Get-CimInstance) or walks `C:\Users` is Windows
+  // specific, so those are gated individually. Keeping the whole function
+  // behind `win32` was what made macOS fall back to the 6-entry static catalog
+  // even though the client's Preferences file was sitting right there.
+  //
+  // `darwin` is enabled because the macOS path was exercised end to end on real
+  // hardware (sign-in, account, quota, model discovery). `linux` stays out: the
+  // same AES-GCM sealing would apply, but nobody has run it against a real
+  // Doubao client on Linux, and claiming a profile layout we never saw is worse
+  // than saying "not supported yet".
+  if (platform !== 'win32' && platform !== 'darwin') return []
   const env = deps.env ?? process.env
   const now = deps.now ?? Date.now
   const out: DoubaoProfileLocation[] = []
@@ -300,15 +329,20 @@ export function listDoubaoProfiles(deps: ProfileProbeDeps = {}): DoubaoProfileLo
     if (looksLikeProfile(base)) push(base, 'appdata')
   }
 
-  // 3. the running client tells us where it really lives
-  const lines = deps.processCommandLines ? deps.processCommandLines() : probeProcessCommandLines()
-  for (const line of lines) {
-    const dir = extractUserDataDir(line)
-    if (dir !== undefined && looksLikeProfile(dir)) push(dir, 'process')
+  // 3. the running client tells us where it really lives. The probe is a
+  //    PowerShell call, so it only runs where PowerShell exists.
+  if (platform === 'win32') {
+    const lines = deps.processCommandLines ? deps.processCommandLines() : probeProcessCommandLines()
+    for (const line of lines) {
+      const dir = extractUserDataDir(line)
+      if (dir !== undefined && looksLikeProfile(dir)) push(dir, 'process')
+    }
   }
 
-  // 4. last resort: walk the drives
-  if (out.length === 0) {
+  // 4. last resort: walk the drives. `defaultScanRoots` enumerates `C:\`-style
+  //    letters, which is meaningless off Windows; `defaultAppDataBases` already
+  //    covers the one macOS location, so POSIX has nothing left to scan.
+  if (out.length === 0 && platform === 'win32') {
     const roots = deps.scanRoots ?? defaultScanRoots()
     for (const hit of scanForProfiles(roots, deps.scanBudgetMs ?? 1500, now)) push(hit.dir, hit.source)
   }

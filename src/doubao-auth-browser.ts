@@ -45,12 +45,41 @@ export function browserProfileDir(): string {
   return join(homedir(), '.dsh', 'doubao-browser-profile')
 }
 
-const CANDIDATES = [
+const WINDOWS_CANDIDATES = [
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
 ]
+
+/**
+ * Chromium binaries that exist on macOS / Linux.
+ *
+ * Resolved fresh on each call: the paths depend on $HOME, and a test that
+ * redirects HOME must see the redirected result.
+ */
+function posixCandidates(): string[] {
+  const bundles = [
+    ['Google Chrome.app', 'Google Chrome'],
+    ['Microsoft Edge.app', 'Microsoft Edge'],
+    ['Chromium.app', 'Chromium'],
+    ['Brave Browser.app', 'Brave Browser'],
+  ] as const
+  const out: string[] = []
+  for (const [app, binary] of bundles) {
+    const inside = join(app, 'Contents', 'MacOS', binary)
+    out.push(join('/Applications', inside))
+    out.push(join(homedir(), 'Applications', inside))
+  }
+  out.push(
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/microsoft-edge',
+  )
+  return out
+}
 
 /** Host page for the sign-in. `/chat` is the page that actually mints the jar. */
 const LOGIN_URL = 'https://www.doubao.com/chat/'
@@ -80,9 +109,19 @@ interface CdpCookie {
   expires?: unknown
 }
 
-/** Find an installed Chromium binary, or undefined. */
+/**
+ * Find an installed Chromium binary, or undefined.
+ *
+ * `DSH_DOUBAO_CHROME` points at a binary explicitly (a portable install, a
+ * non-default bundle name, a Chrome for Testing build). It wins when the file
+ * exists, so a machine with neither Chrome nor Edge in the default locations
+ * can still sign in. Windows keeps its four original paths.
+ */
 export function findBrowser(): string | undefined {
-  for (const candidate of CANDIDATES) {
+  const override = process.env.DSH_DOUBAO_CHROME
+  if (override !== undefined && override !== '' && existsSync(override)) return override
+  const candidates = process.platform === 'win32' ? WINDOWS_CANDIDATES : posixCandidates()
+  for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate
   }
   return undefined
@@ -186,6 +225,15 @@ function pickPairs(cookies: readonly CdpCookie[]): Map<string, string> {
 /** Kill a spawned browser including its renderer children. */
 function terminate(child: ChildProcess): void {
   if (child.pid === undefined) return
+  // POSIX: `taskkill` does not exist. `spawnSync` reports ENOENT in
+  // `result.error` instead of throwing, so the Windows branch's catch never
+  // fired and the browser survived with port 9333 still held — the next
+  // sign-in then failed with "debug port not up". Signal directly instead;
+  // Chromium reaps its own renderer/gpu children on SIGTERM.
+  if (process.platform !== 'win32') {
+    try { child.kill('SIGTERM') } catch { /* gone already */ }
+    return
+  }
   try {
     // Windows: `child.kill()` leaves the renderer/gpu children behind, which
     // keeps the user-data-dir locked and the next login fails to start.
