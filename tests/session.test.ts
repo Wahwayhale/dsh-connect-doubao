@@ -107,6 +107,25 @@ describe('ConversationStore', () => {
     expect(store.get('k')).toBeUndefined()
   })
 
+  it('keeps a conversation alive across a multi-day idle (7-day TTL)', () => {
+    const store = new ConversationStore()
+    store.remember('k', 'conv-9', 1, 0)
+    expect(store.get('k', 6 * 60 * 60 * 1000)).toBeDefined()
+    expect(store.get('k', 6 * 24 * 60 * 60 * 1000)).toBeDefined()
+    expect(store.get('k', 8 * 24 * 60 * 60 * 1000)).toBeUndefined()
+  })
+
+  it('treats re-remembering as use, so eviction is least-recently-used', () => {
+    const store = new ConversationStore(60_000, 2)
+    store.remember('a', 'conv-a', 1)
+    store.remember('b', 'conv-b', 1)
+    store.remember('a', 'conv-a', 2)
+    store.remember('c', 'conv-c', 1)
+    expect(store.size).toBe(2)
+    expect(store.get('a')?.messageCount).toBe(2)
+    expect(store.get('b')).toBeUndefined()
+  })
+
   it('evicts the oldest entry past its cap', () => {
     const store = new ConversationStore(60_000, 2)
     store.remember('a', 'conv-a', 1)

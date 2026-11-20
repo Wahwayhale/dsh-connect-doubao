@@ -20,6 +20,19 @@ import { createDoubaoAdapter } from '../src/doubao-adapter.ts'
 import { registerDoubaoCatalogRoute, WRITE_HEADER } from '../src/doubao-status.ts'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
+// The HTTP-level tests must not depend on a local Doubao login: chat resolves
+// credentials itself on every upstream call, so without this mock the suite
+// only passes on a machine with a sealed browser session.
+vi.mock('../src/doubao-auth.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/doubao-auth.ts')>()
+  const fake: DoubaoCredentials = {
+    ok: true,
+    header: actual.REQUIRED_COOKIE_NAMES.map((name) => `${name}=test`).join('; '),
+    pairs: new Map(actual.REQUIRED_COOKIE_NAMES.map((name) => [name, 'test'])),
+  }
+  return { ...actual, loadDoubaoCredentials: () => fake }
+})
+
 const credentials: DoubaoCredentials = {
   ok: true,
   header: REQUIRED_COOKIE_NAMES.map((name) => `${name}=test`).join('; '),
@@ -443,5 +456,270 @@ describe('model discovery and catalog completeness regressions', () => {
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network down') }))
     const models = await refreshDiscovery({ force: true })
     expect(models.length).toBeGreaterThanOrEqual(DOUBAO_MODELS.length)
+  })
+})
+
+describe('conversation continuation regressions', () => {
+  it('re-issues a rejected continuation as a fresh conversation within the same turn (710020202)', async () => {
+    const capturedBodies: Array<Record<string, any>> = []
+    const realFetch = globalThis.fetch
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.startsWith('http://127.0.0.1:')) return realFetch(input, init)
+        if (url.includes('/quota/summary/')) {
+          return new Response(
+            JSON.stringify({ data: { window_limit_section: { usage_exhausted: false } } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        if (url.includes('/chat/completion')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+          capturedBodies.push(body)
+          if (capturedBodies.length === 2) {
+            // The remembered thread is gone upstream: the continuation is
+            // rejected as an invalid parameter.
+            return sseResponse([
+              frame('STREAM_ERROR', { error_code: 710020202, error_msg: 'common invalid param' }),
+            ])
+          }
+          const conversationId = capturedBodies.length === 1 ? 'conv-stale' : 'conv-fresh'
+          return sseResponse([
+            frame('SSE_ACK', { ack_client_meta: { conversation_id: conversationId } }),
+            frame('STREAM_CHUNK', {
+              block_type: 10000,
+              block_id: 'txt-1',
+              content: { text_block: { text: '好的' } },
+            }),
+            frame('SSE_REPLY_END', {}),
+          ])
+        }
+        throw new Error(`unexpected fetch url: ${url}`)
+      }),
+    )
+
+    const shim = createDoubaoShim({ resolveCredentials: () => credentials })
+    shims.push(shim)
+    const base = await shim.baseUrl()
+    const headers = {
+      'content-type': 'application/json',
+      authorization: `Bearer ${shim.token()}`,
+    }
+
+    // Turn 1: a successful turn remembers conv-stale.
+    const res1 = await realFetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: '3', stream: false, messages: [{ role: 'user', content: '先聊两句' }] }),
+    })
+    expect(res1.status).toBe(200)
+
+    // Turn 2: a longer transcript continues the remembered thread — and the
+    // server rejects it with 710020202.
+    const res2 = await realFetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: '3',
+        stream: true,
+        messages: [
+          { role: 'user', content: '先聊两句' },
+          { role: 'assistant', content: '好的' },
+          { role: 'user', content: '继续' },
+        ],
+      }),
+    })
+    expect(res2.status).toBe(200)
+    expect(capturedBodies[1]?.option?.need_create_conversation).toBe(false)
+    expect(capturedBodies[1]?.client_meta?.conversation_id).toBe('conv-stale')
+    // Same turn, second upstream call: the fallback re-issued the FULL
+    // transcript as a fresh conversation — the user never sees a failure.
+    expect(capturedBodies[2]?.option?.need_create_conversation).toBe(true)
+    expect(capturedBodies[2]?.client_meta?.conversation_id).toBe('')
+    // The upstream body always carries ONE flattened prompt message: the first
+    // attempt sent only the delta, the fresh re-issue carried the whole
+    // transcript.
+    const promptText = (body: Record<string, any> | undefined): string =>
+      body?.messages?.[0]?.content_block?.[0]?.content?.text_block?.text ?? ''
+    expect(promptText(capturedBodies[1])).not.toContain('先聊两句')
+    expect(promptText(capturedBodies[2])).toContain('先聊两句')
+    expect(promptText(capturedBodies[2])).toContain('继续')
+    expect(await res2.text()).toContain('好的')
+
+    // Turn 3: the fallback remembered ITS fresh id, so this turn continues
+    // that thread instead of opening yet another conversation.
+    const res3 = await realFetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: '3',
+        stream: false,
+        messages: [
+          { role: 'user', content: '先聊两句' },
+          { role: 'assistant', content: '好的' },
+          { role: 'user', content: '继续' },
+          { role: 'assistant', content: '好的，然后呢' },
+          { role: 'user', content: '再继续' },
+        ],
+      }),
+    })
+    expect(res3.status).toBe(200)
+    expect(capturedBodies[3]?.option?.need_create_conversation).toBe(false)
+    expect(capturedBodies[3]?.client_meta?.conversation_id).toBe('conv-fresh')
+  })
+})
+
+describe('conversation failure containment regressions', () => {
+  it('surfaces a double rejection and lets the NEXT turn open a fresh conversation', async () => {
+    const capturedBodies: Array<Record<string, any>> = []
+    const realFetch = globalThis.fetch
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.startsWith('http://127.0.0.1:')) return realFetch(input, init)
+        if (url.includes('/quota/summary/')) {
+          return new Response(
+            JSON.stringify({ data: { window_limit_section: { usage_exhausted: false } } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        if (url.includes('/chat/completion')) {
+          const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, any>
+          capturedBodies.push(body)
+          if (capturedBodies.length === 2 || capturedBodies.length === 3) {
+            return sseResponse([
+              frame('STREAM_ERROR', { error_code: 710020202, error_msg: 'common invalid param' }),
+            ])
+          }
+          const conversationId = capturedBodies.length === 1 ? 'conv-stale' : 'conv-fresh'
+          return sseResponse([
+            frame('SSE_ACK', { ack_client_meta: { conversation_id: conversationId } }),
+            frame('STREAM_CHUNK', {
+              block_type: 10000,
+              block_id: 'txt-1',
+              content: { text_block: { text: '好的' } },
+            }),
+            frame('SSE_REPLY_END', {}),
+          ])
+        }
+        throw new Error(`unexpected fetch url: ${url}`)
+      }),
+    )
+
+    const shim = createDoubaoShim({ resolveCredentials: () => credentials })
+    shims.push(shim)
+    const base = await shim.baseUrl()
+    const headers = {
+      'content-type': 'application/json',
+      authorization: `Bearer ${shim.token()}`,
+    }
+    const post = (messages: Array<{ role: string; content: string }>, stream: boolean) =>
+      realFetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model: '3', stream, messages }),
+      })
+
+    // Turn 1: remembers conv-stale.
+    expect((await post([{ role: 'user', content: '先聊两句' }], false)).status).toBe(200)
+
+    // Turn 2 (non-stream): the continuation is rejected AND the in-turn fresh
+    // re-issue is rejected too — the failure must surface, not be swallowed.
+    const res2 = await post(
+      [
+        { role: 'user', content: '先聊两句' },
+        { role: 'assistant', content: '好的' },
+        { role: 'user', content: '继续' },
+      ],
+      false,
+    )
+    expect(res2.status).toBeGreaterThanOrEqual(400)
+    expect(await res2.text()).toContain('710020202')
+    // Both upstream calls carried turn 2: continuation first, fresh full upload second.
+    expect(capturedBodies[1]?.client_meta?.conversation_id).toBe('conv-stale')
+    expect(capturedBodies[2]?.option?.need_create_conversation).toBe(true)
+
+    // Turn 3: the stale id was dropped on the double failure, so this turn
+    // opens a fresh conversation instead of retrying the rejected id again.
+    const res3 = await post(
+      [
+        { role: 'user', content: '先聊两句' },
+        { role: 'assistant', content: '好的' },
+        { role: 'user', content: '继续' },
+        { role: 'assistant', content: '好的，然后呢' },
+        { role: 'user', content: '再继续' },
+      ],
+      false,
+    )
+    expect(res3.status).toBe(200)
+    expect(capturedBodies[3]?.option?.need_create_conversation).toBe(true)
+    expect(capturedBodies[3]?.client_meta?.conversation_id).toBe('')
+  })
+
+  it('stops contacting Doubao after three consecutive failures (circuit valve)', async () => {
+    const capturedBodies: Array<Record<string, any>> = []
+    const realFetch = globalThis.fetch
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.startsWith('http://127.0.0.1:')) return realFetch(input, init)
+        if (url.includes('/quota/summary/')) {
+          return new Response(
+            JSON.stringify({ data: { window_limit_section: { usage_exhausted: false } } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        if (url.includes('/chat/completion')) {
+          capturedBodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, any>)
+          return sseResponse([
+            frame('STREAM_ERROR', { error_code: 710020202, error_msg: 'common invalid param' }),
+          ])
+        }
+        throw new Error(`unexpected fetch url: ${url}`)
+      }),
+    )
+
+    const shim = createDoubaoShim({ resolveCredentials: () => credentials })
+    shims.push(shim)
+    const base = await shim.baseUrl()
+    const headers = {
+      'content-type': 'application/json',
+      authorization: `Bearer ${shim.token()}`,
+    }
+    // Same opening message every turn: one sessionKey, one failure counter.
+    const grow = (turn: number) => {
+      const msgs: Array<{ role: string; content: string }> = [{ role: 'user', content: '先聊两句' }]
+      for (let i = 1; i < turn * 2; i++) {
+        msgs.push(i % 2 === 1 ? { role: 'assistant', content: '答' } : { role: 'user', content: `追问${i}` })
+      }
+      return msgs
+    }
+
+    // Three failing turns: nothing is ever remembered, so each goes upstream.
+    for (let turn = 1; turn <= 3; turn++) {
+      const res = await realFetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model: '3', stream: true, messages: grow(turn) }),
+      })
+      expect(res.status).toBe(200)
+      expect(await res.text()).toContain('710020202')
+    }
+    expect(capturedBodies.length).toBe(3)
+
+    // Fourth turn: the valve answers LOCALLY — no fourth upstream call, so
+    // nothing can start a server-side turn and burn quota during cooldown.
+    const res4 = await realFetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: '3', stream: true, messages: grow(4) }),
+    })
+    expect(res4.status).toBe(429)
+    const body4 = (await res4.json()) as { error?: { message?: string } }
+    expect(body4.error?.message).toContain('暂停')
+    expect(capturedBodies.length).toBe(3)
   })
 })
