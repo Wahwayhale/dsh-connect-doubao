@@ -19,8 +19,10 @@
  * line, so a generic `data:`-only SSE parser silently drops everything.
  */
 import { randomUUID } from 'node:crypto'
+import { appendFileSync } from 'node:fs'
+import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import { hostname, homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join, relative as relativeTo } from 'node:path'
 import {
   findDoubaoUserDataDir,
   loadDoubaoCredentials,
@@ -43,6 +45,9 @@ import {
   TASK_RUNTIME_LOCAL_PC,
   TASK_SANDBOX_AUTH_ALLOW_ALL,
 } from './doubao-catalog.ts'
+
+import { taskWorkspaceOperationsToDshCalls } from './doubao-tools.ts'
+import type { EmulatedToolCall, InboundTool } from './doubao-tools.ts'
 
 export const CHAT_ENDPOINT = 'https://www.doubao.com/chat/completion'
 export const QUOTA_ENDPOINT =
@@ -188,6 +193,8 @@ export interface DoubaoChatResult {
   reasoningText?: string
   /** True when the server routed to a thinking-capable model. */
   thinking: boolean
+  /** Tool calls delegated to this request's declared DSH functions. */
+  toolCalls?: EmulatedToolCall[]
   /**
    * Images produced by a skill turn (`input_skill: imageGen`).
    *
@@ -327,6 +334,8 @@ export interface ChatRequestOptions {
    * Defaults to `DSH_DOUBAO_WORKSPACE`, then `process.cwd()`.
    */
   workspace?: string
+  /** DSH functions declared on this request; never expanded to undeclared tools. */
+  declaredTools?: readonly InboundTool[]
 }
 
 /* ------------------------------------------------------------------ *
@@ -1064,12 +1073,122 @@ export interface StreamCallbacks {
  * + `msg/complete` until `agent_finished` (`command: 6004`) satisfies the server
  * runtime without requiring the Doubao desktop CUA process.
  */
+export function unsupportedLocalTaskResult(inputObj: Record<string, unknown>, reason?: string): Record<string, unknown> {
+  const error = reason ?? '本插件不会执行豆包任务通道发来的本地命令；请通过 DSH 声明的工作区工具执行。'
+  const operations = Array.isArray(inputObj.operations) ? inputObj.operations : []
+  return {
+    request_id: typeof inputObj.request_id === 'string' ? inputObj.request_id : '',
+    status: 'error',
+    error_code: 'LOCAL_EXECUTION_UNAVAILABLE',
+    error_msg: error,
+    results: operations.map((entry: unknown) => {
+      const op = entry !== null && typeof entry === 'object' && !Array.isArray(entry)
+        ? entry as Record<string, unknown>
+        : {}
+      return {
+        ...(typeof op.sequence === 'number' || typeof op.sequence === 'string' ? { sequence: op.sequence } : {}),
+        ...(typeof op.id === 'string' ? { id: op.id } : {}),
+        ...(typeof op.type === 'string' ? { type: op.type } : {}),
+        ...(typeof op.path === 'string' ? { path: op.path } : {}),
+        status: 'error',
+        error_msg: error,
+      }
+    }),
+  }
+}
+
+/**
+ * Perform a task runtime's own workspace bookkeeping (session dirs, board,
+ * trajectory log) inside the workspace this turn declared.
+ *
+ * Only `ensure_dir`, `ensure_file` and appends to files under the session
+ * prefix are honoured; every path is resolved under the root and rejected if it
+ * escapes it, so a crafted `..` cannot write outside the workspace. Anything
+ * unrecognised fails rather than being silently reported as done.
+ */
+/**
+ * Whether a `cmd_call` is the task runtime's own workspace bookkeeping.
+ *
+ * Judged by what the command touches, not by an exhaustive name list: the
+ * runtime names these per target (init_agent_workspace,
+ * append_workspace_trajectory_memory, write_workspace_board,
+ * write_workspace_assignment_main, …) and a list silently misses the next one —
+ * which is what turned a finished turn into a redispatch loop. A command is
+ * bookkeeping when every path it writes stays inside the runtime's own
+ * `.sessions/` prefix; anything reaching a real workspace path is real work and
+ * must go through the DSH tool bridge instead.
+ */
+export function isTaskBookkeeping(commandName: string, input: Record<string, unknown>): boolean {
+  const operations = Array.isArray(input.operations) ? input.operations : []
+  if (operations.length === 0) return false
+  const insideSessions = operations.every((operation) => {
+    if (operation === null || typeof operation !== 'object' || Array.isArray(operation)) return false
+    const path = (operation as Record<string, unknown>).path
+    if (typeof path !== 'string') return false
+    const normalized = path.split(String.fromCharCode(92)).join('/')
+    return normalized === '.sessions' || normalized.startsWith('.sessions/')
+  })
+  if (!insideSessions) return false
+  return commandName.startsWith('init_agent_workspace')
+    || commandName.startsWith('append_workspace_trajectory_memory')
+    || commandName.startsWith('write_workspace_')
+    || commandName.includes('_workspace_')
+}
+
+export async function applyTaskBookkeeping(
+  input: Record<string, unknown>,
+  workspaceRoot?: string,
+): Promise<{ ok: boolean; message: string }> {
+  const root = workspaceRoot ?? process.env.DSH_DOUBAO_WORKSPACE ?? process.cwd()
+  const operations = Array.isArray(input.operations) ? input.operations : []
+  if (operations.length === 0) return { ok: true, message: 'no operations' }
+  const resolveInside = (value: unknown): string | undefined => {
+    if (typeof value !== 'string' || value === '' || value.includes(String.fromCharCode(0))) return undefined
+    const normalized = value.split(String.fromCharCode(92)).join('/')
+    if (normalized.startsWith('/') || /^[A-Za-z]:/.test(normalized)) return undefined
+    if (normalized.split('/').some((part) => part === '..')) return undefined
+    const absolute = join(root, normalized)
+    const relative = relativeTo(root, absolute)
+    if (relative.startsWith('..') || isAbsolute(relative)) return undefined
+    return absolute
+  }
+  try {
+    for (const entry of operations) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        return { ok: false, message: 'invalid operation entry' }
+      }
+      const operation = entry as Record<string, unknown>
+      const target = resolveInside(operation.path)
+      if (target === undefined) return { ok: false, message: 'path outside workspace' }
+      const type = operation.type
+      if (type === 'ensure_dir') await mkdir(target, { recursive: true })
+      else if (type === 'ensure_file') {
+        await mkdir(dirname(target), { recursive: true })
+        await appendFile(target, '')
+      } else if (type === 'write_file' || type === 'append_file') {
+        if (typeof operation.content !== 'string') return { ok: false, message: 'missing content' }
+        await mkdir(dirname(target), { recursive: true })
+        if (type === 'append_file' || operation.mode === 'append') await appendFile(target, operation.content, 'utf8')
+        else await writeFile(target, operation.content, 'utf8')
+      } else {
+        return { ok: false, message: 'unsupported bookkeeping operation' }
+      }
+    }
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : 'bookkeeping failed' }
+  }
+  return { ok: true, message: 'ok' }
+}
+
 async function runToolLocalResponder(
   uniqueKey: string,
   credentials: DoubaoCredentials,
   isStreamDone: () => boolean,
-  signal?: AbortSignal,
-): Promise<void> {
+  signal: AbortSignal | undefined,
+  declaredTools: readonly InboundTool[],
+  onToolCalls: (calls: EmulatedToolCall[]) => void,
+): Promise<boolean> {
+  let localOperationRejected = false
   const msToken = credentials.pairs.get('msToken')
   const postToolJson = async (endpoint: string, payload: unknown): Promise<Record<string, any> | undefined> => {
     const url = buildQueryUrl(endpoint, msToken)
@@ -1086,6 +1205,7 @@ async function runToolLocalResponder(
     })
     absorbSetCookies(res.headers)
     const text = await res.text()
+    if (!res.ok) throw new Error(`Doubao task endpoint failed with HTTP ${res.status}`)
     return JSON.parse(text) as Record<string, any>
   }
 
@@ -1103,7 +1223,7 @@ async function runToolLocalResponder(
     } catch {
       // If fetch fails or returns non-JSON (e.g. a stubbed unit-test fetch),
       // exit quietly so the caller's stream handling is unaffected.
-      return
+      return localOperationRejected
     }
     const msg = ack?.code === 0 ? ack?.data?.msgs?.[0] : undefined
     if (msg !== undefined) {
@@ -1116,41 +1236,123 @@ async function runToolLocalResponder(
         } catch {
           inputObj = {}
         }
-        const ops = Array.isArray(inputObj.operations) ? inputObj.operations : []
-        const results = ops.map((op: Record<string, any>) => ({
-          ...(op.sequence !== undefined ? { sequence: op.sequence } : {}),
-          id: op.id,
-          type: op.type,
-          path: op.path,
-          status: 'success',
-        }))
-        const outputObj = {
-          request_id: inputObj.request_id ?? '',
-          status: 'success',
-          results,
+        /**
+         * Two kinds of command arrive here, and they must be treated differently.
+         *
+         * `init_agent_workspace` / `append_workspace_trajectory_memory` are the
+         * task runtime's OWN bookkeeping: it creates its session directory, its
+         * board and its trajectory log, then expects them to exist. These are not
+         * DSH work, and handing them to DSH made the runtime answer "workspace not
+         * ready" and dispatch the same command again — an endless loop that never
+         * reached the user's actual request. The plugin performs them itself
+         * against the workspace it declared, then answers success.
+         */
+        const commandName = String(cmdCall.id ?? '')
+        /**
+         * Recognise bookkeeping by what it DOES, not by an exhaustive list of
+         * names. The runtime names these per target — init_agent_workspace,
+         * append_workspace_trajectory_memory, write_workspace_board,
+         * write_workspace_assignment_main, and more appear as the app evolves —
+         * and a name list silently misses the next one, which is what turned a
+         * finished turn into a redispatch loop. Anything that only touches the
+         * runtime's own `.sessions/` prefix is bookkeeping; anything reaching a
+         * real workspace path still goes through the DSH tool bridge below.
+         */
+        const bookkeeping = isTaskBookkeeping(commandName, inputObj)
+        if (bookkeeping) {
+          const outcome = await applyTaskBookkeeping(inputObj)
+          try {
+            const uploaded = await postToolJson(TOOL_LOCAL_UPLOAD_ENDPOINT, {
+              device_id: CLIENT_PARAMS.device_id,
+              command_result: { id: cmdCall.id, code: outcome.ok ? 0 : 1, message: outcome.message },
+              workspace_apply_response: {
+                request_id: inputObj.request_id,
+                status: outcome.ok ? 'success' : 'failed',
+                ...(outcome.ok ? {} : { error_code: 'WORKSPACE_BOOKKEEPING_FAILED', error_message: outcome.message }),
+                operation_results: (Array.isArray(inputObj.operations) ? inputObj.operations : []).map((operation: Record<string, unknown>, operation_index: number) => ({
+                  operation_index,
+                  ...(typeof operation.path === 'string' ? { path: operation.path } : {}),
+                  status: outcome.ok ? 'success' : 'failed',
+                  ...(outcome.ok ? {} : { error_code: 'WORKSPACE_BOOKKEEPING_FAILED', error_message: outcome.message }),
+                })),
+                workspace_ready: outcome.ok,
+              },
+            })
+            if (uploaded?.code !== 0) return localOperationRejected
+            const completed = await postToolJson(TOOL_LOCAL_COMPLETE_ENDPOINT, { msg_id: msgId })
+            if (completed?.code !== 0) return localOperationRejected
+          } catch {
+            return localOperationRejected
+          }
+          seq += 1
+          continue
         }
+        // This endpoint is not connected to DSH's workspace tools. Never tell the
+        // remote task agent that a local operation succeeded when nothing ran.
+        localOperationRejected = true
+        const mapped = taskWorkspaceOperationsToDshCalls(inputObj, declaredTools)
+        const handoffReason = mapped.reason ?? '操作已作为 DSH 工具调用转交；等待宿主执行结果。'
+        if (mapped.calls.length === 0) {
+          // Why a task turn ended in LOCAL_EXECUTION_UNAVAILABLE is otherwise
+          // unanswerable: the payload is the server's, and the mapper's refusal
+          // reason names only the category. Log both, plus what was declared.
+          // Only on failure, so a healthy turn writes nothing.
+          const line = '[task] command=' + String(cmdCall.id ?? '')
+            + ' operations=' + JSON.stringify(inputObj.operations ?? [])
+            + ' declared=' + JSON.stringify(declaredTools.map((tool) => tool.function?.name ?? ''))
+            + ' reason=' + (mapped.reason ?? '(none)') + '\n'
+          process.stderr.write(line)
+          try {
+            appendFileSync(join(homedir(), '.dsh', 'doubao-task.log'), line)
+          } catch {
+            /* diagnostics must never break the request */
+          }
+        }
+        unsupportedLocalTaskResult(inputObj, handoffReason)
         try {
-          await postToolJson(TOOL_LOCAL_UPLOAD_ENDPOINT, {
-            cmd_id: cmdCall.cmd_id,
-            session_id: msg.session_id,
-            msg_id: msgId,
-            output: JSON.stringify(outputObj),
+          const uploaded = await postToolJson(TOOL_LOCAL_UPLOAD_ENDPOINT, {
+            device_id: CLIENT_PARAMS.device_id,
+            command_result: { id: cmdCall.id, code: 1, message: handoffReason },
+            workspace_apply_response: {
+              request_id: inputObj.request_id,
+              status: 'failed',
+              error_code: mapped.calls.length > 0 ? 'DSH_TOOL_HANDOFF' : 'DSH_TOOL_UNAVAILABLE',
+              error_message: handoffReason,
+              operation_results: (Array.isArray(inputObj.operations) ? inputObj.operations : []).map((operation: Record<string, unknown>, operation_index: number) => ({
+                operation_index,
+                ...(typeof operation.path === 'string' ? { path: operation.path } : {}),
+                status: 'failed',
+                error_code: mapped.calls.length > 0 ? 'DSH_TOOL_HANDOFF' : 'DSH_TOOL_UNAVAILABLE',
+                error_message: handoffReason,
+              })),
+              workspace_ready: false,
+            },
+
+
+
           })
-          await postToolJson(TOOL_LOCAL_COMPLETE_ENDPOINT, { msg_id: msgId })
+          if (uploaded?.code !== 0) return localOperationRejected
+          const completed = await postToolJson(TOOL_LOCAL_COMPLETE_ENDPOINT, { msg_id: msgId })
+          if (completed?.code !== 0) return localOperationRejected
         } catch {
-          return
+          return localOperationRejected
+        }
+        if (mapped.calls.length > 0) {
+          onToolCalls(mapped.calls)
+          return true
         }
         seq += 1
         continue
       }
       if (agentFinished !== undefined) {
-        return
+        return localOperationRejected
       }
       seq += 1
       continue
     }
     await new Promise((resolve) => setTimeout(resolve, 180))
   }
+  return localOperationRejected
 }
 
 /**
@@ -1228,19 +1430,37 @@ async function streamOnce(
   absorbSetCookies(response.headers)
 
   let streamDone = false
+  let taskToolCalls: EmulatedToolCall[] = []
+  let localOperationRejected = false
   const responderPromise = isTask
-    ? runToolLocalResponder(uniqueKey, credentials, () => streamDone, options.signal).catch(() => {})
+    ? runToolLocalResponder(uniqueKey, credentials, () => streamDone, options.signal, options.declaredTools ?? [], (calls) => { taskToolCalls = calls })
+        .then((rejected) => { localOperationRejected = rejected })
+        .catch(() => {})
     : Promise.resolve()
 
+  let result: DoubaoChatResult | undefined
+  let streamError: unknown
   try {
-    const result = await consumeStream(response, options.callbacks, {
+    result = await consumeStream(response, options.callbacks, {
       harvestNotifyText: isTask,
     })
-    return result
+  } catch (error) {
+    streamError = error
   } finally {
     streamDone = true
     await responderPromise
   }
+  if (localOperationRejected && taskToolCalls.length === 0) {
+    throw new DoubaoUpstreamError(
+      'LOCAL_EXECUTION_UNAVAILABLE: Doubao task mode requested a local operation, but this plugin did not execute it through DSH tools.',
+      undefined,
+      false,
+      { kind: 'upstream' },
+    )
+  }
+  if (streamError !== undefined) throw streamError
+  if (result === undefined) throw new Error('Doubao stream ended without a result')
+  return taskToolCalls.length > 0 ? { ...result, toolCalls: taskToolCalls } : result
 }
 
 /**

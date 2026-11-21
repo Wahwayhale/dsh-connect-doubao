@@ -133,10 +133,8 @@ translation layer that could only be wrong.
 | `5` | 豆包 2.1 Pro | `工作任务` | 工作任务 | ✅ |
 | `9` | 自动 | `工作任务` | 工作任务 | ✅ |
 
-The three `工作任务` rows switch the request into task mode (`mode_id: "3"`,
-`agent_mode: 1`, `need_deep_think: 10001`) and are answered by the plugin's own
-`tool_local` responder — see 「工作任务」 mode below. They are the entries that spend
-the **paid membership quota**.
+The `工作任务` rows use Doubao's separate local runtime. The plugin answers that runtime's own workspace bookkeeping itself (session dirs, board, trajectory log) and bridges the real filesystem commands it dispatches onto the DSH tools declared by the current request, so DSH performs the actual work under the session's permissions. Operations the bridge cannot map are reported as failures rather than claimed as done. Model keys are sent upstream but are not validated, so the service's actual model choice cannot be independently guaranteed.
+
 
 **Reasoning effort**: low = `3`, mid = `4`, high = `5`. These values were read by
 **diffing the configuration the client re-serialises when the level is switched**,
@@ -182,12 +180,14 @@ DSH (pi-ai provider)
    (`bot_id` + `reasoning_effort`).
 3. **Streaming** — upstream's three-line frames are parsed into pi-ai's event stream;
    tool calls, compaction and permissions stay Harness-owned.
-4. **Task mode** — for the `工作任务` entries, `doubao-upstream` additionally runs a
-   `tool_local` responder: it polls the server's `msg/ack` **one `msg_id` at a time**
-   (a batch containing a not-yet-generated seq fails the whole batch with
-   `710010702`), answers `cmd_call` via `upload_command_result` + `msg/complete`, and
-   stops on `agent_finished`. Incremental `CHUNK_DELTA` frames are split into
-   thinking/answer by their block id.
+4. **Workspace tools** — Doubao ignores the OpenAI `tools` field. The plugin accepts
+   only functions declared by the current DSH request and returns standard `tool_calls`;
+   DSH performs the actual operation in the active workspace under session permissions.
+   Doubao work-task local commands are not a DSH tool bridge, so they are rejected
+   instead of being reported as successful. Incremental frames remain parsed by block id.
+   The DSH host records tool calls and results. File-change counts come only from returned
+   DSH diff data; missing statistics are never estimated. Only upstream-provided
+   `reasoning_content` is forwarded when present; hidden reasoning is not guaranteed.
 5. **Read-only routes** — `/plugins/dsh-connect-doubao/quota` and `/catalog` serve quota
    and catalog from an **explicit allow-list** (no upstream field is passed through),
    and refuse non-loopback origins.
@@ -318,15 +318,10 @@ npm run check       # all of the above
 2. **`'4'` (豆包 2.1 Turbo, "即将下线") is unverified** — and withheld from the
    picker. The other 5 entries were exercised in real conversations, including both
    task-mode models.
-3. **Task mode works, but whether a turn is billed depends on what it did.** In task
-   mode the server hands each turn to `Agent-GeneralTask`, and the plugin runs a
-   `tool_local` responder alongside (`msg/ack` → `upload_command_result` →
-   `msg/complete`) so the local workspace commands complete instead of failing with
-   `710010702`. **For a plain-text turn that triggers no local tool, the server marks
-   the round `general_agent_task_mode: "simple"` with `mode_downgrade_reason: "success"`,
-   and the activity-grant `usedAmount` does not move** (measured: unchanged at 782
-   across a call — i.e. downgraded, not billed). To actually spend the paid quota, the
-   turn has to do multi-step tool/document work. This is a measurement, not a promise.
+3. **Doubao task mode is not DSH workspace execution.** Its local commands require a
+   separate runtime; this plugin does not claim that an operation succeeded unless DSH
+   executed it through the current request's declared tools. Tool-bearing task-mode
+   requests are rejected; use a chat-mode entry for DSH workspace file operations.
 4. **There is no response-side field that proves "the server really used that model".**
    The upstream SSE carries an opaque marker in `message.ext` (observed as `38`); it is
    **not** a version number or a tier, and ByteDance has never published its meaning.

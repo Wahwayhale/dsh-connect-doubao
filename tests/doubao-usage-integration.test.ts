@@ -7,6 +7,14 @@ import { createDoubaoShim, type DoubaoShim } from '../src/doubao-shim.ts'
 import { DoubaoStatsTracker } from '../src/doubao-stats.ts'
 import { TOOL_FENCE_LANGUAGE } from '../src/doubao-tools.ts'
 
+
+// These protocol tests use fixture credentials and must never probe this
+// machine's Doubao processes, drives, or Chromium profile.
+vi.mock('../src/doubao-profile.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/doubao-profile.ts')>()
+  return { ...actual, listDoubaoProfiles: () => [], findDoubaoUserDataDir: () => undefined }
+})
+
 const realFetch = globalThis.fetch
 
 const credentials: DoubaoCredentials = {
@@ -310,6 +318,76 @@ describe('Doubao session stats and token usage end-to-end integration', () => {
     expect(reset.byModel).toEqual([])
     expect(reset.sessions).toEqual([])
     expect(reset.lastTurn).toBeNull()
+  })
+
+  it('replays DSH tool execution results and diff statistics to the upstream prompt', async () => {
+    const shim = createDoubaoShim({ resolveCredentials: () => credentials, toolEmulation: () => true })
+    shims.push(shim)
+    const base = await shim.baseUrl()
+    let upstreamText = ''
+    const extractText = (value: unknown): string => {
+      if (typeof value === 'string') return value
+      if (Array.isArray(value)) return value.map(extractText).join('\n')
+      if (value !== null && typeof value === 'object') {
+        return Object.values(value as Record<string, unknown>).map(extractText).join('\n')
+      }
+      return ''
+    }
+    stubUpstreamFetch((_url, init) => {
+      if (typeof init?.body === 'string') upstreamText = extractText(JSON.parse(init.body) as unknown)
+      return sseResponse([
+        frame('SSE_ACK', { ack_client_meta: { conversation_id: 'conv-tool-result' } }),
+        frame('STREAM_CHUNK', {
+          block_type: 10000,
+          block_id: 'answer-tool-result',
+          parent_id: '',
+          content: { text_block: { text: '已依据工具返回的 diff 汇总：新增 2 行，删除 1 行。' } },
+        }),
+        frame('SSE_REPLY_END', { end_type: 1 }),
+      ])
+    })
+
+    const response = await realFetch(base + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + shim.token(), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: '0',
+        stream: false,
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'edit_file',
+            description: 'Edit a file in the active DSH workspace',
+            parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+          },
+        }],
+        messages: [
+          { role: 'user', content: '修改 src/example.ts 并报告真实 diff。' },
+          {
+            role: 'assistant',
+            content: '正在读取并修改文件。',
+            tool_calls: [{
+              id: 'call-edit-1',
+              type: 'function',
+              function: { name: 'edit_file', arguments: JSON.stringify({ path: 'src/example.ts' }) },
+            }],
+          },
+          {
+            role: 'tool',
+            tool_call_id: 'call-edit-1',
+            name: 'edit_file',
+            content: JSON.stringify({ status: 'success', diff: { addedLines: 2, deletedLines: 1 } }),
+          },
+          { role: 'user', content: '根据工具结果总结改动。' },
+        ],
+      }),
+    })
+    expect(response.status).toBe(200)
+    const payload = await response.json() as { choices: Array<{ message: { content: string } }> }
+    expect(payload.choices[0]?.message.content).toContain('新增 2 行，删除 1 行')
+    expect(upstreamText).toContain('[tool result] edit_file:')
+    expect(upstreamText).toContain('"addedLines":2')
+    expect(upstreamText).toContain('"deletedLines":1')
   })
 
   it('accounts for emulated tool calls and tools in both streaming and non-streaming responses and records failures', async () => {

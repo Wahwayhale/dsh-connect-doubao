@@ -74,6 +74,36 @@ afterEach(async () => {
   }
 })
 
+describe('DSH workspace tool routing', () => {
+  it('forwards DSH tools into work-task mode instead of refusing the turn', async () => {
+    const realFetch = globalThis.fetch
+    let chatCalls = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.startsWith('http://127.0.0.1:')) return realFetch(input, init)
+      if (url.includes('/chat/completion')) chatCalls += 1
+      return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }))
+    const shim = createDoubaoShim({ resolveCredentials: () => credentials, toolEmulation: () => true })
+    shims.push(shim)
+    const base = await shim.baseUrl()
+    const response = await realFetch(base + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${shim.token()}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: '5',
+        stream: false,
+        tools: [{ type: 'function', function: { name: 'read_file', parameters: { type: 'object' } } }],
+        messages: [{ role: 'user', content: '读取 src/app.ts' }],
+      }),
+    })
+    // A 「工作任务」 turn is no longer refused: its local commands are bridged
+    // onto the tools this request declared, so the turn must reach upstream.
+    expect(response.status).not.toBe(422)
+    expect(chatCalls).toBe(1)
+  })
+})
+
 describe('image generation regressions', () => {
   it('forces deepThink false and ignores reasoning_effort for image-gen and prefixed ids', () => {
     for (const model of [DOUBAO_IMAGE_MODEL_ID, `doubao/${DOUBAO_IMAGE_MODEL_ID}`, 'DOUBAO/image-gen']) {

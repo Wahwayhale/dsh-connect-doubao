@@ -12,6 +12,7 @@ import {
   dedupeCalls,
   parseToolCalls,
   toolResultAsText,
+  taskWorkspaceOperationsToDshCalls,
   TOOL_FENCE_LANGUAGE,
 } from '../src/doubao-tools.ts'
 
@@ -19,6 +20,10 @@ const tools = [
   { type: 'function', function: { name: 'read_file', description: '读取文件', parameters: { type: 'object', properties: { path: { type: 'string' } } } } },
   { type: 'function', function: { name: 'write_file', description: '写入文件' } },
 ]
+const bashTool = [{
+  type: 'function',
+  function: { name: 'bash', parameters: { type: 'object', properties: { cmd: { type: 'string' } }, required: ['cmd'] } },
+}]
 
 describe('buildToolContract', () => {
   it('names every tool and the fence language', () => {
@@ -50,7 +55,11 @@ describe('buildToolContract', () => {
     const contract = buildToolContract(tools)
     expect(contract).toContain('严禁')
     expect(contract).toContain('[tool result]')
-    expect(contract).toContain('第一条回复必须是一个工具调用')
+    expect(contract).toContain('一句话告诉用户当前要做的步骤')
+    expect(contract).toContain('不输出隐藏的逐步思维链')
+    expect(contract).toContain('必须引用工具结果中的 diff 或统计')
+    expect(contract).toContain('工具未提供')
+    expect(contract).toContain('不能估算')
   })
 
   it('requires a re-read after each edit', () => {
@@ -63,7 +72,7 @@ describe('buildToolContract', () => {
 describe('parseToolCalls', () => {
   it('extracts one call and removes the fence from the text', () => {
     const reply = '我先读一下文件。\n\n```doubao-tool\n{"name":"read_file","arguments":{"path":"a.txt"}}\n```\n'
-    const out = parseToolCalls(reply)
+    const out = parseToolCalls(reply, tools)
     expect(out.calls).toHaveLength(1)
     expect(out.calls[0].name).toBe('read_file')
     expect(out.calls[0].arguments).toBe('{"path":"a.txt"}')
@@ -72,30 +81,32 @@ describe('parseToolCalls', () => {
   })
 
   it('keeps normal prose untouched', () => {
-    const out = parseToolCalls('这就是答案，没有工具调用。')
+    const out = parseToolCalls('这就是答案，没有工具调用。', tools)
     expect(out.calls).toEqual([])
     expect(out.text).toBe('这就是答案，没有工具调用。')
   })
 
   it('drops a malformed fence but keeps the text', () => {
-    const out = parseToolCalls('结论如下\n```doubao-tool\n{name: 缺引号}\n```')
+    const out = parseToolCalls('结论如下\n```doubao-tool\n{name: 缺引号}\n```', tools)
     expect(out.calls).toEqual([])
-    expect(out.text).toBe('结论如下')
+    expect(out.text).toContain('结论如下')
+    expect(out.text).toContain('工具调用未执行')
   })
 
   it('accepts the alternate field spellings models drift to', () => {
-    expect(parseToolCalls('```doubao-tool\n{"tool":"bash","params":{"cmd":"ls"}}\n```').calls[0].name).toBe('bash')
-    expect(parseToolCalls('```doubao-tool\n{"name":"bash","arguments":"{\\"cmd\\":\\"ls\\"}"}\n```').calls[0].arguments).toBe('{"cmd":"ls"}')
+    expect(parseToolCalls('```doubao-tool\n{"tool":"bash","params":{"cmd":"ls"}}\n```', bashTool).calls[0].name).toBe('bash')
+    expect(parseToolCalls('```doubao-tool\n{"name":"bash","arguments":"{\\"cmd\\":\\"ls\\"}"}\n```', bashTool).calls[0].arguments).toBe('{"cmd":"ls"}')
   })
 
   it('rejects a call whose arguments are not an object', () => {
-    expect(parseToolCalls('```doubao-tool\n{"name":"bash","arguments":"ls -la"}\n```').calls).toEqual([])
+    expect(parseToolCalls('```doubao-tool\n{"name":"bash","arguments":"ls -la"}\n```', bashTool).calls).toEqual([])
   })
 
   it('reads several fences and dedupes identical calls', () => {
     const one = '{"name":"write_file","arguments":{"path":"a","content":"1"}}'
     const out = parseToolCalls(
-      '```doubao-tool\n' + one + '\n```\n中间\n```doubao-tool\n' + one + '\n```\n结尾\n```doubao-tool\n{"name":"read_file","arguments":{"path":"b"}}\n```',
+      '```doubao-tool\n' + one + '\n```\n中间\n```doubao-tool\n' + one + '\n```\n结尾\n```\n```doubao-tool\n{"name":"read_file","arguments":{"path":"b"}}\n```',
+      tools,
     )
     expect(out.calls.map((c) => c.name)).toEqual(['write_file', 'read_file'])
     expect(out.text).toContain('中间')
@@ -104,23 +115,90 @@ describe('parseToolCalls', () => {
 
   it('extracts array of tool calls, OpenAI function wrapper, and json fence fallback', () => {
     const arrReply = '```doubao-tool\n[{"name":"read_file","arguments":{"path":"a.ts"}},{"type":"function","function":{"name":"write_file","arguments":{"path":"b.ts"}}}]\n```'
-    const arrOut = parseToolCalls(arrReply)
+    const arrOut = parseToolCalls(arrReply, tools)
     expect(arrOut.calls.map((c) => c.name)).toEqual(['read_file', 'write_file'])
 
     const jsonReply = '??\n```json\n{"name":"read_file","arguments":{"path":"c.ts"}}\n```'
-    const jsonOut = parseToolCalls(jsonReply)
+    const jsonOut = parseToolCalls(jsonReply, tools)
     expect(jsonOut.calls).toHaveLength(1)
     expect(jsonOut.calls[0].name).toBe('read_file')
     expect(jsonOut.text).toBe('??')
   })
 
+  it('filters undeclared names and arguments with the wrong JSON type', () => {
+    const reply = '```doubao-tool\n' + JSON.stringify([
+      { name: 'bash', arguments: { cmd: 'echo hi' } },
+      { name: 'read_file', arguments: { path: 42 } },
+      { name: 'read_file', arguments: { path: 'src/index.ts' } },
+    ]) + '\n```'
+    const out = parseToolCalls(reply, tools)
+    expect(out.calls.map((call) => call.name)).toEqual(['read_file'])
+    expect(out.calls[0].arguments).toBe('{"path":"src/index.ts"}')
+    expect(out.rejectedCalls).toBe(true)
+    expect(out.text).toContain('工具调用未执行')
+  })
+
+  it("rejects a function absent from this request's tools", () => {
+    const reply = '```doubao-tool\n' + JSON.stringify({ name: 'bash', arguments: { cmd: 'echo no' } }) + '\n```'
+    const out = parseToolCalls(reply, tools)
+    expect(out.calls).toEqual([])
+    expect(out.rejectedCalls).toBe(true)
+  })
+
   it('gives each call a distinct id', () => {
     const body = (n: string) => '```doubao-tool\n' + JSON.stringify({ name: n, arguments: {} }) + '\n```'
-    const out = parseToolCalls(`${body('a')}\n${body('b')}`)
+    const out = parseToolCalls(`${body('a')}\n${body('b')}`, [
+      { type: 'function', function: { name: 'a' } },
+      { type: 'function', function: { name: 'b' } },
+    ])
     expect(new Set(out.calls.map((c) => c.id)).size).toBe(2)
   })
 })
 
+describe('taskWorkspaceOperationsToDshCalls', () => {
+  it('maps a native write only to a declared compatible DSH write function', () => {
+    const allowed = [{ type: 'function', function: { name: 'write', parameters: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'], additionalProperties: false } } }]
+    const result = taskWorkspaceOperationsToDshCalls({ operations: [{ type: 'write_file', path: 'src/example.ts', mode: 'replace', content: 'export {}' }] }, allowed)
+    expect(result.reason).toBeUndefined()
+    expect(result.calls).toHaveLength(1)
+    expect(result.calls[0]?.name).toBe('write')
+    expect(JSON.parse(result.calls[0]!.arguments)).toEqual({ file_path: 'src/example.ts', content: 'export {}' })
+  })
+  it('routes task operations into run_code when that is the only declared tool', () => {
+    // PTC turns declare exactly one tool; without this the whole turn is refused.
+    const allowed = [{ type: 'function', function: { name: 'run_code', parameters: { type: 'object', properties: { code: { type: 'string' }, description: { type: 'string' } } } } }]
+    const init = taskWorkspaceOperationsToDshCalls({
+      operations: [
+        { type: 'ensure_dir', path: '.sessions/s1/memory' },
+        { type: 'ensure_file', path: '.sessions/s1/board.md' },
+      ],
+    }, allowed)
+    expect(init.reason).toBeUndefined()
+    expect(init.calls).toHaveLength(1)
+    expect(init.calls[0]?.name).toBe('run_code')
+    const initArgs = JSON.parse(init.calls[0]!.arguments)
+    expect(initArgs.code).toContain('mkdir')
+    expect(initArgs.code).toContain('.sessions/s1/memory')
+
+    // mode:"append" is how a task turn appends to its own trajectory file; it
+    // must become appendFile, never writeFile, or the log is truncated.
+    const append = taskWorkspaceOperationsToDshCalls({
+      operations: [{ type: 'write_file', path: '.sessions/s1/trajectory.jsonl', mode: 'append', content: '{"role":"assistant"}' }],
+    }, allowed)
+    expect(append.calls).toHaveLength(1)
+    const appendCode = JSON.parse(append.calls[0]!.arguments).code
+    expect(appendCode).toContain('appendFile')
+    expect(appendCode).not.toContain('writeFile(')
+
+    // The same path guard still applies inside the generated program.
+    expect(taskWorkspaceOperationsToDshCalls({ operations: [{ type: 'write_file', path: '../escape', mode: 'replace', content: 'x' }] }, allowed).calls).toEqual([])
+  })
+
+  it('rejects traversal paths, undeclared tools, and unknown operations', () => {
+    expect(taskWorkspaceOperationsToDshCalls({ operations: [{ type: 'write_file', path: '../outside', mode: 'replace', content: 'x' }] }, []).calls).toEqual([])
+    expect(taskWorkspaceOperationsToDshCalls({ operations: [{ type: 'run_shell', command: 'x' }] }, []).calls).toEqual([])
+  })
+})
 describe('dedupeCalls', () => {
   it('keeps first occurrence per name+arguments', () => {
     const calls = [
@@ -133,6 +211,11 @@ describe('dedupeCalls', () => {
 })
 
 describe('toolResultAsText', () => {
+  it('preserves tool-reported file diff counts in the recorded result', () => {
+    const result = { status: 'success', diff: { addedLines: 2, deletedLines: 1 } }
+    expect(toolResultAsText('edit_file', result)).toBe('[tool result] edit_file: ' + JSON.stringify(result))
+  })
+
   it('uses the prefix the contract promises', () => {
     expect(toolResultAsText('read_file', '内容').startsWith('[tool result] read_file:')).toBe(true)
     expect(toolResultAsText(undefined, 'ok')).toBe('[tool result] ok')

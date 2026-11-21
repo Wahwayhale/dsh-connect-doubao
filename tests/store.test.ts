@@ -138,10 +138,10 @@ describe('withStoredSettings', () => {
     expect(() => { writeStoredSetting('profileDir', 42, file) }).toThrow('invalid value')
   })
 
-  it('defaults to an empty model list, tools off and automatic discovery', () => {
+  it('defaults to an empty model list, tools on and automatic discovery', () => {
     expect(withStoredSettings(undefined, file)).toEqual({
       enabledModelIds: [],
-      toolEmulation: false,
+      toolEmulation: true,
       profileDir: '',
     })
   })

@@ -342,9 +342,12 @@ export interface DoubaoReasoningOption {
  *   工作任务   → 自动 (9), 2.1 Lite (seed-lite-7b), 2.1 Pro (5), Turbo (3)
  *
  * The 「工作任务」 group (`seed-lite-7b`, `5`, `9`) runs through `Agent-GeneralTask`
- * (`mode_id: "3"`, `agent_mode: 1`) and is accompanied by an HTTP `tool_local`
- * workspace responder (`msg/ack` -> `upload_command_result` -> `msg/complete`)
- * so external turns complete without `710010702`.
+ * (`mode_id: "3"`, `agent_mode: 1`) and requires Doubao's separate local runtime.
+ * The plugin satisfies that runtime's own bookkeeping (session dirs, board,
+ * trajectory log) locally and bridges the real filesystem commands it dispatches
+ * onto the DSH tools this request declared, so DSH executes them under the
+ * session's permissions. Unmappable operations fail explicitly instead of being
+ * reported complete.
  *
  * MEASURED, 2026-10-22: `model_item_key` is forwarded verbatim (the server stores
  * it on the message), but in 对话 mode it does NOT change what answers —

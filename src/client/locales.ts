@@ -70,10 +70,10 @@ export const zh = {
   'models.levelUnverified': '客户端菜单声明，尚未在真实请求中验证',
   'models.rateNote': '倍率来自豆包客户端菜单，仅作展示；本插件不参与计费，也无法核对实际扣费',
 
-  'tools.title': '实验性：工具调用',
+  'tools.title': '工作区工具调用',
   'tools.toggle': '让豆包驱动本地工具（读写文件、执行命令）',
-  'tools.note': '豆包的接口没有函数调用通道（声明的 tools 会被静默忽略），此开关改用提示词模拟：把工具清单写进提示词，再把回复里的围栏解析回标准 tool_calls。实测约 11.5 秒/轮，复杂任务可能退化，故默认关闭。',
-  'tools.warning': '开启后豆包可以读写这台机器上的文件。请确认你信任当前会话的权限范围。',
+  'tools.note': '豆包接口忽略 OpenAI tools；插件把本次 DSH 工具列表写进提示词，只接受列表内且参数符合常用 schema 的调用。实际读写仍由 DSH 在当前工作区按会话权限执行。默认开启。「工作任务」模型的本地通道暂不支持此方式，请用「对话」模式模型做文件操作。',
+  'tools.warning': '开启后，当前 DSH 请求已声明且会话获准的工具可由豆包调用。先核对 DSH 当前工作区和工具权限；本插件不会绕过宿主授权。',
   'tools.enabled': '已开启',
   'tools.disabled': '已关闭',
 
@@ -181,10 +181,10 @@ export const en: Record<DoubaoCardKey, string> = {
   'models.levelUnverified': 'Declared by the client menu, not yet verified on a request',
   'models.rateNote': 'Multipliers come from the Doubao client menu and are display-only; this plugin does not bill and cannot verify the actual charge',
 
-  'tools.title': 'Experimental: tool calling',
+  'tools.title': 'Workspace tool calling',
   'tools.toggle': 'Let Doubao drive local tools (read/write files, run commands)',
-  'tools.note': 'Doubao\'s endpoint has no function-calling channel — a declared `tools` array is silently ignored — so this switch simulates it: the tool list goes into the prompt and the fenced block in the reply is parsed back into standard tool_calls. Measured ~11.5s per round; can degrade on complex tasks, hence off by default.',
-  'tools.warning': 'When on, Doubao can read and write files on this machine. Make sure you trust the permission scope of the current session.',
+  'tools.note': 'Doubao ignores the OpenAI tools field. This plugin places only the current DSH request tool list in the prompt, then accepts calls only for listed names with matching common argument-schema constraints. DSH still performs the operation in the current workspace under its session permissions; this plugin does not edit files itself. Enabled by default. Doubao work-task models cannot use this DSH tool loop; choose a chat-mode model for file work.',
+  'tools.warning': 'When on, Doubao can call tools declared for this DSH request. Check the current workspace and session permissions first; this plugin does not bypass Harness authorization.',
   'tools.enabled': 'On',
   'tools.disabled': 'Off',
 

@@ -8,6 +8,13 @@ import {
   streamChat,
 } from '../src/doubao-upstream.ts'
 
+// These protocol tests use fixture credentials and must never probe this
+// machine's Doubao processes, drives, or Chromium profile.
+vi.mock('../src/doubao-profile.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/doubao-profile.ts')>()
+  return { ...actual, listDoubaoProfiles: () => [], findDoubaoUserDataDir: () => undefined }
+})
+
 const credentials: DoubaoCredentials = {
   ok: true,
   header: REQUIRED_COOKIE_NAMES.map((name) => `${name}=test`).join('; '),
@@ -298,6 +305,44 @@ describe('summary CoT, thinking_block titles, and id-less CHUNK_DELTA extraction
     expect(result.thinking).toBe(true)
     expect(result.reasoningText).toBe('haha')
     expect(result.text).toBe('done')
+  })
+
+  it('keeps task-mode plain text from STREAM_MSG_NOTIFY in the result and callback', async () => {
+    const deltas: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string | URL) => {
+        const url = String(input)
+        if (url.includes('/tool_local/msg/ack')) {
+          return new Response(
+            JSON.stringify({ code: 0, data: { msgs: [{ body: { agent_finished: {} } }] } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          )
+        }
+        return sseResponse([
+          frame('SSE_ACK', { ack_client_meta: { conversation_id: 'conv-task-text' } }),
+          frame('STREAM_MSG_NOTIFY', {
+            content: {
+              content_block: [{
+                block_type: 10000,
+                block_id: 'task-answer',
+                parent_id: '',
+                content: { text_block: { text: '任务模式的完整答复' } },
+              }],
+            },
+          }),
+          frame('SSE_REPLY_END', {}),
+        ])
+      }),
+    )
+
+    const result = await streamChat('do task', {
+      credentials,
+      taskMode: true,
+      callbacks: { onText: (delta) => deltas.push(delta) },
+    })
+    expect(result.text).toBe('任务模式的完整答复')
+    expect(deltas.join('')).toBe('任务模式的完整答复')
   })
 })
 

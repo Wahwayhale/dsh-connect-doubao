@@ -65,10 +65,11 @@ export const DISCOVERY_TTL_MS = 10 * 60 * 1000
  * The app prefixes them itself (「工作任务 Pro」, 「工作任务 Auto」), which is a
  * gift: the mode a model belongs to is legible straight out of the cache.
  *
- * The prefix no longer means "hidden": since 0.4.1 these entries are offered
- * with `taskMode: true` and are answered by the `tool_local` responder, so they
- * complete instead of failing with 710010702. Only entries listed in
- * `DOUBAO_UNAVAILABLE_MODELS` are withheld.
+ * The prefix no longer means "hidden": these entries remain visible in the catalog.
+ * Their separate local-command runtime is bridged onto the DSH tools the request
+ * declared, so DSH performs the real work; unmappable operations fail explicitly
+ * instead of being reported as complete.
+ * Only entries listed in `DOUBAO_UNAVAILABLE_MODELS` are withheld.
  */
 export const TASK_MODE_PREFIX = '工作任务'
 

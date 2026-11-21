@@ -87,8 +87,8 @@ describe('defaults stay "not yet configured" rather than "ticked nothing"', () =
   })
 
   it('enables tool emulation ON by default', () => {
-    // Opt-in on purpose: the switch lets a model touch the local filesystem
-    // through prompt-emulated tool calls, so a fresh install must not have it.
+    // Fresh installs expose only DSH-declared tools; the Harness remains the
+    // authority for workspace scope and permissions.
     const meta = (Config as any).dict[TOOL_EMULATION_FIELD].meta
     expect(meta.default).toBe(true)
   })

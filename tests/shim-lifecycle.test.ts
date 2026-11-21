@@ -59,18 +59,19 @@ describe('request lifecycle', () => {
     lifecycle.release()
   })
 
-  it('keeps waiting while upstream keeps talking', async () => {
+  it('keeps waiting while upstream keeps talking', () => {
+    vi.useFakeTimers()
     const { res } = fakeRes()
     const lifecycle = createRequestLifecycle(res, { idleMs: 20 })
-    // A delta every 5ms is proof of life; without the reset this would have been
-    // aborted at the first 20ms boundary.
+    // A delta every 5ms is proof of life; fake timers keep this assertion
+    // independent of the host test runner's scheduling latency.
     for (let i = 0; i < 4; i += 1) {
-      await sleep(5)
+      vi.advanceTimersByTime(5)
       expect(lifecycle.signal.aborted).toBe(false)
       lifecycle.onActivity()
     }
     lifecycle.release()
-    await sleep(30)
+    vi.advanceTimersByTime(30)
     // release disarms: nothing fires after the request is over.
     expect(lifecycle.signal.aborted).toBe(false)
   })

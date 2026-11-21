@@ -18,7 +18,10 @@
  * expected value from the same constant it is checking cannot fail.
  */
 import { afterEach, describe, expect, it } from 'vitest'
-import { assembleReplyText, buildChatBody } from '../src/doubao-upstream.ts'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { applyTaskBookkeeping, assembleReplyText, buildChatBody, isTaskBookkeeping, unsupportedLocalTaskResult } from '../src/doubao-upstream.ts'
 import { DOUBAO_MODELS, doubaoCatalogEntries, findReasoningLevel, levelIdOf } from '../src/doubao-catalog.ts'
 
 /** A body for the default chat turn. */
@@ -91,6 +94,66 @@ describe('chat mode is what the desktop client actually sends', () => {
 describe('task mode stays opt-in and keeps its own shape', () => {
   it('is off by default', () => {
     expect(body().option.agent_mode).toBe(2)
+  })
+
+  it('recognises every runtime bookkeeping command, not a fixed name list', () => {
+    // These all appeared in real turns. A name list missed write_workspace_*,
+    // which redelivered the same command forever instead of finishing the turn.
+    const sessions = { operations: [{ type: 'write_file', path: '.sessions/s1/board.md', mode: 'replace', content: 'x' }] }
+    expect(isTaskBookkeeping('init_agent_workspace_1', sessions)).toBe(true)
+    expect(isTaskBookkeeping('append_workspace_trajectory_memory_1', sessions)).toBe(true)
+    expect(isTaskBookkeeping('write_workspace_board_1', sessions)).toBe(true)
+    expect(isTaskBookkeeping('write_workspace_assignment_main_1', sessions)).toBe(true)
+    expect(isTaskBookkeeping('some_future_workspace_thing_1', sessions)).toBe(true)
+
+    // Real workspace work is never bookkeeping — it must reach the DSH bridge.
+    const real = { operations: [{ type: 'write_file', path: 'src/app.ts', mode: 'replace', content: 'x' }] }
+    expect(isTaskBookkeeping('write_workspace_board_1', real)).toBe(false)
+    // A path that merely starts with the letters is not inside the prefix.
+    const sneaky = { operations: [{ type: 'write_file', path: '.sessions-evil/x.md', mode: 'replace', content: 'x' }] }
+    expect(isTaskBookkeeping('init_agent_workspace_1', sneaky)).toBe(false)
+  })
+
+  it('performs the task runtime bookkeeping itself and reports it done', async () => {
+    // init_agent_workspace / append_workspace_trajectory_memory are the runtime's
+    // own bookkeeping. Handing them to DSH made the runtime answer "workspace not
+    // ready" and re-dispatch forever; the plugin must satisfy them locally.
+    const root = mkdtempSync(join(tmpdir(), 'dsh-bookkeeping-'))
+    try {
+      const init = await applyTaskBookkeeping({
+        request_id: 'r1',
+        operations: [
+          { type: 'ensure_dir', path: '.sessions/s1/memory' },
+          { type: 'ensure_file', path: '.sessions/s1/board.md' },
+        ],
+      }, root)
+      expect(init.ok).toBe(true)
+      expect(existsSync(join(root, '.sessions/s1/board.md'))).toBe(true)
+
+      const append = await applyTaskBookkeeping({
+        request_id: 'r2',
+        operations: [{ type: 'write_file', path: '.sessions/s1/trajectory.jsonl', mode: 'append', content: '{"role":"assistant"}' }],
+      }, root)
+      expect(append.ok).toBe(true)
+      expect(readFileSync(join(root, '.sessions/s1/trajectory.jsonl'), 'utf8')).toBe('{"role":"assistant"}')
+
+      // A traversal path must fail rather than escape the workspace.
+      const escape = await applyTaskBookkeeping({ operations: [{ type: 'ensure_dir', path: '../outside' }] }, root)
+      expect(escape.ok).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports unsupported local operations as errors, never success', () => {
+    const result = unsupportedLocalTaskResult({
+      request_id: 'r1',
+      operations: [{ id: 'op1', type: 'write', path: 'src/app.ts' }],
+    })
+    const results = result.results as Array<Record<string, unknown>>
+    expect(result.status).toBe('error')
+    expect(result.error_code).toBe('LOCAL_EXECUTION_UNAVAILABLE')
+    expect(results[0]?.status).toBe('error')
   })
 
   it('flips to agent_mode 1 with the local-PC runtime when asked', () => {
