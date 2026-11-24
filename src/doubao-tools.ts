@@ -43,12 +43,20 @@ export interface EmulatedToolCall {
 /** The fence the model is told to use, and that we parse back. */
 export const TOOL_FENCE_LANGUAGE = 'doubao-tool'
 
+/** Switch to compact numbered menu automatically once declared tools exceed this count. */
+export const COMPACT_TOOL_MENU_THRESHOLD = 15
+
+/** How tool definitions are serialized into the prompt. */
+export type ToolRoutingMode = 'auto' | 'fence' | 'menu'
+
 const FENCE_RE = new RegExp(
   `^\\s*\`\`\`\\s*${TOOL_FENCE_LANGUAGE}\\s*\\r?\\n([\\s\\S]*?)\\r?\\n\\s*\`\`\`\\s*`,
   'm',
 )
 
 const JSON_FENCE_RE = /(?:^|\r?\n)\s*```\s*json\s*\r?\n([\s\S]*?)\r?\n\s*```\s*/gi
+
+const INDEXED_CALL_RE = /^[ \t]*`?@[ \t]*(\d+)[ \t]*\r?\n?[ \t]*(\{)/gm
 
 /**
  * Render the tool contract appended to the prompt.
@@ -111,6 +119,146 @@ export function buildToolContract(tools: readonly InboundTool[]): string {
   ].join('\n')
 }
 
+function describeToolForMenu(tool: InboundTool): { name: string; hint: string; desc: string } {
+  const fn = tool.function
+  const params = isJsonObject(fn?.parameters) ? fn.parameters : undefined
+  const props = params !== undefined && isJsonObject(params.properties) ? Object.keys(params.properties) : []
+  const req = params !== undefined && Array.isArray(params.required)
+    ? params.required.filter((key): key is string => typeof key === 'string')
+    : []
+  const reqSet = new Set(req)
+  const opt = props.filter((key) => !reqSet.has(key))
+  const parts: string[] = []
+  if (req.length > 0) parts.push(`必填:${req.join(',')}`)
+  if (opt.length > 0) parts.push(`可选:${opt.slice(0, 6).join(',')}${opt.length > 6 ? ',…' : ''}`)
+  return {
+    name: String(fn?.name ?? ''),
+    hint: parts.length > 0 ? parts.join('; ') : '无参数',
+    desc: String(fn?.description ?? '').replace(/\s+/g, ' ').trim().slice(0, 60),
+  }
+}
+
+/**
+ * Render a compact numbered tool menu (`#1 name — desc (params)`) for large
+ * tool catalogs (e.g. 70 DSH tools) where full JSON schemas cause the model to
+ * refuse local execution or invent tool names.
+ */
+export function buildCompactToolContract(tools: readonly InboundTool[]): string {
+  const usable = tools.filter((tool) => tool.type === 'function' && typeof tool.function?.name === 'string' && tool.function.name !== '')
+  if (usable.length === 0) return ''
+  const lines = usable.map((tool, index) => {
+    const info = describeToolForMenu(tool)
+    return `#${index + 1} ${info.name} — ${info.desc}（${info.hint}）`
+  })
+  return `\n\n可用的工具（只能用下面的编号，一次一个）：\n${lines.join('\n')}\n\n调用格式：单独一行写 \`@<编号> {"参数名":"值"}\`（无参数写 \`@<编号> {}\`），JSON 必须严格合法、不要包在代码块里。\n规则：工具由宿主执行，结果会以 [tool result] 回传；严禁在收到 [tool result] 前声称已完成或让用户手工执行。`
+}
+
+/** Resolve the prompt tool-routing strategy from an override or `DSH_DOUBAO_TOOL_ROUTING`. */
+export function resolveToolRoutingMode(raw?: string): ToolRoutingMode {
+  const value = (raw ?? process.env.DSH_DOUBAO_TOOL_ROUTING ?? '').trim().toLowerCase()
+  if (value === 'fence' || value === 'menu') return value
+  return 'auto'
+}
+
+/**
+ * Select between the full fenced contract and the compact numbered menu.
+ *
+ * `auto` switches to the compact menu once declared tools exceed
+ * {@link COMPACT_TOOL_MENU_THRESHOLD}.
+ */
+export function buildAdaptiveToolContract(
+  tools: readonly InboundTool[],
+  mode: ToolRoutingMode = resolveToolRoutingMode(),
+): string {
+  const usableCount = tools.filter(
+    (tool) => tool.type === 'function' && typeof tool.function?.name === 'string' && tool.function.name !== '',
+  ).length
+  if (usableCount === 0) return ''
+  if (mode === 'fence') return buildToolContract(tools)
+  if (mode === 'menu') return buildCompactToolContract(tools)
+  return usableCount > COMPACT_TOOL_MENU_THRESHOLD ? buildCompactToolContract(tools) : buildToolContract(tools)
+}
+
+function extractBalancedJsonObject(text: string, start: number): string | undefined {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') {
+      inString = true
+      continue
+    }
+    if (char === '{') depth += 1
+    else if (char === '}') {
+      depth -= 1
+      if (depth === 0) return text.slice(start, index + 1)
+    }
+  }
+  return undefined
+}
+
+function parseIndexedToolCalls(
+  text: string,
+  declaredTools: readonly InboundTool[],
+  makeId: (index: number) => string,
+): { calls: EmulatedToolCall[]; text: string } {
+  const list = declaredTools.filter(
+    (tool) => tool.type === 'function' && typeof tool.function?.name === 'string' && tool.function.name !== '',
+  )
+  if (list.length === 0) return { calls: [], text }
+  INDEXED_CALL_RE.lastIndex = 0
+  const calls: EmulatedToolCall[] = []
+  const seen = new Set<string>()
+  const spans: Array<[number, number]> = []
+  let match: RegExpExecArray | null
+  while ((match = INDEXED_CALL_RE.exec(text)) !== null) {
+    const index = Number(match[1]) - 1
+    if (!Number.isInteger(index) || index < 0 || index >= list.length) continue
+    const jsonStart = match.index + match[0].length - 1
+    const json = extractBalancedJsonObject(text, jsonStart)
+    if (json === undefined) continue
+    let args: unknown
+    try {
+      args = JSON.parse(json)
+    } catch {
+      continue
+    }
+    if (!isJsonObject(args)) continue
+    const name = list[index]!.function!.name!
+    const normalizedArgs = JSON.stringify(args)
+    const dedupeKey = `${name}\u0000${normalizedArgs}`
+    let end = jsonStart + json.length
+    if (match[0].trimStart().startsWith('`') && text[end] === '`') end += 1
+    INDEXED_CALL_RE.lastIndex = end
+    spans.push([match.index, end])
+    if (!seen.has(dedupeKey)) {
+      seen.add(dedupeKey)
+      calls.push({
+        id: makeId(calls.length),
+        name,
+        arguments: normalizedArgs,
+      })
+    }
+  }
+  let visible = text
+  for (let i = spans.length - 1; i >= 0; i -= 1) {
+    const span = spans[i]
+    if (span === undefined) continue
+    visible = visible.slice(0, span[0]) + visible.slice(span[1])
+  }
+  if (calls.length > 0) {
+    visible = visible.replace(/```[a-zA-Z0-9_-]*\s*```/g, '')
+  }
+  return { calls, text: visible.trim() }
+}
+
 /**
  * Split a model reply into tool calls and the text the user should see.
  *
@@ -149,10 +297,20 @@ export function parseToolCalls(
       return ''
     }).trim()
   }
+  if (calls.length > 0) {
+    const cleanText = rejectedCalls
+      ? [rest, '工具调用未执行：调用未在本次 DSH 工具列表中，或参数不符合声明。'].filter(Boolean).join('\n\n')
+      : rest
+    return { calls: dedupeCalls(calls), text: cleanText, rejectedCalls }
+  }
+  const indexed = parseIndexedToolCalls(text, declaredTools, makeId)
+  if (indexed.calls.length > 0) {
+    return { calls: indexed.calls, text: indexed.text, rejectedCalls: false }
+  }
   const cleanText = rejectedCalls
     ? [rest, '工具调用未执行：调用未在本次 DSH 工具列表中，或参数不符合声明。'].filter(Boolean).join('\n\n')
     : rest
-  return { calls: dedupeCalls(calls), text: cleanText, rejectedCalls }
+  return { calls: [], text: cleanText, rejectedCalls }
 }
 
 /** Parse one fence body and enforce the current request's tool allow-list. */

@@ -47,7 +47,7 @@ import {
   loadDoubaoCredentials,
   type DoubaoCredentials,
 } from './doubao-auth.ts'
-import { chat, DoubaoUpstreamError, classifyDoubaoFailure, isInvalidParamFailure, isRetryableFailure, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage } from './doubao-upstream.ts'
+import { chat, DoubaoUpstreamError, classifyDoubaoFailure, isInvalidParamFailure, isRetryableFailure, uploadDoubaoImageAttachments, type ChatRequestOptions, type DoubaoErrorKind, type DoubaoImage, type DoubaoImageAttachment } from './doubao-upstream.ts'
 import { fetchQuota, findWindow, millisUntilReset } from './doubao-quota.ts'
 import {
   DOUBAO_IMAGE_MODEL_ID,
@@ -60,7 +60,7 @@ import {
 import { liveModels } from './doubao-discovery.ts'
 import { browserRelayEnabled } from './doubao-browser-relay.ts'
 import {
-  buildToolContract,
+  buildAdaptiveToolContract,
   parseToolCalls,
   toolResultAsText,
   type EmulatedToolCall,
@@ -72,8 +72,11 @@ import { DoubaoStatsTracker, type DoubaoStatsView } from './doubao-stats.ts'
 /** Hostnames the inbound half will accept. */
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]'])
 
-/** Cap on an inbound chat body. Doubao replies are short; anything larger is abuse. */
-const MAX_BODY_BYTES = 4 * 1024 * 1024
+/** Cap on an inbound chat body (24 MiB, sized for up to 4 base64-encoded images). */
+const MAX_BODY_BYTES = 24 * 1024 * 1024
+
+/** Maximum number of inbound images forwarded per request. */
+export const MAX_INBOUND_IMAGES = 4
 
 /** Streaming idle ceiling while one read is outstanding. */
 export const DOUBAO_STREAM_IDLE_TIMEOUT_MS = 300_000
@@ -567,6 +570,59 @@ export function buildPrompt(
   return turns.join('\n\n')
 }
 
+/** Collect base64 `data:image/` URLs from OpenAI/Anthropic/pi-ai message content blocks. */
+export function collectInboundImages(
+  messages: ReadonlyArray<{ content?: unknown }> | undefined,
+): string[] {
+  const images: string[] = []
+  for (const message of messages ?? []) {
+    const content = message?.content
+    if (!Array.isArray(content)) continue
+    for (const part of content) {
+      if (part === null || typeof part !== 'object') continue
+      const record = part as Record<string, unknown>
+      let url: unknown
+      if (record.type === 'image_url') {
+        const imgUrl = record.image_url as { url?: unknown } | undefined
+        if (typeof imgUrl?.url === 'string') url = imgUrl.url
+      } else if (record.type === 'input_image') {
+        url = typeof record.image_url === 'string'
+          ? record.image_url
+          : (record.image_url as { url?: unknown } | undefined)?.url
+      } else if (record.type === 'image' && typeof record.data === 'string') {
+        const mime = typeof record.mimeType === 'string'
+          ? record.mimeType
+          : typeof record.mime_type === 'string'
+            ? record.mime_type
+            : 'image/png'
+        url = `data:${mime};base64,${record.data}`
+      } else {
+        const source = record.source as { type?: unknown; data?: unknown; media_type?: unknown } | undefined
+        if (source?.type === 'base64' && typeof source.data === 'string') {
+          const mediaType = typeof source.media_type === 'string' ? source.media_type : 'image/png'
+          url = `data:${mediaType};base64,${source.data}`
+        }
+      }
+      if (typeof url === 'string' && url.startsWith('data:image/')) {
+        images.push(url)
+      }
+    }
+  }
+  return images.slice(-MAX_INBOUND_IMAGES)
+}
+
+function logRouterParse(toolsCount: number, rawText: string, callsCount: number): void {
+  if (process.env.DSH_DOUBAO_ROUTER_LOG !== '1') return
+  try {
+    appendFileSync(
+      join(homedir(), '.dsh', 'doubao-router.log'),
+      `[${new Date().toISOString()}] tools=${toolsCount} textLen=${rawText.length} calls=${callsCount} raw=${JSON.stringify(rawText.slice(0, 1200))}\n`,
+    )
+  } catch {
+    /* diagnostics must never break the request */
+  }
+}
+
 /**
  * Room left under the hard body ceiling for the JSON envelope, headers and the
  * fields the shim adds around the prompt (model keys, client_meta, ext).
@@ -1006,15 +1062,18 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       let calls: EmulatedToolCall[] = []
       if (emulate) {
         const parsedCalls = parseToolCalls(result.text, parsed.tools ?? [])
+        logRouterParse(parsed.tools?.length ?? 0, result.text, parsedCalls.calls.length)
         // A 「工作任务」 turn does not answer with a fence: the server dispatches
         // workspace commands and the tool_local responder hands back the calls it
         // bridged. Those are already DSH calls, so they join the fenced ones
         // instead of being dropped on the floor.
         calls = [...parsedCalls.calls, ...(result.toolCalls ?? [])]
         visibleAnswerText = parsedCalls.text
-        const visible = parsedCalls.text.trim() === '' ? ' ' : parsedCalls.text
-        if (parsedCalls.text.trim() !== '' || calls.length > 0) markFirstToken()
-        sendChunk({ choices: [{ index: 0, delta: { content: visible }, finish_reason: null }] })
+        const hasVisible = parsedCalls.text.trim() !== ''
+        if (hasVisible || calls.length > 0) markFirstToken()
+        if (hasVisible || calls.length === 0) {
+          sendChunk({ choices: [{ index: 0, delta: { content: hasVisible ? parsedCalls.text : ' ' }, finish_reason: null }] })
+        }
         calls.forEach((call: EmulatedToolCall, index: number) => {
           sendChunk({
             choices: [{
@@ -1022,7 +1081,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
               delta: {
                 tool_calls: [{
                   index,
-                  id: call.id,
+                  id: call.id || `call_${Date.now()}_${index}`,
                   type: 'function',
                   function: { name: call.name, arguments: call.arguments },
                 }],
@@ -1250,10 +1309,11 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       const useDelta = delta.length > 0
       const isContinuationTurn = continuing && useDelta
       const outgoing = useDelta ? delta : (parsed.messages ?? [])
+      const inboundImages = imageModel ? [] : collectInboundImages(outgoing)
       // The tool contract is appended to the prompt, so it has to be known before
       // the transcript is fitted under the byte ceiling.
       const emulate = !imageModel && emulationOn() && (parsed.tools?.length ?? 0) > 0
-      const emulatedContractText = emulate ? buildToolContract(parsed.tools ?? []) : ''
+      const emulatedContractText = emulate ? buildAdaptiveToolContract(parsed.tools ?? []) : ''
       // Hard backstop: compaction reasons in tokens against the declared window,
       // but Doubao rejects on request BYTES — and the contract is invisible to
       // the token meter. Trim the oldest turns here rather than let the turn fail.
@@ -1270,9 +1330,10 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
       // IMAGEGEN_SLIM_PROMPT: 生图模型只该看到用户那句描述。
       // 完整上下文（系统提示、工具清单、MCP、技能、历史）会让它先分析"该用哪个工具"，
       // 实测白等 1 分 54 秒才出图。这里只取最后一条 user 消息。
-      const promptBody = imageModel
+      const promptBody = (imageModel
         ? buildImagePrompt(parsed.messages ?? [], fitted.messages)
-        : buildPrompt(fitted.messages)
+        : buildPrompt(fitted.messages))
+        || (inboundImages.length > 0 ? '请查看并描述这张图片。' : '')
       if (!promptBody) {
         writeOpenAIError(res, 400, 'invalid_request', 'no usable message content')
         return
@@ -1304,6 +1365,16 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
           /* diagnostics must never break the request */
         }
       }
+      let attachments: DoubaoImageAttachment[] = []
+      if (inboundImages.length > 0) {
+        try {
+          attachments = await uploadDoubaoImageAttachments(credentials, inboundImages)
+        } catch (error) {
+          writeFailure(res, error)
+          return
+        }
+      }
+
       // ---- cancellation & liveness -------------------------------------
       //
       // Both chat paths share this: an abort reaches the upstream socket, and
@@ -1321,6 +1392,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         // this request DECLARED. Without this the bridge sees an empty list and
         // every task-mode file operation has to be refused.
         ...parsed.tools === undefined ? {} : { declaredTools: parsed.tools },
+        ...attachments.length > 0 ? { attachments } : {},
         ...isContinuationTurn ? { conversationId: known.conversationId, continueConversation: true } : {},
       }
       /** Record the thread id the server handed back, for the next turn. */
@@ -1367,6 +1439,7 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
         const emulated = emulate
           ? (() => {
               const parsedCalls = parseToolCalls(result.text, parsed.tools ?? [])
+              logRouterParse(parsed.tools?.length ?? 0, result.text, parsedCalls.calls.length)
               // Task-mode turns deliver their calls through the tool_local
               // responder, not a fence; both are DSH calls and both must reach
               // the harness or the turn reports work it never did.
@@ -1420,12 +1493,12 @@ export function createDoubaoShim(options: DoubaoShimOptions = {}): DoubaoShim {
             index: 0,
             message: {
               role: 'assistant',
-              content: content === '' ? ' ' : content,
+              content: content === '' && emulated.calls.length === 0 ? ' ' : content,
               ...(result.reasoningText !== '' ? { reasoning_content: result.reasoningText } : {}),
               ...(emulated.calls.length > 0
                 ? {
-                    tool_calls: emulated.calls.map((call) => ({
-                      id: call.id,
+                    tool_calls: emulated.calls.map((call, index) => ({
+                      id: call.id || `call_${Date.now()}_${index}`,
                       type: 'function',
                       function: { name: call.name, arguments: call.arguments },
                     })),
