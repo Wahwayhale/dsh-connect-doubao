@@ -16,6 +16,7 @@
  *
  * @module dsh-connect-doubao
  */
+import * as dshLlm from '@deepseek-ai/dsh-llm'
 import { createDoubaoAdapter } from './doubao-adapter.ts'
 import { createDoubaoShim } from './doubao-shim.ts'
 import {
@@ -36,7 +37,18 @@ import {
   DOUBAO_PROVIDER_DISPLAY_NAME,
   discoverDoubaoModels,
   enabledModelsOf,
+  modelInputModalities,
 } from './doubao-catalog.ts'
+
+type ResolveImageAttachmentAccessFn = (
+  attachments: unknown,
+  toProcessPath: (hostPath: string) => string | undefined,
+  ref: unknown,
+) => unknown
+
+const resolveImageAttachmentAccess = (
+  dshLlm as { resolveImageAttachmentAccess?: ResolveImageAttachmentAccessFn }
+).resolveImageAttachmentAccess
 import { ENABLED_MODEL_IDS_FIELD, effectiveIds, profileDirOf, toolEmulationOf } from './doubao-config.ts'
 import { writeStoredSetting, readStoredSettings, withStoredSettings } from './doubao-store.ts'
 import { liveModels, invalidateDiscovery, discoverAllCachedModels, refreshDiscovery } from './doubao-discovery.ts'
@@ -98,11 +110,14 @@ export {
   discoverAllCachedModels,
   DISCOVERY_TTL_MS,
 } from './doubao-discovery.ts'
-export { createDoubaoAdapter, DOUBAO_STREAM_IDLE_TIMEOUT_MS } from './doubao-adapter.ts'
+export { createDoubaoAdapter, DOUBAO_STREAM_IDLE_TIMEOUT_MS, REQUEST_IMAGE_BUDGETS } from './doubao-adapter.ts'
 export {
   createDoubaoShim,
   buildPrompt,
+  collectInboundImages,
+  defangLoopbackUrls,
   fitPromptToByteBudget,
+  MAX_INBOUND_IMAGES,
   overflowIfOversized,
   type DoubaoShim,
 } from './doubao-shim.ts'
@@ -272,6 +287,22 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
       enabledModelIds: effectiveIds(current),
       modelsProvider: liveModels,
       onBaseUrlReady: notifyAdapters,
+      resolveAttachments: () => ctx.get?.('attachments'),
+      ...(typeof resolveImageAttachmentAccess === 'function'
+        ? {
+            resolveImageAccess: (attachments: unknown, ref: unknown) =>
+              resolveImageAttachmentAccess(
+                attachments,
+                (hostPath: string) =>
+                  (
+                    ctx.get?.('fs') as
+                      | { processPathFromHostPath?: (p: string) => string | undefined }
+                      | undefined
+                  )?.processPathFromHostPath?.(hostPath),
+                ref,
+              ),
+          }
+        : {}),
     })
     invalidateAdapter = invalidate
 
@@ -324,7 +355,7 @@ export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabl
           name: model.name,
           contextWindow: DOUBAO_CONTEXT_WINDOW,
           maxTokens: DOUBAO_MAX_TOKENS,
-          inputModalities: ['text' as const],
+          inputModalities: modelInputModalities(model),
         }))
       })
     } catch (error: unknown) {

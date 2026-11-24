@@ -114,6 +114,19 @@ describe('sessionKeyOf', () => {
     expect(sessionKeyOf([])).toBeUndefined()
     expect(sessionKeyOf(undefined)).toBeUndefined()
   })
+
+  it('skips synthetic permission/runtime user notices when computing session key', () => {
+    const notice = {
+      role: 'user',
+      content: 'The user changed the approval policy from "ask" to "never".',
+    }
+    const sys = { role: 'system', content: 'You are an AI agent.' }
+    const keyA = sessionKeyOf([sys, notice, { role: 'user', content: '任务 A' }])
+    const keyB = sessionKeyOf([sys, notice, { role: 'user', content: '任务 B' }])
+    expect(keyA).toBeDefined()
+    expect(keyA).not.toBe(keyB)
+    expect(sessionKeyOf([sys, notice])).toBeDefined()
+  })
 })
 
 describe('isContinuation', () => {

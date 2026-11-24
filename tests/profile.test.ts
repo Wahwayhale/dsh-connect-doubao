@@ -338,4 +338,16 @@ describe('manual override', () => {
       setProfileOverride(undefined)
     }
   })
+
+  it('discovers DoubaoWork User Data alongside Doubao in AppData', () => {
+    const localAppData = join(root, 'local')
+    const workProfile = makeProfile(join(localAppData, 'DoubaoWork'), 'User Data')
+    const profiles = listDoubaoProfiles({
+      env: { LOCALAPPDATA: localAppData },
+      processCommandLines: () => [],
+      scanRoots: [],
+      platform: 'win32',
+    })
+    expect(profiles[0]).toEqual({ dir: workProfile, source: 'appdata' })
+  })
 })

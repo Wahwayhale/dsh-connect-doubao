@@ -485,7 +485,14 @@ export function discoverModels(now = Date.now()): DoubaoModelInfo[] | undefined 
     })
     .map((entry) => {
       const staticMatch = DOUBAO_MODELS.find((m) => m.id === entry.key)
-      const taskMode = entry.taskOnly || isTaskModel(entry.key)
+      // DoubaoWork's menu marks third-party `person-*` slugs with default_mode "3",
+      // which would lock them out of chat-mode prompt tool routing and image input.
+      // Treat them as chat models unless `DSH_DOUBAO_PERSON_TASK_MODE=1` opts in.
+      const forcePersonTaskMode = /^(1|true|on|yes)$/i.test(
+        (process.env.DSH_DOUBAO_PERSON_TASK_MODE ?? '').trim(),
+      )
+      const taskMode = (entry.taskOnly || isTaskModel(entry.key))
+        && (forcePersonTaskMode || !entry.key.startsWith('person-'))
       // A discovered task model has no static badge to inherit, and its name is a
       // plain product name (「GLM 5.3」, not 「工作任务 GLM 5.3」) — without this the
       // card would render it as an ordinary chat entry while it runs in task mode.

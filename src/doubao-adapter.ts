@@ -34,6 +34,7 @@ import {
   DOUBAO_REASONING_LEVELS,
   enabledModelsOf,
   levelIdOf,
+  modelInputModalities,
   type DoubaoModelInfo,
 } from './doubao-catalog.ts'
 
@@ -66,11 +67,13 @@ const INERT_AUTH: { credentials: CredentialStore; authContext: AuthContext } = {
 /** No per-token pricing is knowable for a subscription quota; report zero. */
 const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const
 
-/** Image-request budgets: this route is text-only, so the caps are inert. */
-const REQUEST_IMAGE_BUDGETS = {
-  maxRequestImageBytes: 0,
-  requestImagePixelBudget: 0,
-  requestImageMaxBytes: 0,
+/** Image-request budgets aligned with the shim's 4-image / 24 MiB body limits. */
+export const REQUEST_IMAGE_BUDGETS = {
+  maxRequestImageBytes: 12 * 1024 * 1024,
+  maxRequestImages: 4,
+  imageOffloadCountQuantum: 1,
+  requestImagePixelBudget: 2048 * 2048,
+  requestImageMaxBytes: 1024 * 1024,
 } as const
 
 /**
@@ -149,7 +152,7 @@ function toPiModel(info: DoubaoModelInfo, baseUrl: string, providerId: string): 
     api: 'openai-completions',
     provider: providerId,
     baseUrl,
-    input: ['text'],
+    input: modelInputModalities(info),
     cost: NO_COST,
     contextWindow: DOUBAO_CONTEXT_WINDOW,
     maxTokens: DOUBAO_MAX_TOKENS,
@@ -192,6 +195,10 @@ export interface DoubaoAdapterOptions {
    * so callers can re-emit adapter availability (`adapterRelease.replace`).
    */
   onBaseUrlReady?: () => void
+  /** Resolve the optional durable attachment service at request time (DSH 0.2.2+). */
+  resolveAttachments?: (() => unknown) | undefined
+  /** Bridge one attachment reference into the current model-tool execution world (DSH 0.2.2+). */
+  resolveImageAccess?: ((attachments: unknown, ref: unknown) => unknown) | undefined
 }
 
 /**
@@ -264,7 +271,7 @@ export function createDoubaoAdapter(options: DoubaoAdapterOptions): DoubaoAdapte
   // through the constructed provider while the catalog answer can be rebuilt.
   const provider: Provider = { ...base, getModels: () => buildModels() }
 
-  const profile: ResolvedPiAiProviderProfile = {
+  const profile = {
     provider: providerId,
     displayName: providerName,
     streamIdleTimeoutMs: DOUBAO_STREAM_IDLE_TIMEOUT_MS,
@@ -293,7 +300,7 @@ export function createDoubaoAdapter(options: DoubaoAdapterOptions): DoubaoAdapte
     // external (see tsdown.config.ts `neverBundle`), so the host's single copy is
     // what actually loads.
     piProvider: provider as unknown as NonNullable<ResolvedPiAiProviderProfile['piProvider']>,
-  }
+  } as ResolvedPiAiProviderProfile
 
   // Replacing (not mutating) the map forces the next profiles read to rebuild.
   let profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, profile]])
@@ -305,7 +312,9 @@ export function createDoubaoAdapter(options: DoubaoAdapterOptions): DoubaoAdapte
     // pi-ai sends as `Authorization: Bearer`. The shim validates it and never
     // forwards it upstream.
     resolveApiKey: async () => shim.token(),
-  })
+    ...(options.resolveAttachments !== undefined ? { resolveAttachments: options.resolveAttachments } : {}),
+    ...(options.resolveImageAccess !== undefined ? { resolveImageAccess: options.resolveImageAccess } : {}),
+  } as ConstructorParameters<typeof PiAiAdapter>[0])
 
   return {
     adapter,

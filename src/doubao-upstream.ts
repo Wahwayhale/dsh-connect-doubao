@@ -18,7 +18,7 @@
  * Frames are three lines — `id:`, `event:`, `data:` — followed by a blank
  * line, so a generic `data:`-only SSE parser silently drops everything.
  */
-import { randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { appendFile, mkdir, writeFile } from 'node:fs/promises'
 import { hostname, homedir, tmpdir } from 'node:os'
@@ -393,6 +393,8 @@ export interface ChatRequestOptions {
   workspace?: string
   /** DSH functions declared on this request; never expanded to undeclared tools. */
   declaredTools?: readonly InboundTool[]
+  /** Uploaded ImageX attachments prepended before the text block. */
+  attachments?: readonly DoubaoImageAttachment[]
 }
 
 /* ------------------------------------------------------------------ *
@@ -518,6 +520,413 @@ export function withImagePrefix(prompt: string, options: ChatRequestOptions = {}
   return `生成图片：${prompt}`
 }
 
+export const ATTACHMENT_BLOCK_TYPE = 10052
+export const DOUBAO_IMAGE_LIMIT_BYTES = 10 * 1024 * 1024
+const DOUBAO_IMAGE_CACHE_MAX = 64
+
+export interface DecodedDoubaoImage {
+  mime: string
+  bytes: Buffer
+  ext: string
+}
+
+export interface UploadedDoubaoImage {
+  uri: string
+  identifier: string
+  name: string
+  mime: string
+}
+
+export interface DoubaoImageAttachment {
+  type: 1
+  identifier: string
+  image: {
+    name: string
+    uri: string
+    image_ori: {
+      url: string
+      width: number
+      height: number
+      format: string
+      url_formats: Record<string, never>
+    }
+  }
+  parse_state: 1
+  review_state: 1
+  upload_status: 1
+  progress: 100
+  src: string
+}
+
+export interface DoubaoAttachmentBlock {
+  block_type: typeof ATTACHMENT_BLOCK_TYPE
+  block_id: string
+  parent_id: string
+  meta_info: unknown[]
+  extra_info: Record<string, unknown>
+  append_fields: unknown[]
+  content: {
+    attachment_block: { attachments: readonly DoubaoImageAttachment[] }
+    pc_event_block: string
+  }
+}
+
+interface ImagexUploadCredentials {
+  access_key: string
+  secret_key: string
+  session_token: string
+}
+
+const doubaoImageUploadCache = new Map<string, UploadedDoubaoImage>()
+
+/** Clear the in-memory ImageX upload deduplication cache (used in tests). */
+export function clearDoubaoImageUploadCache(): void {
+  doubaoImageUploadCache.clear()
+}
+
+function sha256Hex(data: Buffer): string {
+  return createHash('sha256').update(data).digest('hex')
+}
+
+/** Decode a `data:image/(png|jpeg|jpg|webp|gif);base64,...` URL into raw bytes. */
+export function decodeImageDataUrl(source: unknown): DecodedDoubaoImage | undefined {
+  if (typeof source !== 'string') return undefined
+  const match = /^data:(image\/(?:png|jpeg|jpg|webp|gif));base64,(.*)$/s.exec(source)
+  if (match === null) return undefined
+  const rawMime = match[1]!
+  const mime = rawMime === 'image/jpg' ? 'image/jpeg' : rawMime
+  const bytes = Buffer.from(match[2] ?? '', 'base64')
+  if (bytes.length === 0 || bytes.length > DOUBAO_IMAGE_LIMIT_BYTES) {
+    throw new DoubaoUpstreamError('图片为空或超过 10 MiB 上限', CODE_INVALID_PARAM)
+  }
+  const ext = mime === 'image/jpeg' ? 'jpg' : mime.slice(6)
+  return { mime, bytes, ext }
+}
+
+/** Compute lowercase 8-hex-digit CRC32 required by ImageX upload endpoints. */
+export function imagexCrc32(bytes: Buffer): string {
+  let crc = -1
+  for (let index = 0; index < bytes.length; index += 1) {
+    crc ^= bytes[index] ?? 0
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1))
+    }
+  }
+  return ((crc ^ -1) >>> 0).toString(16).padStart(8, '0')
+}
+
+function canonicalImagexQuery(params: Record<string, string>): string {
+  const entries = Object.entries(params).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  return new URLSearchParams(entries).toString()
+}
+
+/** Validate an ImageX API or TOS upload host returned by Doubao. */
+export function validateImagexHost(host: unknown, isImagexApi: boolean): string {
+  if (typeof host !== 'string' || /[/@:]/.test(host) || host === '') {
+    throw new DoubaoUpstreamError('豆包返回了非法的图片上传域名', CODE_INVALID_PARAM)
+  }
+  const name = host.toLowerCase()
+  const allowed = isImagexApi
+    ? name === 'imagex.bytedanceapi.com' || name === 'imagex.volcengineapi.com'
+    : ['snssdk.com', 'byteimg.com', 'volces.com'].some((suffix) => name.endsWith(`.${suffix}`))
+  if (!allowed) {
+    throw new DoubaoUpstreamError('豆包返回了不受支持的图片上传域名', CODE_INVALID_PARAM)
+  }
+  return `https://${name}`
+}
+
+/** Sign an ImageX request with AWS4-HMAC-SHA256 (`cn-north-1` / `imagex`). */
+export function signImagexRequest(
+  method: string,
+  query: string,
+  credentials: ImagexUploadCredentials,
+  body: Buffer = Buffer.alloc(0),
+  now: Date = new Date(),
+): Record<string, string> {
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  const timestamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}T${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}Z`
+  const day = timestamp.slice(0, 8)
+  const scope = `${day}/cn-north-1/imagex/aws4_request`
+  const headers: Record<string, string> = {
+    'x-amz-date': timestamp,
+    'x-amz-security-token': credentials.session_token,
+  }
+  if (body.length > 0) headers['x-amz-content-sha256'] = sha256Hex(body)
+  const names = Object.keys(headers).sort()
+  const canonicalHeaders = names.map((name) => `${name}:${headers[name]}\n`).join('')
+  const signedHeaders = names.join(';')
+  const payloadHash = sha256Hex(body)
+  const canonical = [method.toUpperCase(), '/', query, canonicalHeaders, signedHeaders, payloadHash].join('\n')
+  const toSign = ['AWS4-HMAC-SHA256', timestamp, scope, sha256Hex(Buffer.from(canonical, 'utf8'))].join('\n')
+  let key = Buffer.from(`AWS4${credentials.secret_key}`, 'utf8')
+  for (const part of [day, 'cn-north-1', 'imagex', 'aws4_request']) {
+    key = createHmac('sha256', key).update(part).digest()
+  }
+  const signature = createHmac('sha256', key).update(toSign).digest('hex')
+  headers.Authorization = `AWS4-HMAC-SHA256 Credential=${credentials.access_key}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+  return headers
+}
+
+/** Upload one decoded image via Doubao `alice/resource` + ImageX STS flow. */
+export async function uploadDoubaoImage(
+  credentials: DoubaoCredentials,
+  image: DecodedDoubaoImage,
+  filename?: string,
+): Promise<UploadedDoubaoImage> {
+  if (!credentials.ok || !credentials.pairs) {
+    throw new DoubaoUpstreamError('豆包登录态不可用，无法上传图片', CODE_SESSION_DEAD)
+  }
+  const msToken = credentials.pairs.get('msToken')
+  const csrf = credentials.pairs.get('passport_csrf_token') ?? credentials.pairs.get('passport_csrf_token_default')
+  const extra: Record<string, string> = {
+    'content-type': 'application/json',
+    origin: 'https://www.doubao.com',
+    referer: 'https://www.doubao.com/chat/',
+    'x-requested-with': 'XMLHttpRequest',
+  }
+  if (csrf !== undefined) extra['x-tt-passport-csrf-token'] = csrf
+  const headers = buildHeaders(credentials, extra)
+
+  const api = async (path: string, payload: unknown): Promise<Record<string, unknown>> => {
+    const response = await fetch(buildQueryUrl(`https://www.doubao.com${path}`, msToken), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    })
+    absorbSetCookies(response.headers)
+    const body = (await response.json().catch(() => undefined)) as Record<string, unknown> | undefined
+    if (!response.ok) {
+      throw new DoubaoUpstreamError(
+        `豆包图片接口失败（HTTP ${response.status}）`,
+        undefined,
+        false,
+        { httpStatus: response.status },
+      )
+    }
+    const responseMetadata = body?.ResponseMetadata as { Error?: unknown } | undefined
+    if (body === null || typeof body !== 'object' || responseMetadata?.Error) {
+      throw new DoubaoUpstreamError('豆包图片接口返回错误', CODE_INVALID_PARAM)
+    }
+    if (typeof body.code === 'number' && body.code !== 0) {
+      throw new DoubaoUpstreamError(
+        `豆包图片接口返回 ${body.code}`,
+        body.code,
+        body.code === CODE_RATE_LIMITED,
+      )
+    }
+    return body
+  }
+
+  const preparedBody = await api('/alice/resource/prepare_upload', {
+    tenant_id: '5',
+    scene_id: '5',
+    resource_type: 2,
+  })
+  const prepared = preparedBody.data as Record<string, unknown> | undefined
+  if (prepared === null || typeof prepared !== 'object') {
+    throw new DoubaoUpstreamError('豆包图片上传接口没有返回资源信息', CODE_INVALID_PARAM)
+  }
+  const imagexBase = validateImagexHost(prepared.upload_host, true)
+  const rawCreds = prepared.upload_auth_token as Record<string, unknown> | undefined
+  for (const field of ['access_key', 'secret_key', 'session_token']) {
+    if (typeof rawCreds?.[field] !== 'string' || rawCreds[field] === '') {
+      throw new DoubaoUpstreamError('豆包图片上传凭证不完整', CODE_INVALID_PARAM)
+    }
+  }
+  const uploadCredentials: ImagexUploadCredentials = {
+    access_key: rawCreds!.access_key as string,
+    secret_key: rawCreds!.secret_key as string,
+    session_token: rawCreds!.session_token as string,
+  }
+  const serviceId = typeof prepared.service_id === 'string' ? prepared.service_id : ''
+  if (serviceId === '') {
+    throw new DoubaoUpstreamError('豆包图片上传接口缺少 service_id', CODE_INVALID_PARAM)
+  }
+
+  const applyParams = {
+    Action: 'ApplyImageUpload',
+    Version: '2018-08-01',
+    ServiceId: serviceId,
+    FileSize: String(image.bytes.length),
+    FileExtension: `.${image.ext}`,
+    s: randomUUID().replace(/-/g, '').slice(0, 12),
+    device_platform: 'web',
+  }
+  const applyQuery = canonicalImagexQuery(applyParams)
+  const appliedResponse = await fetch(`${imagexBase}/?${applyQuery}`, {
+    method: 'GET',
+    headers: signImagexRequest('GET', applyQuery, uploadCredentials),
+  })
+  const applied = (await appliedResponse.json().catch(() => undefined)) as {
+    ResponseMetadata?: { Error?: unknown }
+    Result?: {
+      UploadAddress?: {
+        SessionKey?: unknown
+        UploadHosts?: unknown[]
+        StoreInfos?: Array<{ StoreUri?: unknown; Auth?: unknown }>
+      }
+    }
+  } | undefined
+  if (!appliedResponse.ok || !applied || applied.ResponseMetadata?.Error) {
+    throw new DoubaoUpstreamError('豆包图片上传申请失败', CODE_INVALID_PARAM)
+  }
+
+  const address = applied.Result?.UploadAddress
+  const storeInfo = address?.StoreInfos?.[0]
+  const uploadBase = validateImagexHost(address?.UploadHosts?.[0], false)
+  if (
+    typeof storeInfo?.StoreUri !== 'string' ||
+    typeof storeInfo?.Auth !== 'string' ||
+    typeof address?.SessionKey !== 'string'
+  ) {
+    throw new DoubaoUpstreamError('豆包返回的图片上传地址不完整', CODE_INVALID_PARAM)
+  }
+
+  const storeUri = storeInfo.StoreUri.split('/').map((part) => encodeURIComponent(part)).join('/')
+  const uploadResponse = await fetch(`${uploadBase}/upload/v1/${storeUri}`, {
+    method: 'POST',
+    headers: {
+      Authorization: storeInfo.Auth,
+      'Content-CRC32': imagexCrc32(image.bytes),
+      'Content-Type': 'application/octet-stream',
+    },
+    body: new Uint8Array(image.bytes),
+  })
+  const uploaded = (await uploadResponse.json().catch(() => undefined)) as { code?: unknown } | undefined
+  const uploadedCode = String(uploaded?.code ?? 2000)
+  if (!uploadResponse.ok || !uploaded || (uploadedCode !== '2000' && uploadedCode !== '0')) {
+    throw new DoubaoUpstreamError('豆包图片传输失败', CODE_INVALID_PARAM)
+  }
+
+  const commitQuery = canonicalImagexQuery({
+    Action: 'CommitImageUpload',
+    Version: '2018-08-01',
+    ServiceId: serviceId,
+  })
+  const commitBody = Buffer.from(JSON.stringify({ SessionKey: address.SessionKey }), 'utf8')
+  const commitResponse = await fetch(`${imagexBase}/?${commitQuery}`, {
+    method: 'POST',
+    headers: {
+      ...signImagexRequest('POST', commitQuery, uploadCredentials, commitBody),
+      'Content-Type': 'application/json',
+    },
+    body: new Uint8Array(commitBody),
+  })
+  const committed = (await commitResponse.json().catch(() => undefined)) as {
+    ResponseMetadata?: { Error?: unknown }
+    Result?: { Results?: Array<{ UriStatus?: unknown }> }
+  } | undefined
+  if (!commitResponse.ok || !committed || committed.ResponseMetadata?.Error) {
+    throw new DoubaoUpstreamError('豆包图片提交失败', CODE_INVALID_PARAM)
+  }
+  const results = committed.Result?.Results
+  if (!Array.isArray(results) || results.length === 0 || results.some((item) => item?.UriStatus !== 2000)) {
+    throw new DoubaoUpstreamError('豆包图片提交未被接受', CODE_INVALID_PARAM)
+  }
+
+  const identifier = randomUUID().replace(/-/g, '')
+  const digest = createHash('md5').update(image.bytes).digest('hex')
+  const name = filename ?? `image.${image.ext}`
+  const registeredBody = await api('/alice/resource/register', {
+    tenant_id: '5',
+    scene_id: '5',
+    resource_list: [{
+      uri: storeInfo.StoreUri,
+      resource_type: 2,
+      meta: {
+        image_meta: {
+          data: { md5: digest, identifier },
+          parse_extra: {},
+          image_info: {
+            file_name: name,
+            format: image.ext === 'jpg' ? 'jpeg' : image.ext,
+            size: image.bytes.length,
+          },
+        },
+      },
+    }],
+  })
+  const dataMap = registeredBody.data as Record<string, { resource_id?: unknown } | undefined> | undefined
+  const record = dataMap?.[storeInfo.StoreUri]
+  if (!record?.resource_id) {
+    throw new DoubaoUpstreamError('豆包图片登记失败', CODE_INVALID_PARAM)
+  }
+  return {
+    uri: storeInfo.StoreUri,
+    identifier,
+    name,
+    mime: image.mime,
+  }
+}
+
+/** Build the Doubao `attachment_block` item for one uploaded image. */
+export function toImageAttachment(uploaded: UploadedDoubaoImage): DoubaoImageAttachment {
+  const subtype = uploaded.mime.split('/')[1] ?? 'png'
+  return {
+    type: 1,
+    identifier: uploaded.identifier,
+    image: {
+      name: uploaded.name,
+      uri: uploaded.uri,
+      image_ori: {
+        url: '',
+        width: 0,
+        height: 0,
+        format: subtype === 'jpeg' ? 'jpeg' : subtype,
+        url_formats: {},
+      },
+    },
+    parse_state: 1,
+    review_state: 1,
+    upload_status: 1,
+    progress: 100,
+    src: '',
+  }
+}
+
+/** Wrap uploaded image attachments into a `block_type: 10052` content block. */
+export function buildAttachmentBlock(attachments: readonly DoubaoImageAttachment[]): DoubaoAttachmentBlock {
+  return {
+    block_type: ATTACHMENT_BLOCK_TYPE,
+    block_id: randomUUID(),
+    parent_id: '',
+    meta_info: [],
+    extra_info: {},
+    append_fields: [],
+    content: {
+      attachment_block: { attachments },
+      pc_event_block: '',
+    },
+  }
+}
+
+/** Decode and upload inbound `data:image/...` URLs with per-account SHA-256 caching. */
+export async function uploadDoubaoImageAttachments(
+  credentials: DoubaoCredentials,
+  sources: readonly string[] | undefined,
+): Promise<DoubaoImageAttachment[]> {
+  const attachments: DoubaoImageAttachment[] = []
+  const accountKey = credentials.ok ? (credentials.pairs.get('uid_tt') ?? '') : ''
+  let index = 0
+  for (const source of sources ?? []) {
+    const image = decodeImageDataUrl(source)
+    if (image === undefined) continue
+    index += 1
+    const key = `${accountKey}:${sha256Hex(image.bytes)}`
+    let uploaded = doubaoImageUploadCache.get(key)
+    if (uploaded === undefined) {
+      uploaded = await uploadDoubaoImage(credentials, image, `image-${index}.${image.ext}`)
+      if (doubaoImageUploadCache.size >= DOUBAO_IMAGE_CACHE_MAX) {
+        const oldest = doubaoImageUploadCache.keys().next().value
+        if (oldest !== undefined) doubaoImageUploadCache.delete(oldest)
+      }
+      doubaoImageUploadCache.set(key, uploaded)
+    }
+    attachments.push(toImageAttachment(uploaded))
+  }
+  return attachments
+}
+
 export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) {
   prompt = withImagePrefix(prompt, options)
   const model = findDoubaoModel(options.modelKey)
@@ -588,6 +997,9 @@ export function buildChatBody(prompt: string, options: ChatRequestOptions = {}) 
         local_message_id: localMessageId,
         message_status: 0,
         content_block: [
+          ...(options.attachments !== undefined && options.attachments.length > 0
+            ? [buildAttachmentBlock(options.attachments)]
+            : []),
           {
             block_type: 10000,
             block_id: randomUUID(),
@@ -1476,6 +1888,7 @@ async function streamOnce(
   const useBrowserRelay = !isTask
     && options.skill === undefined
     && options.modelKey !== DOUBAO_IMAGE_MODEL_ID
+    && (options.attachments === undefined || options.attachments.length === 0)
     && browserRelayEnabled()
 
   let response: Response

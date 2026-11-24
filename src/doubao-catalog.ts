@@ -481,6 +481,21 @@ export function supportsReasoning(id: string): boolean {
 }
 
 /**
+ * Input modalities advertised for a Doubao model.
+ *
+ * Task-mode models (local `tool_local` protocol) and the `image-gen` alias
+ * remain text-only; chat models (including `person-*` slugs) accept images
+ * via ImageX attachment upload.
+ */
+export function modelInputModalities(
+  model: Pick<DoubaoModelInfo, 'id' | 'taskMode'>,
+): ('text' | 'image')[] {
+  return isTaskModel(model.id) || model.taskMode === true || model.id === DOUBAO_IMAGE_MODEL_ID
+    ? ['text']
+    : ['text', 'image']
+}
+
+/**
  * Publish the catalog as pi-ai model descriptors.
  *
  * `models` defaults to the static list but is normally the DISCOVERED one — the
@@ -495,9 +510,7 @@ export function discoverDoubaoModels(
     name: model.badge === undefined ? model.name : `${model.name} · ${model.badge}`,
     contextWindow: DOUBAO_CONTEXT_WINDOW,
     maxTokens: DOUBAO_MAX_TOKENS,
-    // Text-only: this route sends one Doubao text_block and never forwards
-    // image parts, so advertising otherwise would be a lie the picker honours.
-    inputModalities: ['text'],
+    inputModalities: modelInputModalities(model),
     reasoning: model.reasoning,
   }))
 }

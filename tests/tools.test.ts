@@ -6,15 +6,23 @@
  * from the text the user sees. A drift between them is invisible in a unit test
  * that only checks one side, so both are exercised against the same shape here.
  */
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import {
+  buildAdaptiveToolContract,
+  buildCompactToolContract,
   buildToolContract,
+  COMPACT_TOOL_MENU_THRESHOLD,
   dedupeCalls,
   parseToolCalls,
+  resolveToolRoutingMode,
   toolResultAsText,
   taskWorkspaceOperationsToDshCalls,
   TOOL_FENCE_LANGUAGE,
 } from '../src/doubao-tools.ts'
+
+afterEach(() => {
+  delete process.env.DSH_DOUBAO_TOOL_ROUTING
+})
 
 const tools = [
   { type: 'function', function: { name: 'read_file', description: '读取文件', parameters: { type: 'object', properties: { path: { type: 'string' } } } } },
@@ -152,6 +160,150 @@ describe('parseToolCalls', () => {
       { type: 'function', function: { name: 'b' } },
     ])
     expect(new Set(out.calls.map((c) => c.id)).size).toBe(2)
+  })
+})
+
+describe('compact numbered tool routing (@N {JSON})', () => {
+  const menuTools = [
+    {
+      type: 'function',
+      function: {
+        name: 'glob',
+        description: 'find files',
+        parameters: {
+          type: 'object',
+          required: ['pattern'],
+          properties: { pattern: { type: 'string' }, path: { type: 'string' } },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read',
+        description: 'read a file',
+        parameters: {
+          type: 'object',
+          required: ['file_path'],
+          properties: { file_path: { type: 'string' }, offset: { type: 'number' }, limit: { type: 'number' } },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'many_opt',
+        description: 'many optional params',
+        parameters: {
+          type: 'object',
+          properties: {
+            a: { type: 'string' },
+            b: { type: 'string' },
+            c: { type: 'string' },
+            d: { type: 'string' },
+            e: { type: 'string' },
+            f: { type: 'string' },
+            g: { type: 'string' },
+          },
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: { name: 'noop', description: 'no parameters' },
+    },
+  ]
+
+  it('builds a compact contract with required, up to 6 optional params, and no-param hints', () => {
+    const contract = buildCompactToolContract(menuTools)
+    expect(contract).toContain('#1 glob — find files（必填:pattern; 可选:path）')
+    expect(contract).toContain('#2 read — read a file（必填:file_path; 可选:offset,limit）')
+    expect(contract).toContain('#3 many_opt — many optional params（可选:a,b,c,d,e,f,…）')
+    expect(contract).toContain('#4 noop — no parameters（无参数）')
+    expect(contract).toContain('@<编号> {}')
+    expect(buildCompactToolContract([])).toBe('')
+  })
+
+  it('switches automatically between fence and compact menu at threshold', () => {
+    const small = Array.from({ length: COMPACT_TOOL_MENU_THRESHOLD }, (_, i) => ({
+      type: 'function',
+      function: { name: `tool_${i}`, description: 'desc', parameters: { type: 'object', properties: {} } },
+    }))
+    const large = [
+      ...small,
+      { type: 'function', function: { name: 'tool_extra', description: 'desc', parameters: { type: 'object', properties: {} } } },
+    ]
+    expect(buildAdaptiveToolContract(small)).toContain(TOOL_FENCE_LANGUAGE)
+    expect(buildAdaptiveToolContract(large)).toContain('#1 tool_0')
+    expect(buildAdaptiveToolContract(large)).not.toContain(TOOL_FENCE_LANGUAGE)
+    expect(buildAdaptiveToolContract(large, 'fence')).toContain(TOOL_FENCE_LANGUAGE)
+    expect(buildAdaptiveToolContract(small, 'menu')).toContain('#1 tool_0')
+    process.env.DSH_DOUBAO_TOOL_ROUTING = 'menu'
+    expect(resolveToolRoutingMode()).toBe('menu')
+    expect(buildAdaptiveToolContract(small)).toContain('#1 tool_0')
+  })
+
+  it('parses single-line, multiline, fenced, and multiple @N {JSON} calls with non-empty ids', () => {
+    const single = parseToolCalls('@1 {"pattern":"C:\\\\Users\\\\x\\\\*"}', menuTools)
+    expect(single.calls).toHaveLength(1)
+    expect(single.calls[0]?.id).toMatch(/^call_/)
+    expect(single.calls[0]?.name).toBe('glob')
+    expect(single.text).toBe('')
+    expect(single.rejectedCalls).toBe(false)
+
+    const multiline = parseToolCalls('先看看文件\n@2 {\n  "file_path": "C:\\\\a.txt"\n}\n完成', menuTools)
+    expect(multiline.calls).toHaveLength(1)
+    expect(multiline.calls[0]?.name).toBe('read')
+    expect(multiline.text).toContain('先看看文件')
+    expect(multiline.text).toContain('完成')
+
+    const fenced = parseToolCalls('```\n@4 {}\n```', menuTools)
+    expect(fenced.calls).toHaveLength(1)
+    expect(fenced.calls[0]?.name).toBe('noop')
+    expect(fenced.calls[0]?.arguments).toBe('{}')
+    expect(fenced.text).toBe('')
+
+    const backticked = parseToolCalls('`@1 {"pattern":"*"}`', menuTools)
+    expect(backticked.calls).toHaveLength(1)
+    expect(backticked.text).toBe('')
+
+    const multiple = parseToolCalls(
+      '@2 {\n  "file_path": "C:\\\\a.txt"\n}\n@1 {\n  "pattern": "*", "extra": 1\n}',
+      menuTools,
+    )
+    expect(multiple.calls).toHaveLength(2)
+    expect(multiple.calls.map((c) => c.name)).toEqual(['read', 'glob'])
+    expect(multiple.calls[0]?.id).not.toBe(multiple.calls[1]?.id)
+    expect(JSON.parse(multiple.calls[1]!.arguments)).toEqual({ pattern: '*', extra: 1 })
+    expect(multiple.text).toBe('')
+  })
+
+  it('dedupes identical @N calls, ignores bad indices or invalid JSON, and preserves fence priority', () => {
+    const dup = parseToolCalls('@1 {"pattern":"*"}\n@1 {"pattern":"*"}', menuTools)
+    expect(dup.calls).toHaveLength(1)
+    expect(dup.text).toBe('')
+
+    const badIdx = parseToolCalls('@99 {"x":1}', menuTools)
+    expect(badIdx.calls).toEqual([])
+    expect(badIdx.text).toBe('@99 {"x":1}')
+
+    const badJson = parseToolCalls('@1 {bad json}', menuTools)
+    expect(badJson.calls).toEqual([])
+    expect(badJson.text).toBe('@1 {bad json}')
+
+    const fenceFirst = parseToolCalls(
+      '```doubao-tool\n{"name":"glob","arguments":{"pattern":"*.ts"}}\n```\n@4 {}',
+      menuTools,
+    )
+    expect(fenceFirst.calls.map((c) => c.name)).toEqual(['glob'])
+
+    const rawBackslash = '@2 {"file_path":"D:\\software\\dshspace\\misc\\HANDOFF.md"}'
+    const repaired = parseToolCalls(rawBackslash, menuTools)
+    expect(repaired.calls).toHaveLength(1)
+    expect(repaired.calls[0]?.name).toBe('read')
+    expect(JSON.parse(repaired.calls[0]!.arguments)).toEqual({
+      file_path: 'D:\\software\\dshspace\\misc\\HANDOFF.md',
+    })
   })
 })
 

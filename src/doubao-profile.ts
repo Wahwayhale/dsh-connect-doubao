@@ -158,7 +158,7 @@ export function extractUserDataDir(commandLine: string): string | undefined {
  */
 function probeProcessCommandLines(): string[] {
   const script =
-    "Get-CimInstance Win32_Process -Filter \"Name='Doubao.exe'\" | ForEach-Object { $_.CommandLine }"
+    "Get-CimInstance Win32_Process -Filter \"Name='Doubao.exe' OR Name='DoubaoWork.exe'\" | ForEach-Object { $_.CommandLine }"
   try {
     const result = spawnSync(
       'powershell.exe',
@@ -177,7 +177,10 @@ function defaultAppDataBases(env: NodeJS.ProcessEnv): string[] {
   const bases = [env.LOCALAPPDATA, env.APPDATA].filter(
     (entry): entry is string => typeof entry === 'string' && entry !== '',
   )
-  const candidates = bases.map((base) => join(base, 'Doubao', 'User Data'))
+  const candidates = bases.flatMap((base) => [
+    join(base, 'Doubao', 'User Data'),
+    join(base, 'DoubaoWork', 'User Data'),
+  ])
   // Roaming first, then every other user's Local: a second account on the same
   // machine is a real setup, and `C:\Users` is cheap to list.
   const usersRoot = 'C:\\Users'
@@ -185,6 +188,7 @@ function defaultAppDataBases(env: NodeJS.ProcessEnv): string[] {
     try {
       for (const user of readdirSync(usersRoot)) {
         candidates.push(join(usersRoot, user, 'AppData', 'Local', 'Doubao', 'User Data'))
+        candidates.push(join(usersRoot, user, 'AppData', 'Local', 'DoubaoWork', 'User Data'))
       }
     } catch {
       /* unreadable C:\Users — nothing to add */
