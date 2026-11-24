@@ -9,7 +9,7 @@ import { DOUBAO_IMAGE_MODEL_ID, modelInputModalities } from '../src/doubao-catal
 import { discoverModels, invalidateDiscovery } from '../src/doubao-discovery.ts'
 import { setProfileOverride } from '../src/doubao-profile.ts'
 import { invalidateQuotaCache } from '../src/doubao-quota.ts'
-import { collectInboundImages, createDoubaoShim, MAX_INBOUND_IMAGES, type DoubaoShim } from '../src/doubao-shim.ts'
+import { buildPrompt, collectInboundImages, createDoubaoShim, defangLoopbackUrls, MAX_INBOUND_IMAGES, type DoubaoShim } from '../src/doubao-shim.ts'
 import {
   ATTACHMENT_BLOCK_TYPE,
   buildAttachmentBlock,
@@ -622,5 +622,23 @@ describe('modalities, adapter attachment resolvers, and person-* chat mode', () 
     const taskModels = discoverModels()
     const personTask = taskModels?.find((m) => m.id === 'person-deepseek-v4-1-flash-261017')
     expect(personTask?.taskMode).toBe(true)
+  })
+
+  it('defangs loopback URLs in non-tool prompts while preserving public URLs and empty tool results', () => {
+    expect(defangLoopbackUrls('Web GUI: http://127.0.0.1:56928 and http://localhost:3000/api')).toBe(
+      'Web GUI: 127.0.0.1:56928 and localhost:3000/api',
+    )
+    expect(defangLoopbackUrls('Upstream: https://github.com/Wahwayhale/dsh-connect-doubao')).toBe(
+      'Upstream: https://github.com/Wahwayhale/dsh-connect-doubao',
+    )
+
+    const prompt = buildPrompt([
+      { role: 'user', content: 'Current DeepSeek Harness Web GUI URL: "http://127.0.0.1:56928".\n请读 README' },
+      { role: 'tool', name: 'pwsh', content: '' },
+      { role: 'tool', name: 'read', content: 'keep http://127.0.0.1:56928/health verbatim' },
+    ])
+    expect(prompt).toContain('Current DeepSeek Harness Web GUI URL: "127.0.0.1:56928".')
+    expect(prompt).toContain('[tool result] pwsh: (empty)')
+    expect(prompt).toContain('[tool result] read: keep http://127.0.0.1:56928/health verbatim')
   })
 })

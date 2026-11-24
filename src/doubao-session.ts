@@ -56,20 +56,55 @@ export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 /** Hard cap, so a long-lived host cannot grow this map without bound. */
 export const SESSION_MAX_ENTRIES = 256
 
+const SYNTHETIC_USER_NOTICE_PREFIXES = [
+  '<system-reminder>',
+  'The user changed the approval policy',
+  'The user changed the sandbox mode',
+  'The user changed the permission preset',
+  'Time sampled while preparing',
+]
+
+function extractMessageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  const parts: string[] = []
+  for (const block of content) {
+    if (typeof block === 'string') parts.push(block)
+    else if (block !== null && typeof block === 'object') {
+      const record = block as { text?: unknown; content?: unknown }
+      if (typeof record.text === 'string') parts.push(record.text)
+      else if (typeof record.content === 'string') parts.push(record.content)
+    }
+  }
+  return parts.join('\n')
+}
+
+function isSyntheticUserNotice(text: string): boolean {
+  const trimmed = text.trimStart()
+  return SYNTHETIC_USER_NOTICE_PREFIXES.some((prefix) => trimmed.startsWith(prefix))
+}
+
 /**
  * Stable key for a transcript's opening HUMAN turn.
  *
- * Keyed on the first `user` message rather than `messages[0]`: the Harness
- * usually opens with a system prompt that is IDENTICAL across unrelated chats,
- * so keying on it would collapse every conversation into one entry — and the
- * next turn would be appended to a stranger's thread.
+ * Keyed on the first substantive `user` message rather than `messages[0]` or
+ * synthetic policy/runtime notices: the Harness usually opens with an identical
+ * system prompt (and sometimes permission-preset notices before the user prompt),
+ * so keying on those would collapse unrelated chats onto one thread.
  *
  * Hashed rather than stored: the key outlives a single request, and user text
  * has no business being held there.
  */
 export function sessionKeyOf(messages: readonly InboundMessage[] | undefined): string | undefined {
   if (!Array.isArray(messages) || messages.length === 0) return undefined
-  const opening = messages.find((message) => message?.role === 'user') ?? messages[0]
+  const opening =
+    messages.find((message) => {
+      if (message?.role !== 'user') return false
+      const text = extractMessageText(message.content).trim()
+      return text !== '' && !isSyntheticUserNotice(text)
+    }) ??
+    messages.find((message) => message?.role === 'user') ??
+    messages[0]
   const text = typeof opening?.content === 'string'
     ? opening.content
     : JSON.stringify(opening?.content ?? '')

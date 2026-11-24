@@ -296,6 +296,14 @@ describe('compact numbered tool routing (@N {JSON})', () => {
       menuTools,
     )
     expect(fenceFirst.calls.map((c) => c.name)).toEqual(['glob'])
+
+    const rawBackslash = '@2 {"file_path":"D:\\software\\dshspace\\misc\\HANDOFF.md"}'
+    const repaired = parseToolCalls(rawBackslash, menuTools)
+    expect(repaired.calls).toHaveLength(1)
+    expect(repaired.calls[0]?.name).toBe('read')
+    expect(JSON.parse(repaired.calls[0]!.arguments)).toEqual({
+      file_path: 'D:\\software\\dshspace\\misc\\HANDOFF.md',
+    })
   })
 })
 

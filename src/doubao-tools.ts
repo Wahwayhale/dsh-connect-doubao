@@ -204,6 +204,21 @@ function extractBalancedJsonObject(text: string, start: number): string | undefi
   return undefined
 }
 
+function parseJsonObjectLenient(raw: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    return isJsonObject(parsed) ? parsed : undefined
+  } catch {
+    try {
+      const repaired = raw.replace(/\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})/g, '\\\\')
+      const parsed: unknown = JSON.parse(repaired)
+      return isJsonObject(parsed) ? parsed : undefined
+    } catch {
+      return undefined
+    }
+  }
+}
+
 function parseIndexedToolCalls(
   text: string,
   declaredTools: readonly InboundTool[],
@@ -224,13 +239,8 @@ function parseIndexedToolCalls(
     const jsonStart = match.index + match[0].length - 1
     const json = extractBalancedJsonObject(text, jsonStart)
     if (json === undefined) continue
-    let args: unknown
-    try {
-      args = JSON.parse(json)
-    } catch {
-      continue
-    }
-    if (!isJsonObject(args)) continue
+    const args = parseJsonObjectLenient(json)
+    if (args === undefined) continue
     const name = list[index]!.function!.name!
     const normalizedArgs = JSON.stringify(args)
     const dedupeKey = `${name}\u0000${normalizedArgs}`

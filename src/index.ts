@@ -115,6 +115,7 @@ export {
   createDoubaoShim,
   buildPrompt,
   collectInboundImages,
+  defangLoopbackUrls,
   fitPromptToByteBudget,
   MAX_INBOUND_IMAGES,
   overflowIfOversized,

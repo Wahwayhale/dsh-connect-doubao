@@ -519,6 +519,20 @@ export function buildImagePrompt(
   return fallback
 }
 
+const LOOPBACK_URL_RE =
+  /\bhttps?:\/\/((?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/[^\s"'<>)\]]*)?)/gi
+
+/**
+ * Strip `http(s)://` from loopback URLs before sending text to Doubao.
+ *
+ * Doubao's server-side URL fetcher hijacks turns containing bare `http://...`
+ * links and fails trying to crawl the user's unreachable `127.0.0.1:<port>`
+ * DSH Web GUI URL instead of answering or emitting tool calls.
+ */
+export function defangLoopbackUrls(text: string): string {
+  return text.replace(LOOPBACK_URL_RE, '$1')
+}
+
 export function buildPrompt(
   messages: Array<{
     role?: string
@@ -533,7 +547,7 @@ export function buildPrompt(
     const text = flattenContent(message.content)
     const role = message.role ?? 'user'
     if (role === 'tool') {
-      if (text) turns.push(toolResultAsText(message.name, text))
+      turns.push(toolResultAsText(message.name, text || '(empty)'))
       continue
     }
     // Replay an assistant turn that carried tool calls back into the prompt as
@@ -559,13 +573,14 @@ export function buildPrompt(
           return `\`\`\`doubao-tool\n${JSON.stringify({ name: fnName, arguments: parsedArgs })}\n\`\`\``
         })
         .join('\n\n')
-      const trimmed = text.trim()
+      const trimmed = defangLoopbackUrls(text.trim())
       const combined = trimmed ? `${trimmed}\n\n${fencedCalls}` : fencedCalls
       turns.push(`[assistant] ${combined}`)
       continue
     }
     if (!text) continue
-    turns.push(role === 'user' ? text : `[${role}] ${text}`)
+    const safeText = defangLoopbackUrls(text)
+    turns.push(role === 'user' ? safeText : `[${role}] ${safeText}`)
   }
   return turns.join('\n\n')
 }
