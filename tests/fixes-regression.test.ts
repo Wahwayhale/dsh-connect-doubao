@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { DOUBAO_IMAGE_MODEL_ID, DOUBAO_MODELS, inputSkillOf, SKILL_CARRIER_MODEL_ID } from '../src/doubao-catalog.ts'
+import { DOUBAO_IMAGE_MODEL_ID, DOUBAO_MODELS, enabledModelsOf, inputSkillOf, SKILL_CARRIER_MODEL_ID } from '../src/doubao-catalog.ts'
 import { buildImagePrompt, createDoubaoShim, requestOptions } from '../src/doubao-shim.ts'
 import { REQUIRED_COOKIE_NAMES, type DoubaoCredentials } from '../src/doubao-auth.ts'
 import { streamChat } from '../src/doubao-upstream.ts'
@@ -310,6 +310,40 @@ describe('image generation regressions', () => {
         incentive_quota_section: { usage_exhausted: true },
       }),
     ).toBe(true)
+  })
+})
+
+describe('model checklist visibility regressions', () => {
+  const discovered = [
+    ...DOUBAO_MODELS,
+    { id: 'person-glm-5-4', name: 'GLM 5.4', reasoning: true },
+    { id: 'person-kimi-k3-1-pro', name: 'Kimi K3.1 Pro', reasoning: true },
+  ]
+
+  it('hides a built-in model that the user unticked', () => {
+    const ids = DOUBAO_MODELS.map((model) => model.id).filter((id) => id !== '3')
+    expect(enabledModelsOf(ids, discovered).map((model) => model.id)).not.toContain('3')
+  })
+
+  it('hides a DISCOVERED model that the user unticked (#5)', () => {
+    // Before the fix, any id outside DOUBAO_MODELS was kept unconditionally,
+    // so unticking a person-* model in the card never removed it from the picker.
+    const ids = discovered.map((model) => model.id).filter((id) => id !== 'person-glm-5-4')
+    const visible = enabledModelsOf(ids, discovered).map((model) => model.id)
+    expect(visible).not.toContain('person-glm-5-4')
+    expect(visible).toContain('person-kimi-k3-1-pro')
+  })
+
+  it('keeps only the ticked ids, for both built-in and discovered models', () => {
+    expect(enabledModelsOf(['0', 'person-glm-5-4'], discovered).map((model) => model.id)).toEqual([
+      '0',
+      'person-glm-5-4',
+    ])
+  })
+
+  it('still serves the whole catalog before the first save', () => {
+    expect(enabledModelsOf(undefined, discovered)).toEqual(discovered)
+    expect(enabledModelsOf([], discovered)).toEqual(discovered)
   })
 })
 

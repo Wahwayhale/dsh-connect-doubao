@@ -512,10 +512,10 @@ export function discoverDoubaoModels(
  * `undefined` (never configured) serves the whole catalog: a first-run install
  * must show its models. Ids that no longer exist are dropped.
  *
- * A model DISCOVERED after the user last saved is kept even when it is not in
- * their tick list — otherwise a new Doubao release would be invisible until the
- * user thought to reopen the card and re-save, which is exactly the staleness
- * this path exists to remove.
+ * Every id — including one discovered from the client cache after the last save —
+ * is filtered by the tick list. Unticking a model must always hide it, otherwise
+ * the card's checkbox is a lie. The settings card still lists the FULL catalog,
+ * so a model released after the last save can be ticked there once to opt in.
  */
 export function enabledModelsOf(
   enabledIds: string[] | undefined,
@@ -523,8 +523,7 @@ export function enabledModelsOf(
 ): DoubaoModelInfo[] {
   if (enabledIds === undefined || enabledIds.length === 0) return [...models]
   const wanted = new Set(enabledIds)
-  const known = new Set(DOUBAO_MODELS.map((model) => model.id))
-  return models.filter((model) => wanted.has(model.id) || !known.has(model.id))
+  return models.filter((model) => wanted.has(model.id))
 }
 
 /** One catalog entry as the card's checklist consumes it. */
