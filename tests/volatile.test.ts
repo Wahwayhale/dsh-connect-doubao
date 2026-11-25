@@ -77,11 +77,13 @@ describe('the settings schema survives the Host volatile gate', () => {
   })
 })
 
-describe('defaults stay "not yet configured" rather than "ticked nothing"', () => {
-  it('declares an empty list for the model ids, not a required selection', () => {
-    // An empty list means "not yet configured" (serve the whole catalog); the
-    // card must never be able to persist that as a deliberate "ticked none",
-    // which is why `enabledModelsOf` keys off `isConfigured` instead.
+describe('the schema default is a placeholder, not a selection', () => {
+  it('declares an empty list for the model ids', () => {
+    // `[]` is the schema's placeholder for "never saved", because schemastery
+    // 3.18.4 has no `.optional()`. `withStoredSettings` is what turns that
+    // placeholder into the `undefined` that means "serve the whole catalog",
+    // so a fresh install still shows every model — while a `[]` saved to the
+    // plugin's own file stays `[]` and serves none.
     const meta = (Config as any).dict[ENABLED_MODEL_IDS_FIELD].meta
     expect(meta.default).toEqual([])
   })

@@ -509,22 +509,28 @@ export function discoverDoubaoModels(
  * restriction — but it still only decides WHICH ENTRIES APPEAR IN DSH's MODEL
  * PICKER; the per-request choice is made by the DSH session, not here.
  *
- * `undefined` (never configured) serves the whole catalog: a first-run install
- * must show its models. Ids that no longer exist are dropped.
+ * `undefined` means "never configured" and serves the whole catalog, so a
+ * first-run install shows its models. A saved list — including the empty one,
+ * which is a user who deliberately ticked nothing — is honoured VERBATIM:
+ * only ticked ids survive, and ids that no longer exist are dropped.
  *
- * A model DISCOVERED after the user last saved is kept even when it is not in
- * their tick list — otherwise a new Doubao release would be invisible until the
- * user thought to reopen the card and re-save, which is exactly the staleness
- * this path exists to remove.
+ * There used to be an escape hatch here: any model absent from the static
+ * `DOUBAO_MODELS` table was kept even when unticked, so that a newly released
+ * Doubao model would appear without re-saving the card. That table only lists
+ * the handful of ids shipped with the plugin (`0`, `3`, `5`, `9`, `seed-lite-7b`,
+ * `image-gen`), while the catalog actually served comes from client discovery
+ * and is dominated by `person-*` ids. Every discovered id therefore looked
+ * "new", and ticking anything filtered nothing at all — the reported symptom.
+ * A newly discovered model is now simply unticked, visible in the card's
+ * checklist, and one click away; the picker only ever shows what was ticked.
  */
 export function enabledModelsOf(
   enabledIds: string[] | undefined,
   models: readonly DoubaoModelInfo[] = DOUBAO_MODELS,
 ): DoubaoModelInfo[] {
-  if (enabledIds === undefined || enabledIds.length === 0) return [...models]
+  if (enabledIds === undefined) return [...models]
   const wanted = new Set(enabledIds)
-  const known = new Set(DOUBAO_MODELS.map((model) => model.id))
-  return models.filter((model) => wanted.has(model.id) || !known.has(model.id))
+  return models.filter((model) => wanted.has(model.id))
 }
 
 /** One catalog entry as the card's checklist consumes it. */

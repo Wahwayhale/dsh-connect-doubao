@@ -207,8 +207,10 @@ export function createDoubaoAdapter(options: DoubaoAdapterOptions): DoubaoAdapte
 
   /**
    * Which catalog ids are currently in force, or undefined for "never
-   * configured" (serve everything). Updated by {@link setEnabledModelIds} when
-   * the user saves a different checklist selection.
+   * configured" (serve everything). An empty array is a real selection —
+   * "the user ticked none" — and serves nothing. Updated by
+   * {@link setEnabledModelIds} when the user saves a different checklist
+   * selection.
    */
   let enabledIds: string[] | undefined = options.enabledModelIds
 
@@ -234,8 +236,10 @@ export function createDoubaoAdapter(options: DoubaoAdapterOptions): DoubaoAdapte
     if (address === undefined) return []
     const baseUrl = `${address}/v1`
     // Filtered by the checklist selection, drawn from the CURRENT catalog (the
-    // discovered one when the client cache yields it). A model Doubao adds shows
-    // up here on the next rebuild rather than after a plugin release.
+    // discovered one when the client cache yields it) — so a model Doubao adds
+    // is offered as soon as it is ticked, without waiting for a plugin release.
+    // Unticked entries stay out even when they are newly discovered: the tick
+    // list is the whole answer, and the card's checklist is where they appear.
     return enabledModelsOf(enabledIds, (options.modelsProvider ?? (() => DOUBAO_MODELS))())
       .map(info => toPiModel(info, baseUrl, providerId))
   }

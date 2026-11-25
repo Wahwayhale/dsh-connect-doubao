@@ -219,7 +219,7 @@ export function settingsNamespaceOf(ctx: unknown): string {
  * releases the shim's port, the adapter, the directory entry, the discovery
  * callback and the HTTP routes — nothing outlives the plugin.
  */
-export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabledModelIds: [], toolEmulation: true, profileDir: '' }): void {
+export function apply(ctx: DoubaoPluginContext, config: DoubaoSettings = { enabledModelIds: undefined, toolEmulation: true, profileDir: '' }): void {
   let shim: ReturnType<typeof createDoubaoShim> | undefined
   let adapterRelease: DoubaoAdapterRelease | undefined
   let directoryRelease: (() => void) | undefined

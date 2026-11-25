@@ -138,12 +138,30 @@ describe('withStoredSettings', () => {
     expect(() => { writeStoredSetting('profileDir', 42, file) }).toThrow('invalid value')
   })
 
-  it('defaults to an empty model list, tools on and automatic discovery', () => {
+  it('defaults to "never configured", tools on and automatic discovery', () => {
+    // `undefined` — not `[]` — so a first-run install serves the whole catalog.
+    // The Host's `[]` placeholder must not survive the merge as a selection.
     expect(withStoredSettings(undefined, file)).toEqual({
-      enabledModelIds: [],
+      enabledModelIds: undefined,
       toolEmulation: true,
       profileDir: '',
     })
+    expect(withStoredSettings({ enabledModelIds: [] }, file).enabledModelIds).toBeUndefined()
+  })
+
+  it('keeps a stored empty list as a deliberate "ticked none"', () => {
+    // The user pressed "select none" and saved. Folding that back into
+    // `undefined` would silently re-publish every entry, which is the very
+    // class of bug this change fixes — so the FILE wins, verbatim.
+    writeStoredSetting('enabledModelIds', [], file)
+    const merged = withStoredSettings({ enabledModelIds: ['0'] }, file)
+    expect(merged.enabledModelIds).toEqual([])
+  })
+
+  it('keeps a stored list even when the Loader default is empty', () => {
+    writeStoredSetting('enabledModelIds', ['person-glm-5-4'], file)
+    const merged = withStoredSettings({ enabledModelIds: [] }, file)
+    expect(merged.enabledModelIds).toEqual(['person-glm-5-4'])
   })
 })
 

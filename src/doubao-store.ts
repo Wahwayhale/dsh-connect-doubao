@@ -85,15 +85,28 @@ export function readStoredSettings(path: string = settingsFilePath()): Partial<D
  *
  * Only recognised keys are carried, so a hand-edited file cannot inject an
  * unknown field into the live config object.
+ *
+ * This is the ONE place that folds the schema's `[]` placeholder into
+ * `undefined`, because it is the only place that can still tell the two apart.
+ * `Config` declares `z.array(z.string()).default([])`, so the Host always hands
+ * `apply` an empty array for a user who never saved — indistinguishable from a
+ * user who saved an empty list unless the file is consulted. A value coming
+ * from the FILE is therefore kept verbatim (`[]` stays `[]` = "ticked none"),
+ * while an empty value coming from the config fallback becomes `undefined`
+ * (= "not yet configured" → serve the whole catalog).
  */
 export function withStoredSettings(config: unknown, path: string = settingsFilePath()): DoubaoSettings {
+  const fromConfig = enabledIdsOf(config)
   const base: DoubaoSettings = {
-    enabledModelIds: enabledIdsOf(config) ?? [],
+    // `[]` from the Loader is the schema default, not a user choice.
+    enabledModelIds: fromConfig === undefined || fromConfig.length === 0 ? undefined : fromConfig,
     toolEmulation: (config as { toolEmulation?: unknown } | undefined)?.toolEmulation !== false,
     profileDir: profileDirOf(config) ?? '',
   }
   const stored = readStoredSettings(path)
   return {
+    // `??` keeps a stored `[]` (a deliberate "ticked none") rather than
+    // falling through to the config fallback.
     enabledModelIds: stored.enabledModelIds ?? base.enabledModelIds,
     toolEmulation: stored.toolEmulation ?? base.toolEmulation,
     profileDir: stored.profileDir ?? base.profileDir,

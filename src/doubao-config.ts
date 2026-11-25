@@ -16,24 +16,46 @@ import z from '@deepseek-ai/schemastery'
 /** The single settings field. Mirrored by the card as `enabledModelIds`. */
 export const ENABLED_MODEL_IDS_FIELD = 'enabledModelIds'
 
-/** Shape of this plugin's settings. */
-export interface DoubaoSettings {
-  /**
-   * Catalog ids the user has ticked.
-   *
-   * Defaults to `[]` — which means "NOT YET CONFIGURED" rather than "ticked
-   * nothing". The two are separated by {@link isConfigured}, which treats a
-   * never-saved field the same as an empty one; schemastery 3.18.4 has no
-   * `.optional()` and folds an `undefined` default into a NULLABLE field, which
-   * would add a third state (`null`) for the card to disambiguate. The reference
-   * connector uses the same default-plus-explicit-seeding approach.
-   *
-   * An empty list therefore serves the WHOLE catalog, so a first-run install
-   * shows its models. Collapsing the two states would instead silently re-publish
-   * every entry for a user who had deliberately ticked none — which is why
-   * `enabledModelsOf` keys off {@link isConfigured} rather than off emptiness.
-   */
+/**
+ * Shape of the config the HOST hands to `apply`, i.e. what `Config` validates.
+ *
+ * Every field is required here: schemastery's `.default()` marks a field
+ * `"defined"`, so the Loader always supplies a value. `enabledModelIds` is a
+ * plain array at this layer — the schema's `[]` placeholder for "never saved"
+ * is not distinguishable from a saved empty list until the plugin's own
+ * settings file is consulted, which {@link DoubaoSettings} accounts for.
+ */
+export interface DoubaoConfig {
   enabledModelIds: string[]
+  toolEmulation: boolean
+  profileDir: string
+}
+
+/**
+ * Shape of this plugin's LIVE settings, after {@link withStoredSettings} has
+ * merged the Host config with the plugin's own settings file.
+ */
+export interface DoubaoSettings extends Omit<DoubaoConfig, 'enabledModelIds'> {
+  /**
+   * Catalog ids the user has ticked, or `undefined` when never saved.
+   *
+   * THREE states, all meaningful:
+   *
+   *   `undefined` — the user has never saved a selection. The whole catalog is
+   *                 served, so a first-run install shows its models.
+   *   `[]`        — the user saved an EMPTY selection. Nothing is served; this
+   *                 is a real choice and must not be read as "not configured".
+   *   `[a, b]`    — serve exactly these ids.
+   *
+   * The distinction is carried by {@link withStoredSettings}, not by the
+   * schema: `Config` declares `z.array(z.string()).default([])`, so the Host
+   * always hands `apply` an empty array for a user who never saved. That empty
+   * value is the schema's placeholder and is folded to `undefined` while
+   * merging the plugin's own settings file — a saved `[]` in that file survives
+   * as `[]`. Collapsing the two would silently re-publish every entry for a
+   * user who had deliberately ticked none.
+   */
+  enabledModelIds: string[] | undefined
   /**
    * Simulate tool calling in the prompt so Doubao can drive the Harness tools.
    *
@@ -84,19 +106,6 @@ export function isConfigured(config: unknown): boolean {
 }
 
 /**
- * The settings SCHEMA the Loader reads.
- *
- * It MUST be a real schemastery schema: Cordis calls `.validate()` on it while
- * resolving the entry's config, so a plain object literal throws
- * `TypeError: Cannot read properties of undefined (reading 'validate')` and the
- * Loader reports `1 entry did not activate` — the plugin then contributes
- * nothing at all (no provider, no routes), with only that one warning to show
- * for it. Verified against a real DSH 0.2.0-rc.2 host (M5-B).
- *
- * schemastery is a peer dependency resolved from the Harness at runtime and is
- * never bundled (see tsdown.config.ts).
- */
-/**
  * Mark one schema field as volatile.
  *
  * This is what makes the field WRITABLE from a settings form at all. The host
@@ -121,9 +130,22 @@ function asVolatile<T>(schema: T): T {
   return typeof candidate.volatile === 'function' ? candidate.volatile() : schema
 }
 
-export const Config: z<DoubaoSettings> = z.object({
+/**
+ * The settings SCHEMA the Loader reads.
+ *
+ * It MUST be a real schemastery schema: Cordis calls `.validate()` on it while
+ * resolving the entry's config, so a plain object literal throws
+ * `TypeError: Cannot read properties of undefined (reading 'validate')` and the
+ * Loader reports `1 entry did not activate` — the plugin then contributes
+ * nothing at all (no provider, no routes), with only that one warning to show
+ * for it. Verified against a real DSH 0.2.0-rc.2 host (M5-B).
+ *
+ * schemastery is a peer dependency resolved from the Harness at runtime and is
+ * never bundled (see tsdown.config.ts).
+ */
+export const Config: z<DoubaoConfig> = z.object({
   enabledModelIds: asVolatile(z.array(z.string()).default([]))
-    .description('Catalog ids enabled in the DSH model picker. Doubao routes upstream by content, so this selects which entries are offered, never which model answers. Empty means "not yet configured" and serves the whole catalog.'),
+    .description('Catalog ids enabled in the DSH model picker. Doubao routes upstream by content, so this selects which entries are offered, never which model answers. Leave untouched to serve the whole catalog; an explicitly emptied list serves none.'),
   toolEmulation: asVolatile(z.boolean().default(true))
     .description('使用提示词模拟工具调用（OpenAI tools → doubao-tool 围栏 → tool_calls），让豆包及客户端接入的第三方模型能驱动 Harness 的本地工具。默认开启。'),
   profileDir: asVolatile(z.string().default(''))
@@ -133,8 +155,11 @@ export const Config: z<DoubaoSettings> = z.object({
 /**
  * The ticked ids, or `undefined` when the field is ABSENT.
  *
- * The absent case is what `enabledModelsOf` keys off to mean "never
- * configured"; a present-but-empty array is a real (empty) selection.
+ * A present-but-empty array is returned as-is: it is a real (empty) selection,
+ * distinct from `undefined` ("never configured"). {@link withStoredSettings}
+ * is the only place that folds the schema's `[]` placeholder into `undefined`,
+ * so by the time this is called on the merged settings the two are already
+ * separated.
  */
 export function enabledIdsOf(config: unknown): string[] | undefined {
   const value = (config as { enabledModelIds?: unknown } | undefined)?.enabledModelIds
@@ -145,13 +170,14 @@ export function enabledIdsOf(config: unknown): string[] | undefined {
 /**
  * The ids the adapter should filter by, or `undefined` for "serve everything".
  *
- * Normalises the schemastery default (`[]`, meaning not-yet-configured) into
- * the `undefined` that `enabledModelsOf` reads as "serve the whole catalog".
- * Without this the default would read as a user who ticked nothing, and a
- * first-run install would show an empty model picker.
+ * A pure pass-through of {@link enabledIdsOf}: `undefined` stays `undefined`
+ * (never configured → whole catalog) and a saved empty list stays empty (the
+ * user ticked nothing → serve nothing). An earlier version folded `[]` into
+ * `undefined` to keep a first-run install from showing an empty picker, but the
+ * merge in `withStoredSettings` already performs that fold exactly once, where
+ * "the Host's schema default" and "the user's saved value" can still be told
+ * apart. Folding again here erased a deliberate "ticked none".
  */
 export function effectiveIds(config: unknown): string[] | undefined {
-  const ids = enabledIdsOf(config)
-  if (ids === undefined || ids.length === 0) return undefined
-  return ids
+  return enabledIdsOf(config)
 }
